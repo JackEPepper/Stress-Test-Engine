@@ -35,7 +35,7 @@
     }
   },
   "consumer": {
-    "pd_multiplier": 1.35,
+    "el_multiplier": 1.35,
     "value_loss_shock": -0.10
   }
 }

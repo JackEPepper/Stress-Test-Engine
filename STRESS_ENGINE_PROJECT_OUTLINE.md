@@ -125,7 +125,7 @@ Required scenario categories:
 - CRE sector NOI shocks
 - C&I EBITDA shocks
 - C&I formula-specific shock variables
-- Consumer PD shocks
+- Consumer EL shocks
 - Consumer collateral or value loss shocks
 - CRE sector capitalization rate shocks
 - Near-term and longer-term formula settings for each module
@@ -171,7 +171,7 @@ Example shape:
     }
   },
   "consumer": {
-    "pd_multiplier": 1.35,
+    "el_multiplier": 1.35,
     "value_loss_shock": -0.10
   }
 }
@@ -241,8 +241,7 @@ Canonical fields:
 | `maturity_date` | Loan maturity date |
 | `risk_rating` | Internal risk rating, if available |
 | `fico` | Consumer FICO score, if applicable |
-| `current_pd` | Current probability of default, if available |
-| `current_lgd` | Current loss given default, if available |
+| `current_el_rate` | Current expected loss rate, if available |
 
 ### 5.2 CRE Collateral Data
 
@@ -317,7 +316,7 @@ Suggested tags:
 
 - `eligible_cre`: candidate for CRE collateral stress
 - `eligible_ci`: candidate for C&I borrower financial stress
-- `eligible_consumer`: candidate for consumer PD and value stress
+- `eligible_consumer`: candidate for consumer EL and value stress
 - `has_cre_collateral`
 - `has_ci_financials`
 - `has_fico_pd`
@@ -460,8 +459,7 @@ Illustrative longer-term calculations:
 - `stressed_interest_rate = treasury_5y_rate + interest_spread`
 - `stressed_debt_service = amortized_payment(balance, stressed_interest_rate, amortization_years)`
 - `stressed_dscr = stressed_noi / stressed_debt_service`
-- `cre_pd_adjustment` based on stressed LTV and DSCR thresholds
-- `cre_lgd_adjustment` based on stressed collateral value decline
+The primary CRE output is stressed DSCR. Supporting metrics such as stressed value and stressed LTV should be retained for explanation.
 
 Illustrative near-term calculations may place greater weight on refinance risk, current collateral value, stressed cap rate, and maturity exposure. The exact formula should be configured and documented separately from the longer-term amortization-based path.
 
@@ -471,9 +469,9 @@ Outputs:
 - `stressed_value`
 - `stressed_ltv`
 - `stressed_dscr`
-- `stressed_pd`
-- `stressed_lgd`
-- `stressed_expected_loss`
+- `base_dscr`
+- `stressed_debt_service`
+- `dscr_change`
 - `cre_stress_flag`
 
 ### 9.2 C&I Stress Module
@@ -507,7 +505,7 @@ Illustrative formula 1 calculations:
 - `stressed_debt_service = debt_service + total_debt * interest_rate_shock`
 - `stressed_debt_to_ebitda = total_debt / stressed_ebitda`
 - `stressed_fixed_charge_coverage = stressed_ebitda / stressed_debt_service`
-- `ci_pd_adjustment` based on stressed leverage and coverage thresholds
+The primary C&I output is stressed fixed charge coverage ratio, or FCCR. Supporting metrics such as leverage, stressed EBITDA, interest expense, and liquidity gap should be retained for explanation.
 
 Outputs:
 
@@ -517,9 +515,9 @@ Outputs:
 - `stressed_fixed_charge_coverage`
 - `selected_ci_formula`
 - `maturity_formula`
-- `stressed_pd`
-- `stressed_lgd`
-- `stressed_expected_loss`
+- `base_fixed_charge_coverage`
+- `fixed_charge_coverage_change`
+- `liquidity_gap`
 - `ci_stress_flag`
 
 ### 9.3 Consumer Stress Module
@@ -529,8 +527,8 @@ Inputs:
 - Balance
 - FICO
 - Base PD from transformation table
-- Current LGD
-- Scenario PD multiplier
+- Current EL rate
+- Scenario EL multiplier
 - Scenario value loss shock
 
 Core calculations:
@@ -538,15 +536,16 @@ Core calculations:
 The consumer module should also support near-term and longer-term formula paths when product type, maturity date, or remaining term changes the applicable stress treatment.
 
 - Map FICO to base PD.
-- Apply scenario PD multiplier.
-- Apply value loss shock to collateral-sensitive LGD assumptions when relevant.
+- Convert base PD to a base EL rate using configured consumer LGD, unless a current EL rate is supplied directly.
+- Apply scenario EL multiplier.
+- Apply value loss shock to consumer EL rate when relevant.
 - Calculate stressed expected loss.
 
 Outputs:
 
 - `base_pd_from_fico`
-- `stressed_pd`
-- `stressed_lgd`
+- `base_el_rate`
+- `stressed_el_rate`
 - `stressed_expected_loss`
 - `consumer_stress_flag`
 
@@ -569,11 +568,13 @@ The stressed loan-level output should include:
 | `scope_status` | In scope or out of scope |
 | `out_of_scope_reasons` | Reason codes for loans excluded from stress |
 | `balance` | Current balance |
-| `base_pd` | Base probability of default |
-| `base_lgd` | Base loss given default |
+| `base_dscr` | Base DSCR for CRE loans |
+| `stressed_dscr` | Stressed DSCR for CRE loans |
+| `base_fixed_charge_coverage` | Base FCCR for C&I loans |
+| `stressed_fixed_charge_coverage` | Stressed FCCR for C&I loans |
+| `base_el_rate` | Base expected loss rate for consumer loans |
 | `base_expected_loss` | Base EL |
-| `stressed_pd` | Stressed probability of default |
-| `stressed_lgd` | Stressed loss given default |
+| `stressed_el_rate` | Stressed expected loss rate for consumer loans |
 | `stressed_expected_loss` | Stressed EL |
 | `expected_loss_change` | Stressed EL minus base EL |
 | `data_quality_flags` | Validation, cleaning, and scope flags |
@@ -602,10 +603,10 @@ Required metrics:
 
 - Exposure count
 - Total balance
-- Weighted average base PD
-- Weighted average stressed PD
-- Weighted average base LGD
-- Weighted average stressed LGD
+- Weighted average base DSCR for CRE
+- Weighted average stressed DSCR for CRE
+- Weighted average base FCCR for C&I
+- Weighted average stressed FCCR for C&I
 - Base expected loss
 - Stressed expected loss
 - Expected loss change
@@ -696,7 +697,7 @@ The engine should support attribution comparing two completed runs. Attribution 
 
 Attribution should cover:
 
-- Scenario input changes, such as rate shocks, cap rate shocks, NOI shocks, EBITDA shocks, PD multipliers, and value loss assumptions.
+- Scenario input changes, such as rate shocks, cap rate shocks, NOI shocks, EBITDA shocks, EL multipliers, and value loss assumptions.
 - Data changes, such as balance movement, population movement, sector changes, maturity changes, tag changes, collateral changes, financial statement changes, FICO changes, and out-of-scope changes.
 
 Recommended attribution grain:
@@ -714,8 +715,9 @@ Recommended attribution metrics:
 
 - Balance change
 - Stressed expected loss change
-- Weighted average stressed PD change
-- Weighted average stressed LGD change
+- Weighted average stressed DSCR change
+- Weighted average stressed FCCR change
+- Expected loss change
 - In-scope population change
 - Out-of-scope population change
 
@@ -791,8 +793,8 @@ Range summary metrics:
 - Mean stressed expected loss.
 - Median stressed expected loss.
 - 10th and 90th percentile stressed expected loss.
-- Minimum and maximum weighted average stressed PD.
-- Minimum and maximum weighted average stressed LGD.
+- Minimum and maximum weighted average stressed DSCR.
+- Minimum and maximum weighted average stressed FCCR.
 - Minimum and maximum expected loss change.
 
 The range runner should preserve determinism by writing the exact child scenario file for each expanded case.
@@ -858,7 +860,7 @@ Configuration should include:
 - Dynamic validation rule matrix
 - Validation thresholds by module, formula, and tag
 - Fallback assumptions
-- PD and LGD floors and caps
+- Consumer EL rate floors and caps
 - External source tie-out requirements and tolerances
 - Attribution grouping rules
 - Scenario variable attribution groups
@@ -872,10 +874,8 @@ Example:
   "engine_version": "0.1.0",
   "primary_module_priority": ["cre", "ci", "consumer"],
   "near_term_maturity_days": 365,
-  "pd_floor": 0.0001,
-  "pd_cap": 1.0,
-  "lgd_floor": 0.0,
-  "lgd_cap": 1.0,
+  "el_rate_floor": 0.0,
+  "el_rate_cap": 1.0,
   "allow_fallbacks": false,
   "external_tie_outs_required": true,
   "range_run_max_cases": 250
@@ -900,7 +900,7 @@ Minimum tests:
 - C&I formula 1, formula 2, and formula 3 select and calculate independently.
 - C&I near-term and longer-term formula paths select correctly.
 - C&I EBITDA shock handles positive, zero, and negative EBITDA.
-- Consumer PD multiplier respects PD caps.
+- Consumer EL multiplier respects EL rate caps.
 - Aggregations reconcile to loan-level totals.
 - Tag population tie-outs calculate differences and tolerance status correctly.
 - Attribution compares two runs at tag level without requiring loan-level output in the attribution report.
@@ -1017,8 +1017,8 @@ CLI responsibilities:
 
 ## 20. Key Open Decisions
 
-- Whether base PD and LGD are supplied directly, inferred from risk ratings, or both.
-- How to convert stressed financial ratios into PD and LGD changes.
+- Whether consumer base EL is supplied directly, inferred from FICO, or both.
+- Whether future versions should convert DSCR/FCCR changes into rating grades or leave them as primary stressed metrics.
 - Exact C&I formula 1, formula 2, and formula 3 definitions.
 - Exact near-term versus longer-term formula definitions by module.
 - Whether sector-level stress assumptions are regulatory, management-defined, or model-derived.

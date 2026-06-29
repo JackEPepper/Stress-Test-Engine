@@ -10,7 +10,7 @@
     "tag_population_targets": "tag_population_targets.csv"
   },
   "required_columns": {
-    "loan_identity": ["loan_id", "borrower_id", "portfolio", "product_type", "sector", "balance", "commitment", "interest_rate", "maturity_date", "risk_rating", "fico", "current_pd", "current_lgd"],
+    "loan_identity": ["loan_id", "borrower_id", "portfolio", "product_type", "sector", "balance", "commitment", "interest_rate", "maturity_date", "risk_rating", "fico", "current_el_rate"],
     "cre_collateral": ["loan_id", "collateral_id", "cre_sector", "noi", "appraised_value", "occupancy_rate", "debt_service", "ltv", "dscr"],
     "ci_financials": ["loan_id", "borrower_id", "industry", "revenue", "ebitda", "debt_service", "total_debt", "cash", "interest_expense"],
     "fico_pd_table": ["fico_min", "fico_max", "base_pd"]
@@ -19,18 +19,10 @@
   "near_term_maturity_days": 365,
   "pd_floor": 0.0001,
   "pd_cap": 1.0,
-  "lgd_floor": 0.0,
-  "lgd_cap": 1.0,
-  "default_pd": {
-    "cre": 0.025,
-    "ci": 0.03,
-    "consumer": 0.04
-  },
-  "default_lgd": {
-    "cre": 0.35,
-    "ci": 0.45,
-    "consumer": 0.55
-  },
+  "el_rate_floor": 0.0,
+  "el_rate_cap": 1.0,
+  "default_consumer_el_rate": 0.025,
+  "default_consumer_lgd": 0.55,
   "ci_formula_rules": [
     {"formula": "formula_2", "sectors": ["construction"]},
     {"formula": "formula_3", "product_types": ["revolver"]}

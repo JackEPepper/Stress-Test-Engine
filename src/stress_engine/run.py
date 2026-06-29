@@ -143,7 +143,19 @@ def _build_outputs(results: pd.DataFrame, tie_outs: pd.DataFrame, metadata: Mapp
 def _finalize_result_columns(results: pd.DataFrame, scenario: Mapping[str, object]) -> pd.DataFrame:
     finalized = results.copy()
     finalized.insert(0, "scenario_id", scenario.get("scenario_id"))
-    for column in ("base_pd", "base_lgd", "base_expected_loss", "stressed_pd", "stressed_lgd", "stressed_expected_loss", "expected_loss_change"):
+    for column in (
+        "base_dscr",
+        "stressed_dscr",
+        "dscr_change",
+        "base_fixed_charge_coverage",
+        "stressed_fixed_charge_coverage",
+        "fixed_charge_coverage_change",
+        "base_el_rate",
+        "base_expected_loss",
+        "stressed_el_rate",
+        "stressed_expected_loss",
+        "expected_loss_change",
+    ):
         if column not in finalized.columns:
             finalized[column] = 0.0
     return finalized

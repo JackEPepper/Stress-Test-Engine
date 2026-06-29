@@ -35,5 +35,7 @@ def apply_selected_stress(
         return stressed
     for column in results.columns:
         stressed[column] = results[column]
+    if "expected_loss_change" not in stressed.columns:
+        stressed["expected_loss_change"] = 0.0
     stressed["expected_loss_change"] = stressed["stressed_expected_loss"].fillna(0) - stressed["base_expected_loss"].fillna(0)
     return stressed

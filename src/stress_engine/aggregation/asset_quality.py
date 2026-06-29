@@ -25,14 +25,14 @@ def _summary_row(group: pd.DataFrame) -> pd.Series:
         {
             "exposure_count": len(group),
             "total_balance": balance,
-            "weighted_average_base_pd": _weighted_average(group, "base_pd", balance),
-            "weighted_average_stressed_pd": _weighted_average(group, "stressed_pd", balance),
-            "weighted_average_base_lgd": _weighted_average(group, "base_lgd", balance),
-            "weighted_average_stressed_lgd": _weighted_average(group, "stressed_lgd", balance),
-            "base_expected_loss": group["base_expected_loss"].sum(),
-            "stressed_expected_loss": group["stressed_expected_loss"].sum(),
-            "expected_loss_change": group["expected_loss_change"].sum(),
-            "expected_loss_change_pct_balance": group["expected_loss_change"].sum() / balance if balance else 0.0,
+            "weighted_average_base_dscr": _weighted_average(group, "base_dscr", balance),
+            "weighted_average_stressed_dscr": _weighted_average(group, "stressed_dscr", balance),
+            "weighted_average_base_fccr": _weighted_average(group, "base_fixed_charge_coverage", balance),
+            "weighted_average_stressed_fccr": _weighted_average(group, "stressed_fixed_charge_coverage", balance),
+            "base_expected_loss": _sum_if_present(group, "base_expected_loss"),
+            "stressed_expected_loss": _sum_if_present(group, "stressed_expected_loss"),
+            "expected_loss_change": _sum_if_present(group, "expected_loss_change"),
+            "expected_loss_change_pct_balance": _sum_if_present(group, "expected_loss_change") / balance if balance else 0.0,
         }
     )
 
@@ -41,6 +41,12 @@ def _weighted_average(group: pd.DataFrame, column: str, balance: float) -> float
     if balance == 0 or column not in group:
         return 0.0
     return float((group[column].fillna(0) * group["balance"]).sum() / balance)
+
+
+def _sum_if_present(group: pd.DataFrame, column: str) -> float:
+    if column not in group:
+        return 0.0
+    return float(group[column].fillna(0).sum())
 
 
 def out_of_scope_summary(frame: pd.DataFrame) -> pd.DataFrame:
