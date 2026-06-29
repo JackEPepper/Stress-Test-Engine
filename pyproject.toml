@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stress-engine"
+version = "0.1.0"
+description = "Deterministic credit stress engine vertical slice"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+where = ["src"]

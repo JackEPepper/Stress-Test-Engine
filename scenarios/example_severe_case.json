@@ -1,0 +1,41 @@
+{
+  "scenario_id": "severe_2026_v1",
+  "as_of_date": "2026-06-30",
+  "treasury_5y_rate": 0.0425,
+  "cre": {
+    "multifamily": {
+      "base_cap_rate": 0.055,
+      "cap_rate_shock": 0.015,
+      "interest_spread": 0.025,
+      "noi_shock": -0.12,
+      "amortization_years": 30
+    },
+    "office": {
+      "base_cap_rate": 0.075,
+      "cap_rate_shock": 0.025,
+      "interest_spread": 0.035,
+      "noi_shock": -0.25,
+      "amortization_years": 25
+    }
+  },
+  "ci": {
+    "formula_1": {
+      "interest_rate_shock": 0.02,
+      "ebitda_shock": -0.15
+    },
+    "formula_2": {
+      "interest_rate_shock": 0.015,
+      "ebitda_shock": -0.10,
+      "revenue_shock": -0.08
+    },
+    "formula_3": {
+      "interest_rate_shock": 0.025,
+      "ebitda_shock": -0.20,
+      "liquidity_haircut": -0.15
+    }
+  },
+  "consumer": {
+    "pd_multiplier": 1.35,
+    "value_loss_shock": -0.10
+  }
+}
