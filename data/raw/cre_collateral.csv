@@ -1,3 +1,0 @@
-loan_id,collateral_id,cre_sector,noi,appraised_value,occupancy_rate,debt_service,ltv,dscr
-L001,COL001,office,95000,1500000,0.88,72000,0.67,1.32
-L005,COL005,office,,400000,0.70,25000,0.75,

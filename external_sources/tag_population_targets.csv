@@ -1,5 +1,0 @@
-source_id,as_of_date,tag_name,population_metric,source_value,tolerance,source_owner
-portfolio_inventory,2026-06-30,eligible_cre,count,2,0,credit_risk
-portfolio_inventory,2026-06-30,eligible_ci,count,2,0,credit_risk
-portfolio_inventory,2026-06-30,eligible_consumer,count,1,0,credit_risk
-portfolio_inventory,2026-06-30,in_scope,balance,2275000,0.01,credit_risk

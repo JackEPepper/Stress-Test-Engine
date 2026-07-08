@@ -1,7 +1,0 @@
-loan_id,borrower_id,portfolio,product_type,sector,balance,commitment,interest_rate,maturity_date,risk_rating,fico,current_el_rate
-L001,B001,CRE,Term,Office,1000000,1000000,0.055,2027-12-31,5,,
-L002,B002,C&I,Term,Manufacturing,750000,900000,0.062,2026-10-31,6,,
-L003,B003,Consumer,Installment,Auto,25000,25000,0.079,2028-03-15,,720,
-L004,B004,C&I,Revolver,Wholesale,500000,700000,0.068,2028-06-30,7,,
-L005,B005,CRE,Term,Office,300000,300000,0.057,2026-09-30,8,,
-L006,B006,Other,Term,Unknown,100000,100000,0.050,2028-01-01,,,

@@ -1,3 +1,0 @@
-loan_id,borrower_id,industry,revenue,ebitda,debt_service,total_debt,cash,interest_expense
-L002,B002,manufacturing,5000000,650000,180000,1800000,250000,110000
-L004,B004,wholesale,3000000,320000,125000,1200000,140000,82000
