@@ -1,0 +1,393 @@
+{
+  "scenario_id": "example_2026q2",
+  "stress_levels": ["S1", "S2"],
+  "run": {
+    "cutoff_date": "2026-06-30"
+  },
+  "outputs": {
+    "directory": "outputs/example_2026q2"
+  },
+  "inputs": {
+    "identity": {
+      "path": "data/loans.csv",
+      "type": "csv",
+      "date_columns": ["maturity_date"],
+      "numeric_columns": ["risk_rating", "outstanding_balance", "cecl_reserve"],
+      "required_columns": ["loan_id", "borrower_id", "outstanding_balance"]
+    },
+    "sources": {
+      "financials": {
+        "path": "data/financials.csv",
+        "type": "csv",
+        "key": "borrower_id",
+        "numeric_columns": [
+          "dscr",
+          "noi",
+          "ebitda",
+          "cash_taxes",
+          "cash_distribution",
+          "cash_dividends",
+          "discretionary_cash_dividends_distribution",
+          "cash_management_fees",
+          "unfinanced_capex",
+          "global_total_outstanding",
+          "cash_paid_for_interest",
+          "principal_repayments_paid",
+          "required_principal_paid_period",
+          "fccr"
+        ],
+        "aggregation": {
+          "dscr": "first",
+          "noi": "first",
+          "ebitda": "first",
+          "cash_taxes": "first",
+          "cash_distribution": "first",
+          "cash_dividends": "first",
+          "discretionary_cash_dividends_distribution": "first",
+          "cash_management_fees": "first",
+          "unfinanced_capex": "first",
+          "global_total_outstanding": "first",
+          "cash_paid_for_interest": "first",
+          "principal_repayments_paid": "first",
+          "required_principal_paid_period": "first",
+          "fccr": "first"
+        }
+      },
+      "collateral": {
+        "path": "data/collateral.csv",
+        "type": "csv",
+        "key": "borrower_id",
+        "date_columns": ["appraisal_date"],
+        "numeric_columns": ["appraised_value"],
+        "aggregation": {
+          "appraised_value_unique_sum": {
+            "method": "unique_sum",
+            "field": "appraised_value",
+            "unique_fields": ["collateral_id"]
+          },
+          "current_appraised_value": {
+            "method": "latest",
+            "field": "appraised_value",
+            "date_field": "appraisal_date"
+          },
+          "appraisal_date": {
+            "method": "latest",
+            "field": "appraisal_date",
+            "date_field": "appraisal_date"
+          }
+        }
+      },
+      "consumer_scores": {
+        "path": "data/consumer_scores.csv",
+        "type": "csv",
+        "key": "borrower_id",
+        "date_columns": ["fico_date"],
+        "numeric_columns": ["fico_score"],
+        "aggregation": {
+          "fico_score": {
+            "method": "latest",
+            "field": "fico_score",
+            "date_field": "fico_date"
+          },
+          "fico_date": {
+            "method": "latest",
+            "field": "fico_date",
+            "date_field": "fico_date"
+          }
+        }
+      },
+      "fico_pd_lookup": {
+        "path": "data/fico_pd_lookup.csv",
+        "type": "csv",
+        "merge": false,
+        "numeric_columns": ["min_score", "max_score", "pd"]
+      },
+      "tag_tieouts": {
+        "path": "data/tag_tieouts.csv",
+        "type": "csv",
+        "merge": false,
+        "numeric_columns": ["expected_balance"]
+      }
+    }
+  },
+  "borrower": {
+    "borrower_id_field": "borrower_id",
+    "loan_id_field": "loan_id",
+    "portfolio_field": "portfolio",
+    "module_field": "module",
+    "balance_field": "outstanding_balance",
+    "balance_fields": ["outstanding_balance"],
+    "sum_fields": ["outstanding_balance", "cecl_reserve"],
+    "risk_rating_field": "risk_rating",
+    "maturity_date_field": "maturity_date",
+    "default_aggregation": "first",
+    "aggregation": {
+      "loan_id": "list_unique",
+      "borrower_name": "first",
+      "portfolio": "first",
+      "module": "first",
+      "status": "first",
+      "cre_subsector": "first",
+      "ci_sector": "first",
+      "risk_rating": "max",
+      "maturity_date": "min",
+      "outstanding_balance": "sum",
+      "cecl_reserve": "sum"
+    }
+  },
+  "tags": {
+    "CRE_Model": {
+      "model_eligible": true,
+      "include": [
+        {"field": "module", "op": "eq", "value": "CRE"}
+      ],
+      "exclude": [
+        {"field": "status", "op": "in", "value": ["Paid Off", "Charged Off"]}
+      ],
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CI_Model": {
+      "model_eligible": true,
+      "include": [
+        {"field": "module", "op": "eq", "value": "C&I"}
+      ],
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "Consumer_Model": {
+      "model_eligible": true,
+      "include": [
+        {"field": "module", "op": "eq", "value": "Consumer"}
+      ],
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "Overlay_Internal": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "portfolio", "op": "in", "value": ["EF", "BCC"]}
+      ],
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Multifamily_Rent_Regulated": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Multifamily Rent Regulated"}
+      ]
+    },
+    "CRE_Subsector_Multifamily_Market": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Multifamily Market"}
+      ]
+    },
+    "CRE_Subsector_Traditional_Office": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Traditional Office"}
+      ]
+    },
+    "CRE_Subsector_Medical_Office": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Medical Office"}
+      ]
+    },
+    "CRE_Subsector_Industrial": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Industrial"}
+      ]
+    },
+    "CRE_Subsector_Skilled_Nursing_Facilities": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Skilled Nursing Facilities"}
+      ]
+    },
+    "CRE_Subsector_Senior_Living": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Senior Living"}
+      ]
+    },
+    "CRE_Subsector_Retail": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Retail"}
+      ]
+    },
+    "CRE_Subsector_Hotel": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "cre_subsector", "op": "eq", "value": "Hotel"}
+      ]
+    },
+    "CI_Sector_Sponsor_and_Specialty": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "ci_sector", "op": "eq", "value": "Sponsor and Specialty"}
+      ]
+    },
+    "CI_Sector_Middle_Market": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "ci_sector", "op": "eq", "value": "Middle Market"}
+      ]
+    },
+    "CI_Sector_Asset_Based_Lending": {
+      "model_eligible": false,
+      "internal_only": true,
+      "include": [
+        {"field": "ci_sector", "op": "eq", "value": "Asset-Based Lending"}
+      ]
+    }
+  },
+  "module_order": ["CRE", "C&I", "Consumer"],
+  "modules": {
+    "CRE": {
+      "enabled": true,
+      "eligible_tags": ["CRE_Model"],
+      "subsector_field": "cre_subsector",
+      "maturity_threshold_months": 12,
+      "noi_balance_ratio_acceptable_range": [0.01, 0.30],
+      "tests": {
+        "dscr": {
+          "field": "dscr",
+          "decline": {
+            "default": {"S1": 0.05, "S2": 0.10},
+            "Traditional Office": {"S1": 0.05, "S2": 0.10},
+            "Multifamily Rent Regulated": {"S1": 0.04, "S2": 0.08},
+            "Multifamily Market": {"S1": 0.05, "S2": 0.10},
+            "Medical Office": {"S1": 0.04, "S2": 0.08},
+            "Industrial": {"S1": 0.04, "S2": 0.08},
+            "Skilled Nursing Facilities": {"S1": 0.06, "S2": 0.12},
+            "Senior Living": {"S1": 0.06, "S2": 0.12},
+            "Retail": {"S1": 0.06, "S2": 0.12},
+            "Hotel": {"S1": 0.08, "S2": 0.15}
+          },
+          "cutoffs": {"special_mention": 1.15, "substandard": 1.00},
+          "acceptable_range": [0.20, 5.00]
+        },
+        "refinance": {
+          "noi_field": "noi",
+          "treasury_rate": 0.04,
+          "credit_spreads": {
+            "default": {"S1": 0.02, "S2": 0.03}
+          },
+          "amortization_years": {
+            "default": {"S1": 25, "S2": 25}
+          },
+          "cutoffs": {"special_mention": 1.15, "substandard": 1.00}
+        },
+        "ltv": {
+          "noi_field": "noi",
+          "cap_rates": {
+            "default": {"S1": 0.075, "S2": 0.085}
+          },
+          "cutoffs": {"special_mention": 0.75, "substandard": 0.90}
+        }
+      }
+    },
+    "C&I": {
+      "enabled": true,
+      "eligible_tags": ["CI_Model"],
+      "sector_field": "ci_sector",
+      "current_fccr_field": "fccr",
+      "ebitda_reduction": {
+        "default": {
+          "Pass": {"S1": 0.10, "S2": 0.20},
+          "Special Mention": {"S1": 0.12, "S2": 0.25},
+          "Substandard": {"S1": 0.00, "S2": 0.00}
+        }
+      },
+      "interest_rate_stress": {"S1": 0.01, "S2": 0.02},
+      "cutoffs": {"special_mention": 1.15, "substandard": 1.00},
+      "sectors": {
+        "Sponsor and Specialty": {
+          "principal_field": "required_principal_paid_period",
+          "include_non_discretionary_dividends": false
+        },
+        "Middle Market": {
+          "principal_field": "principal_repayments_paid",
+          "include_non_discretionary_dividends": true
+        },
+        "Asset-Based Lending": {
+          "principal_field": "required_principal_paid_period",
+          "include_non_discretionary_dividends": true
+        }
+      }
+    },
+    "Consumer": {
+      "enabled": true,
+      "eligible_tags": ["Consumer_Model"],
+      "pd_lookup_source": "fico_pd_lookup",
+      "fico_candidates": [
+        {"score_field": "fico_score", "date_field": "fico_date"}
+      ],
+      "appraisal_candidates": [
+        {"value_field": "current_appraised_value", "date_field": "appraisal_date"}
+      ],
+      "pd_increase_factor": {"S1": 1.25, "S2": 1.50},
+      "collateral_value_factor": {"S1": 0.90, "S2": 0.80},
+      "rushed_sale_discount": 0.05,
+      "closing_costs": 0.02,
+      "pd_cap": 1.00
+    }
+  },
+  "overlays": {
+    "EF": {
+      "enabled": true,
+      "source_portfolios": ["C&I"]
+    },
+    "BCC": {
+      "enabled": true,
+      "source_portfolios": ["CRE", "C&I"]
+    }
+  },
+  "cecl": {
+    "reserve_field": "cecl_reserve",
+    "default_bucket_reserve_ratios": {
+      "Pass": 0.010,
+      "Special Mention": 0.015,
+      "Substandard": 0.050
+    },
+    "portfolios": {
+      "Consumer": {"method": "expected_loss"}
+    }
+  }
+}
