@@ -25,24 +25,71 @@ class SampleScenarioRunTest(unittest.TestCase):
             scenario, base_dir = load_scenario(SCENARIO)
             result = StressEngine(scenario, base_dir).run(output_dir=tmp, write_outputs=True, run_comparison=False)
 
+            identity_columns = set(pd.read_csv(ROOT / "examples" / "data" / "loans.csv").columns)
+            self.assertNotIn("portfolio", identity_columns)
+            self.assertNotIn("module", identity_columns)
+            self.assertNotIn("cre_subsector", identity_columns)
+            self.assertNotIn("ci_sector", identity_columns)
+            self.assertIn("subsector", identity_columns)
+            self.assertIn("tag_hint", identity_columns)
+
             borrowers = result["borrowers"]
-            self.assertEqual(len(borrowers), 11)
+            self.assertEqual(len(borrowers), 15)
             b001 = borrowers.loc[borrowers["borrower_id"] == "B001"].iloc[0]
             self.assertEqual(float(b001["outstanding_balance"]), 1250000.0)
             self.assertEqual(int(b001["loan_count"]), 2)
+            self.assertEqual(float(b001["dscr"]), 1.20)
+            self.assertEqual(b001["dscr_source_field"], "prior_dscr")
+            self.assertEqual(b001["dscr_candidate"], "prior")
             overlap = borrowers.loc[borrowers["borrower_id"] == "B011"].iloc[0]
             self.assertIn("CI_Model", overlap["model_tags"])
-            self.assertNotIn("CRE_Model", overlap["model_tags"])
+            self.assertIn("CRE_Model", overlap["model_tags"])
             self.assertIn("CRE_Subsector_Retail", overlap["all_tags"])
             self.assertIn("CI_Sector_Middle_Market", overlap["all_tags"])
+            self.assertEqual(overlap["subsector"], "Retail")
+            self.assertEqual(overlap["tag_hint"], "Middle Market")
+            self.assertEqual(overlap["eligible_modules"], "CRE;C&I")
+            self.assertEqual(overlap["primary_module"], "CRE")
+            self.assertEqual(overlap["model_portfolio"], "CRE")
+            self.assertEqual(overlap["model_module"], "CRE")
+            self.assertEqual(overlap["cecl_portfolio"], "CRE")
+            self.assertEqual(overlap["cre_subsector"], "Retail")
+            self.assertEqual(overlap["ci_sector"], "Middle Market")
+            self.assertEqual(float(overlap["dscr"]), 1.25)
+            self.assertEqual(overlap["dscr_source_field"], "prior_dscr")
+            b002 = borrowers.loc[borrowers["borrower_id"] == "B002"].iloc[0]
+            self.assertEqual(float(b002["current_appraised_value"]), 1500000.0)
+
+            consumer_borrower = borrowers.loc[borrowers["borrower_id"] == "B007"].iloc[0]
+            self.assertEqual(float(consumer_borrower["fico_score"]), 680.0)
+            self.assertEqual(consumer_borrower["fico_source_field"], "current_fico_score")
+            self.assertEqual(float(consumer_borrower["current_appraised_value"]), 340000.0)
+            self.assertEqual(consumer_borrower["appraisal_source_field"], "current_appraised_value_raw")
 
             tag_summary = result["reports"]["tag_summary"]
             tieouts = tag_summary[tag_summary["tie_out_name"].notna()]
             self.assertTrue(tieouts["passed"].astype(bool).all())
 
+            overlay_summary = result["reports"]["overlay_summary"]
+            bcc_overlay = overlay_summary[
+                (overlay_summary["portfolio"] == "BCC")
+                & (overlay_summary["stress_level"] == "S1")
+            ].iloc[0]
+            self.assertEqual(bcc_overlay["source_portfolios"], "CRE;C&I")
+            self.assertEqual(bcc_overlay["source_weights"], "CRE=0.65;C&I=0.35")
+            self.assertEqual(
+                bcc_overlay["source_selection"],
+                "CRE(tags=CRE_Model;primary_module=required);C&I(tags=CI_Model;primary_module=required)",
+            )
+
             out_scope = result["reports"]["out_of_scope_detail"]
             self.assertEqual(set(out_scope["borrower_id"]), {"B004"})
             self.assertEqual(set(out_scope["field"]), {"dscr"})
+
+            overlap_result = result["results"].loc[result["results"]["borrower_id"] == "B011"].iloc[0]
+            self.assertEqual(overlap_result["module_applied"], "CRE")
+            self.assertGreater(float(overlap_result["cre_dscr_S1"]), 0)
+            self.assertTrue(pd.isna(overlap_result["ci_fccr_S1"]))
 
             consumer = result["reports"]["consumer_summary"]
             s1 = float(consumer.loc[consumer["stress_level"] == "S1", "expected_loss"].iloc[0])
@@ -54,19 +101,51 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertIn("borrower_audit_raw.csv", output_files)
             self.assertIn("stressed_borrower_results.csv", output_files)
             self.assertIn("cecl_summary.csv", output_files)
+            self.assertIn("exception_log.csv", output_files)
             self.assertIn("metadata.json", output_files)
+            self.assertIn("output_manifest.json", output_files)
+            self.assertIn("source_reconciliation.csv", output_files)
+
+            cecl = result["reports"]["cecl_summary"]
+            unavailable = cecl[cecl["cecl_reserve_status"] == "unavailable"]
+            self.assertTrue(unavailable.empty)
+            cre_s2_sub = cecl[
+                (cecl["portfolio"] == "CRE")
+                & (cecl["stress_level"] == "S2")
+                & (cecl["bucket"] == "Substandard")
+            ].iloc[0]
+            self.assertFalse(pd.isna(cre_s2_sub["reserve_ratio"]))
+            self.assertFalse(pd.isna(cre_s2_sub["proforma_cecl_reserve"]))
+
+            exceptions = result["reports"]["exception_log"]
+            self.assertNotIn("CECL_RESERVE_RATIO_UNAVAILABLE", set(exceptions["code"]))
+            self.assertIn("CECL_LOAN_RESERVE_MISSING_TREATED_AS_ZERO", set(exceptions["code"]))
+            self.assertEqual(result["metadata"]["exception_count"], len(exceptions))
+
+            consumer_base = cecl[
+                (cecl["portfolio"] == "Consumer")
+                & (cecl["stress_level"] == "Base")
+                & (cecl["bucket"] == "Total")
+            ].iloc[0]
+            self.assertEqual(float(consumer_base["proforma_cecl_reserve"]), 4000.0)
+            aggregate_base = cecl[
+                (cecl["portfolio"] == "Aggregate")
+                & (cecl["stress_level"] == "Base")
+                & (cecl["bucket"] == "Total")
+            ].iloc[0]
+            self.assertEqual(float(aggregate_base["proforma_cecl_reserve"]), 76000.0)
 
     def test_repeated_runs_are_deterministic_for_core_reports(self):
         first = self._run()
         second = self._run()
-        for report_name in ["migration_summary", "cecl_summary", "consumer_summary", "out_of_scope_summary"]:
+        for report_name in ["migration_summary", "cecl_summary", "consumer_summary", "out_of_scope_summary", "exception_log"]:
             left = first["reports"][report_name].fillna("").sort_index(axis=1).reset_index(drop=True)
             right = second["reports"][report_name].fillna("").sort_index(axis=1).reset_index(drop=True)
             pd.testing.assert_frame_equal(left, right, check_dtype=False)
 
     def test_changed_scenario_variable_produces_marginal_report(self):
         scenario, base_dir = load_scenario(SCENARIO)
-        scenario["modules"]["CRE"]["tests"]["dscr"]["decline"]["Traditional Office"]["S1"] = 0.20
+        scenario["modules"]["Consumer"]["pd_increase_factor"]["S1"] = 2.00
         result = StressEngine(scenario, base_dir).run(write_outputs=False, run_comparison=False)
         diff = build_comparison_report(
             scenario,
@@ -77,6 +156,44 @@ class SampleScenarioRunTest(unittest.TestCase):
         scenario_rows = diff[diff["change_kind"] == "scenario_variable"]
         self.assertFalse(scenario_rows.empty)
         self.assertTrue((scenario_rows["marginal_impact"].astype(float) != 0).any())
+
+    def test_cre_cecl_can_remain_at_subsector_level(self):
+        scenario, base_dir = load_scenario(SCENARIO)
+        scenario["modules"]["CRE"].pop("cecl_portfolio_rollup")
+        result = StressEngine(scenario, base_dir).run(write_outputs=False, run_comparison=False)
+        overlap = result["borrowers"].loc[result["borrowers"]["borrower_id"] == "B011"].iloc[0]
+        self.assertEqual(overlap["cecl_portfolio"], "Retail")
+        cecl = result["reports"]["cecl_summary"]
+        self.assertIn("Retail", set(cecl["portfolio"]))
+        retail_rows = cecl[(cecl["portfolio"] == "Retail") & (cecl["bucket"] == "Total")]
+        self.assertFalse(retail_rows.empty)
+
+    def test_overlay_source_weights_change_tagged_source_ratios(self):
+        scenario, base_dir = load_scenario(SCENARIO)
+        scenario["overlays"]["BCC"]["sources"][0]["weight"] = 1.0
+        scenario["overlays"]["BCC"]["sources"][1]["weight"] = 0.0
+        cre_only = StressEngine(scenario, base_dir).run(write_outputs=False, run_comparison=False)
+        cre_ratio = float(
+            cre_only["reports"]["overlay_summary"].loc[
+                (cre_only["reports"]["overlay_summary"]["portfolio"] == "BCC")
+                & (cre_only["reports"]["overlay_summary"]["stress_level"] == "S1"),
+                "weighted_source_stressed_substandard_ratio",
+            ].iloc[0]
+        )
+
+        scenario, base_dir = load_scenario(SCENARIO)
+        scenario["overlays"]["BCC"]["sources"][0]["weight"] = 0.0
+        scenario["overlays"]["BCC"]["sources"][1]["weight"] = 1.0
+        ci_only = StressEngine(scenario, base_dir).run(write_outputs=False, run_comparison=False)
+        ci_ratio = float(
+            ci_only["reports"]["overlay_summary"].loc[
+                (ci_only["reports"]["overlay_summary"]["portfolio"] == "BCC")
+                & (ci_only["reports"]["overlay_summary"]["stress_level"] == "S1"),
+                "weighted_source_stressed_substandard_ratio",
+            ].iloc[0]
+        )
+
+        self.assertNotEqual(cre_ratio, ci_ratio)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
+from .exceptions import record_exception
 from .io import LoadedTable
 from .utils import as_list, compare_values, stable_name, to_number
 
@@ -15,7 +16,15 @@ def apply_tags(
     borrowers: pd.DataFrame,
     scenario: Mapping[str, Any],
     loaded: Mapping[str, LoadedTable],
+    exceptions: List[Dict[str, Any]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate scenario tags, assignments, and tie-outs against borrowers.
+
+    Called by `StressEngine.run` after borrower aggregation. Tag columns drive
+    model eligibility, reconciliation-only populations, and derived fields such
+    as `cre_subsector`, `ci_sector`, and `model_portfolio`.
+    """
+    exceptions = exceptions if exceptions is not None else []
     result = borrowers.copy()
     tag_rows: List[Dict[str, Any]] = []
     tag_defs = normalize_tag_defs(scenario.get("tags", {}))
@@ -26,10 +35,32 @@ def apply_tags(
         tag_col = f"tag_{stable_name(name)}"
         include = tag.get("include", tag.get("conditions", []))
         exclude = tag.get("exclude", [])
+        missing_condition_fields = sorted(
+            field for field in (_condition_fields(include) | _condition_fields(exclude)) if field not in result.columns
+        )
+        for field in missing_condition_fields:
+            record_exception(
+                exceptions,
+                "ERROR",
+                "tagging",
+                "TAG_CONDITION_FIELD_MISSING",
+                "A tag referenced a field that was not present in the borrower identity data; the condition matched no borrowers.",
+                field=field,
+                source=name,
+            )
         mask = evaluate_conditions(result, include)
         if exclude:
             mask &= ~evaluate_conditions(result, exclude)
         result[tag_col] = mask.fillna(False).astype(bool)
+        # Assignments let input files stay narrow. For example, a single
+        # `subsector` token can derive both model routing and CECL grouping.
+        _apply_assignments(
+            result,
+            result[tag_col],
+            tag.get("assign", tag.get("set_fields", {})),
+            exceptions,
+            name,
+        )
         result.loc[result[tag_col], "all_tags"] = (
             result.loc[result[tag_col], "all_tags"].fillna("")
             if "all_tags" in result.columns
@@ -54,7 +85,44 @@ def apply_tags(
         }
         tag_rows.append(row)
         for tieout in as_list(tag.get("tie_out")):
-            tag_rows.append(_evaluate_tieout(name, tag_col, result, tieout, loaded, balance_field))
+            tieout_row = _evaluate_tieout(name, tag_col, result, tieout, loaded, balance_field)
+            tag_rows.append(tieout_row)
+            match_count = tieout_row.get("expected_match_count")
+            if pd.notna(match_count) and int(match_count) == 0:
+                record_exception(
+                    exceptions,
+                    "WARNING",
+                    "tagging",
+                    "TAG_TIEOUT_EXPECTED_ROW_MISSING",
+                    "No expected tie-out row matched this tag; expected amount was treated as zero for display only.",
+                    source=str(tieout.get("source", "scenario")),
+                    field=name,
+                )
+            elif pd.notna(match_count) and int(match_count) > 1:
+                record_exception(
+                    exceptions,
+                    "WARNING",
+                    "tagging",
+                    "TAG_TIEOUT_EXPECTED_ROWS_DUPLICATE",
+                    "Multiple expected tie-out rows matched this tag and were summed.",
+                    source=str(tieout.get("source", "scenario")),
+                    field=name,
+                    details=f"match_count={int(match_count)}",
+                )
+            if tieout_row.get("passed") is False:
+                record_exception(
+                    exceptions,
+                    "WARNING",
+                    "tagging",
+                    "TAG_TIEOUT_DIFFERENCE",
+                    "Tag population did not reconcile to the configured expected total within tolerance.",
+                    source=str(tieout.get("source", "scenario")),
+                    field=name,
+                    details=(
+                        f"expected={tieout_row['expected']}; actual={tieout_row['actual']}; "
+                        f"difference={tieout_row['difference']}; tolerance={tieout_row['tolerance']}"
+                    ),
+                )
 
     tag_summary = pd.DataFrame(tag_rows)
     result["all_tags"] = _tag_list(result, tag_defs, include_internal=True)
@@ -63,6 +131,7 @@ def apply_tags(
 
 
 def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
+    """Normalize object-style or list-style scenario tag definitions."""
     if isinstance(tags, Mapping):
         out = []
         for name, spec in tags.items():
@@ -76,6 +145,11 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
 
 
 def evaluate_conditions(df: pd.DataFrame, conditions: Any) -> pd.Series:
+    """Return a boolean mask for JSON condition blocks.
+
+    Called by `apply_tags` and tie-out lookup filtering. Supports implicit
+    AND lists plus explicit `all` and `any` blocks for nested logic.
+    """
     if not conditions:
         return pd.Series(True, index=df.index)
     if isinstance(conditions, Mapping):
@@ -98,6 +172,7 @@ def evaluate_conditions(df: pd.DataFrame, conditions: Any) -> pd.Series:
 
 
 def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Series:
+    """Evaluate one atomic condition against a DataFrame column."""
     field = condition.get("field")
     op = str(condition.get("op", "eq")).lower()
     value = condition.get("value")
@@ -128,18 +203,122 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
         numeric = pd.to_numeric(series, errors="coerce")
         return (numeric >= to_number(lower)) & (numeric <= to_number(upper))
     if op == "contains":
-        return series.astype(str).str.contains(str(value), case=bool(condition.get("case", False)), na=False)
+        return series.astype(str).str.contains(
+            str(value), case=bool(condition.get("case", False)), regex=False, na=False
+        )
+    if op in {"has_token", "token_in"}:
+        values = set(_normalize_tokens(value, condition))
+        return series.apply(lambda item: bool(set(_split_tokens(item, condition)) & values))
+    if op in {"has_any_token", "contains_any"}:
+        values = set(_normalize_tokens(value, condition))
+        return series.apply(lambda item: bool(set(_split_tokens(item, condition)) & values))
+    if op in {"has_all_tokens", "contains_all"}:
+        values = set(_normalize_tokens(value, condition))
+        if not values:
+            return pd.Series(False, index=df.index)
+        return series.apply(lambda item: values.issubset(set(_split_tokens(item, condition))))
     if op == "startswith":
-        return series.astype(str).str.startswith(str(value), na=False)
+        left = series.astype(str)
+        right = str(value)
+        if not bool(condition.get("case", False)):
+            left = left.str.lower()
+            right = right.lower()
+        return left.str.startswith(right, na=False)
     if op == "endswith":
-        return series.astype(str).str.endswith(str(value), na=False)
+        left = series.astype(str)
+        right = str(value)
+        if not bool(condition.get("case", False)):
+            left = left.str.lower()
+            right = right.lower()
+        return left.str.endswith(right, na=False)
     if op in {"is_null", "null"}:
         return series.isna()
     if op in {"not_null", "notnull"}:
         return series.notna()
     if op == "regex":
-        return series.astype(str).str.contains(str(value), regex=True, na=False)
+        return series.astype(str).str.contains(
+            str(value), regex=True, case=bool(condition.get("case", True)), na=False
+        )
     raise ValueError(f"Unsupported tag condition operator: {op}")
+
+
+def _apply_assignments(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    assignments: Mapping[str, Any],
+    exceptions: List[Dict[str, Any]],
+    tag_name: str,
+) -> None:
+    """Write derived field values for rows matched by a tag.
+
+    Called from `apply_tags`. Assignments are intentionally simple so derived
+    routing fields are auditable in `borrower_audit_raw.csv`.
+    """
+    for field, value_spec in assignments.items():
+        if field not in df.columns:
+            df[field] = np.nan
+        if isinstance(value_spec, Mapping) and "from_field" in value_spec:
+            source = value_spec["from_field"]
+            if source not in df.columns:
+                raise ValueError(f"Tag assignment references missing source field '{source}'.")
+            values = df[source]
+        else:
+            values = pd.Series(value_spec, index=df.index)
+        candidate = values if isinstance(values, pd.Series) else pd.Series(values, index=df.index)
+        existing = df[field]
+        comparable_existing = existing.astype(str)
+        comparable_candidate = candidate.astype(str)
+        conflict = mask & existing.notna() & candidate.notna() & comparable_existing.ne(comparable_candidate)
+        if conflict.any():
+            record_exception(
+                exceptions,
+                "WARNING",
+                "tagging",
+                "TAG_ASSIGNMENT_CONFLICT",
+                "Multiple tags attempted to assign different values to the same field; the first assignment was retained.",
+                field=field,
+                source=tag_name,
+                details=f"conflict_count={int(conflict.sum())}",
+            )
+        write_mask = mask & existing.isna()
+        df.loc[write_mask, field] = candidate.loc[write_mask]
+
+
+def _condition_fields(conditions: Any) -> set[str]:
+    """Collect field references from nested condition blocks for validation."""
+    if isinstance(conditions, Mapping):
+        fields = {str(conditions["field"])} if conditions.get("field") else set()
+        for key in ("all", "any"):
+            for item in as_list(conditions.get(key)):
+                fields.update(_condition_fields(item))
+        return fields
+    fields: set[str] = set()
+    for item in as_list(conditions):
+        fields.update(_condition_fields(item))
+    return fields
+
+
+def _normalize_tokens(value: Any, condition: Mapping[str, Any]) -> List[str]:
+    """Normalize a condition value into comparable delimited tokens."""
+    tokens: List[str] = []
+    for item in as_list(value):
+        tokens.extend(_split_tokens(item, condition))
+    return tokens
+
+
+def _split_tokens(value: Any, condition: Mapping[str, Any]) -> List[str]:
+    """Split semicolon/comma/pipe token fields for subsector-style tags."""
+    if pd.isna(value):
+        return []
+    delimiters = condition.get("delimiters", [";", "|", ","])
+    text = str(value)
+    for delimiter in delimiters:
+        text = text.replace(str(delimiter), ";")
+    case_sensitive = bool(condition.get("case", False))
+    tokens = [token.strip() for token in text.split(";") if token.strip()]
+    if not case_sensitive:
+        tokens = [token.lower() for token in tokens]
+    return tokens
 
 
 def _evaluate_tieout(
@@ -150,11 +329,18 @@ def _evaluate_tieout(
     loaded: Mapping[str, LoadedTable],
     default_balance_field: str,
 ) -> Dict[str, Any]:
+    """Calculate one tag reconciliation row.
+
+    Called by `apply_tags` when a tag defines `tie_out`. Actual values come
+    from the tagged borrower population; expected values come from either JSON
+    constants or an external tie-out input table.
+    """
     source_name = tieout.get("source")
     actual_field = tieout.get("actual_field", tieout.get("balance_field", default_balance_field))
     tolerance = float(tieout.get("tolerance", 0.0))
     actual = float(pd.to_numeric(borrowers.loc[borrowers[tag_col], actual_field], errors="coerce").sum())
     expected = tieout.get("expected")
+    expected_match_count = np.nan
     if expected is None:
         if source_name not in loaded:
             raise ValueError(f"Tie-out for tag '{tag_name}' references unknown source '{source_name}'.")
@@ -167,8 +353,11 @@ def _evaluate_tieout(
             filtered = filtered[evaluate_conditions(filtered, [condition])]
         if "key_field" in tieout:
             key_field = tieout["key_field"]
+            if key_field not in filtered.columns:
+                raise ValueError(f"Tie-out source '{source_name}' missing key field '{key_field}'.")
             match_value = tieout.get("match_value", tag_name)
             filtered = filtered[filtered[key_field] == match_value]
+        expected_match_count = int(len(filtered))
         expected = float(pd.to_numeric(filtered[amount_field], errors="coerce").sum())
     expected = float(expected)
     difference = actual - expected
@@ -186,10 +375,12 @@ def _evaluate_tieout(
         "difference": difference,
         "tolerance": tolerance,
         "passed": bool(abs(difference) <= tolerance),
+        "expected_match_count": expected_match_count,
     }
 
 
 def _tag_list(df: pd.DataFrame, tag_defs: List[Mapping[str, Any]], include_internal: bool) -> pd.Series:
+    """Build semicolon-delimited tag audit columns."""
     values: List[str] = []
     for _, row in df.iterrows():
         active: List[str] = []
@@ -204,5 +395,107 @@ def _tag_list(df: pd.DataFrame, tag_defs: List[Mapping[str, Any]], include_inter
 
 
 def model_eligible_tag_names(scenario: Mapping[str, Any]) -> set[str]:
+    """Return tags allowed to control module populations."""
     tags = normalize_tag_defs(scenario.get("tags", {}))
     return {str(tag["name"]) for tag in tags if tag.get("model_eligible", True)}
+
+
+def apply_module_priority(
+    df: pd.DataFrame,
+    scenario: Mapping[str, Any],
+    exceptions: List[Dict[str, Any]] | None = None,
+) -> pd.DataFrame:
+    """Resolve one primary stress module from active model tags.
+
+    The active model tags remain visible in ``model_tags`` for auditability, but
+    downstream stress modules use ``primary_module`` to avoid double-stressing
+    borrowers that satisfy more than one model tag.
+    """
+    exceptions = exceptions if exceptions is not None else []
+    result = df.copy()
+    modules = scenario.get("modules", {})
+    priority = [str(item) for item in scenario.get("module_priority", scenario.get("module_order", list(modules)))]
+    priority_rank = {_normalize_module_name(name): idx for idx, name in enumerate(priority)}
+    module_specs = []
+    for module_name, config in modules.items():
+        normalized = _normalize_module_name(module_name)
+        module_specs.append(
+            {
+                "name": str(module_name),
+                "normalized": normalized,
+                "rank": int(config.get("priority", priority_rank.get(normalized, len(priority_rank) + len(module_specs)))),
+                "eligible_tags": [str(tag) for tag in as_list(config.get("eligible_tags"))],
+                "portfolio_label": config.get("portfolio_label", str(module_name)),
+            }
+        )
+    module_specs.sort(key=lambda item: (item["rank"], item["name"]))
+    result["eligible_modules"] = ""
+    if "primary_module" not in result.columns:
+        result["primary_module"] = pd.Series(pd.NA, index=result.index, dtype=object)
+    else:
+        result["primary_module"] = result["primary_module"].astype(object)
+
+    borrower_cfg = scenario.get("borrower", {})
+    module_field = borrower_cfg.get("module_field", "model_module")
+    portfolio_field = borrower_cfg.get("portfolio_field", "model_portfolio")
+    cecl = scenario.get("cecl", {})
+    cecl_portfolio_field = cecl.get("portfolio_field", "cecl_portfolio")
+    if module_field not in result.columns:
+        result[module_field] = pd.Series(pd.NA, index=result.index, dtype=object)
+    else:
+        result[module_field] = result[module_field].astype(object)
+    if portfolio_field not in result.columns:
+        result[portfolio_field] = pd.Series(pd.NA, index=result.index, dtype=object)
+    else:
+        result[portfolio_field] = result[portfolio_field].astype(object)
+    if cecl_portfolio_field not in result.columns:
+        result[cecl_portfolio_field] = pd.Series(pd.NA, index=result.index, dtype=object)
+    else:
+        result[cecl_portfolio_field] = result[cecl_portfolio_field].astype(object)
+
+    for idx, row in result.iterrows():
+        active = []
+        for spec in module_specs:
+            if any(bool(row.get(f"tag_{stable_name(tag)}", False)) for tag in spec["eligible_tags"]):
+                active.append(spec)
+        if not active:
+            existing_module = row.get(module_field)
+            if pd.notna(existing_module):
+                result.at[idx, "primary_module"] = existing_module
+            existing_portfolio = row.get(portfolio_field)
+            if pd.notna(existing_portfolio):
+                result.at[idx, cecl_portfolio_field] = existing_portfolio
+            continue
+        selected = active[0]
+        # The selected module is the first active module after priority sort.
+        # Other active modules remain in `eligible_modules` for audit review.
+        result.at[idx, "eligible_modules"] = ";".join(spec["name"] for spec in active)
+        if len(active) > 1:
+            record_exception(
+                exceptions,
+                "WARNING",
+                "tagging",
+                "MODEL_MODULE_OVERLAP_RESOLVED",
+                "Borrower matched multiple model modules; configured priority selected the primary module.",
+                borrower_id=row.get(scenario.get("borrower", {}).get("borrower_id_field", "borrower_id")),
+                module=selected["name"],
+                details=f"eligible_modules={';'.join(spec['name'] for spec in active)}",
+            )
+        result.at[idx, "primary_module"] = selected["name"]
+        result.at[idx, module_field] = selected["name"]
+        result.at[idx, portfolio_field] = selected["portfolio_label"]
+        selected_module_config = modules.get(selected["name"], {})
+        cecl_rollup = selected_module_config.get("cecl_portfolio_rollup")
+        cecl_source_field = selected_module_config.get("cecl_portfolio_field")
+        if cecl_rollup:
+            result.at[idx, cecl_portfolio_field] = cecl_rollup
+        elif cecl_source_field and cecl_source_field in result.columns and pd.notna(row.get(cecl_source_field)):
+            result.at[idx, cecl_portfolio_field] = row.get(cecl_source_field)
+        else:
+            result.at[idx, cecl_portfolio_field] = selected["portfolio_label"]
+    return result
+
+
+def _normalize_module_name(value: Any) -> str:
+    """Normalize module labels before comparing scenario names."""
+    return str(value).lower().replace("&", "and").replace(" ", "_")

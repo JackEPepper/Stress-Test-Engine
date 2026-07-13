@@ -1,0 +1,26 @@
+{
+  "scenario_batch": {
+    "mode": "grid",
+    "output_directory": "outputs/example_batch",
+    "include_base": true,
+    "delta_from_base": true,
+    "max_scenarios": 20,
+    "variables": [
+      {
+        "name": "CRE DSCR S1 decline",
+        "path": "modules.CRE.tests.dscr.decline.default.S1",
+        "range": {
+          "start": 0.03,
+          "stop": 0.07,
+          "step": 0.02
+        },
+        "precision": 4
+      },
+      {
+        "name": "Consumer PD S2 factor",
+        "path": "modules.Consumer.pd_increase_factor.S2",
+        "values": [1.25, 1.50]
+      }
+    ]
+  }
+}

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+import pandas as pd
+
 from .utils import deep_merge, hash_json, resolve_path
 
 
@@ -47,6 +49,7 @@ def load_scenario(paths: str | Path | Iterable[str | Path]) -> Tuple[Dict[str, A
 
 
 def validate_scenario(scenario: Dict[str, Any]) -> None:
+    """Perform lightweight required-section validation after JSON merge."""
     required = ["inputs", "borrower", "tags", "modules"]
     missing = [key for key in required if key not in scenario]
     if missing:
@@ -57,9 +60,20 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     for field in ("borrower_id_field", "balance_field"):
         if field not in borrower:
             raise ValueError(f"Scenario borrower section must define '{field}'.")
+    levels = [str(level) for level in scenario.get("stress_levels", ["S1", "S2"])]
+    if not levels or len(levels) != len(set(levels)):
+        raise ValueError("Scenario stress_levels must contain unique, nonblank levels.")
+    if any(not level.strip() for level in levels):
+        raise ValueError("Scenario stress_levels cannot contain blank names.")
+    cre = scenario.get("modules", {}).get("CRE", scenario.get("modules", {}).get("cre", {}))
+    if cre and cre.get("enabled", True):
+        cutoff = scenario.get("run", {}).get("cutoff_date", scenario.get("cutoff_date"))
+        if cutoff is None or pd.isna(pd.to_datetime(cutoff, errors="coerce")):
+            raise ValueError("An enabled CRE module requires a valid run.cutoff_date.")
 
 
 def output_dir_for(scenario: Dict[str, Any], base_dir: Path, override: str | Path | None = None) -> Path:
+    """Resolve the scenario or CLI output directory relative to scenario JSON."""
     if override:
         return resolve_path(override, base_dir)
     outputs = scenario.get("outputs", {})

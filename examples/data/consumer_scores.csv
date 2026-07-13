@@ -1,3 +1,3 @@
-borrower_id,fico_date,fico_score
-B007,2023-06-30,700
-B007,2026-06-15,680
+borrower_id,current_fico_score,current_fico_date,origination_fico_score,origination_fico_date
+B007,0,2026-01-01,700,2023-06-30
+B007,680,2026-06-15,700,2023-06-30

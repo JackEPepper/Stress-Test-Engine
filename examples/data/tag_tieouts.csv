@@ -1,5 +1,13 @@
 tag,expected_balance
-CRE_Model,3150000
-CI_Model,1950000
-Consumer_Model,300000
-Overlay_Internal,600000
+CRE_Subsector_Multifamily_Rent_Regulated,0
+CRE_Subsector_Multifamily_Market,800000
+CRE_Subsector_Traditional_Office,1250000
+CRE_Subsector_Medical_Office,0
+CRE_Subsector_Industrial,500000
+CRE_Subsector_Skilled_Nursing_Facilities,0
+CRE_Subsector_Senior_Living,0
+CRE_Subsector_Retail,900000
+CRE_Subsector_Hotel,100000
+CI_Sector_Sponsor_and_Specialty,600000
+CI_Sector_Middle_Market,1100000
+CI_Sector_Asset_Based_Lending,550000
