@@ -7,9 +7,15 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from .base import module_population, record_out_of_scope
+from .base import append_module, module_population, record_out_of_scope
 from ..exceptions import record_exception
 from ..utils import get_levels, is_missing, lookup_parameter_with_source, lower_metric_bucket, to_number, worse_bucket
+
+
+DEFAULT_SECTOR_CONFIG = {
+    "principal_field": "principal_repayments_paid",
+    "include_non_discretionary_dividends": False,
+}
 
 
 def run_ci(
@@ -24,7 +30,7 @@ def run_ci(
     substitutions that still leave the borrower in scope.
     """
     exceptions = exceptions if exceptions is not None else []
-    config = scenario.get("modules", {}).get("C&I", scenario.get("modules", {}).get("CI", scenario.get("modules", {}).get("ci", {})))
+    config = scenario.get("modules", {}).get("C&I", {})
     if not config or not config.get("enabled", True):
         return results, pd.DataFrame()
     config = dict(config)
@@ -37,20 +43,20 @@ def run_ci(
     fallback_events: set[tuple[str, str, str]] = set()
     sector_field = config.get("sector_field", "ci_sector")
     fields = {
-        "ebitda": config.get("ebitda_field", "ebitda"),
-        "cash_taxes": config.get("cash_taxes_field", "cash_taxes"),
-        "cash_distribution": config.get("cash_distribution_field", "cash_distribution"),
-        "cash_dividends": config.get("cash_dividends_field", "cash_dividends"),
-        "discretionary_dividends": config.get("discretionary_dividends_field", "discretionary_cash_dividends_distribution"),
-        "cash_management_fees": config.get("cash_management_fees_field", "cash_management_fees"),
-        "capex": config.get("unfinanced_capex_field", "unfinanced_capex"),
-        "global_outstanding": config.get("global_total_outstanding_field", "global_total_outstanding"),
-        "interest": config.get("cash_paid_interest_field", "cash_paid_for_interest"),
+        "ebitda": "ebitda",
+        "cash_taxes": "cash_taxes",
+        "cash_distribution": "cash_distribution",
+        "cash_dividends": "cash_dividends",
+        "discretionary_dividends": "discretionary_cash_dividends_distribution",
+        "cash_management_fees": "cash_management_fees",
+        "capex": "unfinanced_capex",
+        "global_outstanding": "global_total_outstanding",
+        "interest": "cash_paid_for_interest",
     }
 
     for level in levels:
         for idx, row in out.loc[mask].iterrows():
-            out.at[idx, "module_applied"] = _append_module(out.at[idx, "module_applied"], "C&I")
+            out.at[idx, "module_applied"] = append_module(out.at[idx, "module_applied"], "C&I")
             base_bucket = row.get("base_bucket", "Unknown")
             if base_bucket == "Substandard":
                 # Substandard is the highest commercial bucket; keep it fixed.
@@ -217,7 +223,7 @@ def _calculate_fccr(
         - _value(row, fields["capex"])
     )
 
-    principal_field = sector_cfg.get("principal_field", config.get("principal_repayments_field", "principal_repayments_paid"))
+    principal_field = sector_cfg["principal_field"]
     if interest_rate_stress is None:
         interest_rate_stress = to_number(
             lookup_parameter_with_source(config.get("interest_rate_stress"), sector, level, np.nan)[0], np.nan
@@ -253,11 +259,25 @@ def _calculate_fccr(
 
 
 def _sector_config(config: Mapping[str, Any], sector: Any) -> tuple[Mapping[str, Any], bool]:
-    """Return sector-specific formula options and whether default was used."""
+    """Return complete sector formula options and whether a fallback was used."""
     sectors = config.get("sectors", {})
+    if not isinstance(sectors, Mapping):
+        raise ValueError("modules.C&I.sectors must be a JSON object.")
     if str(sector) in sectors:
-        return sectors[str(sector)], False
-    return sectors.get("default", {}), True
+        sector_config = sectors[str(sector)]
+        used_default = False
+    else:
+        sector_config = sectors.get("default", {})
+        used_default = True
+    if not isinstance(sector_config, Mapping):
+        source = f"sector '{sector}'" if not used_default else "the default sector"
+        raise ValueError(f"modules.C&I.sectors configuration for {source} must be a JSON object.")
+    merged = {**DEFAULT_SECTOR_CONFIG, **sector_config}
+    principal_field = merged.get("principal_field")
+    if not isinstance(principal_field, str) or not principal_field.strip():
+        source = f"sector '{sector}'" if not used_default else "the default sector"
+        raise ValueError(f"modules.C&I.sectors configuration for {source} requires principal_field.")
+    return merged, used_default
 
 
 def _ebitda_reduction(config: Mapping[str, Any], sector: Any, bucket: str, level: str) -> tuple[float, str]:
@@ -318,7 +338,7 @@ def _fields_used(sector_cfg: Mapping[str, Any], fields: Mapping[str, str]) -> Li
         fields["capex"],
         fields["global_outstanding"],
         fields["interest"],
-        sector_cfg.get("principal_field", "principal_repayments_paid"),
+        sector_cfg.get("principal_field", DEFAULT_SECTOR_CONFIG["principal_field"]),
     ]
     if sector_cfg.get("include_non_discretionary_dividends", False):
         used.extend([fields["cash_dividends"], fields["discretionary_dividends"]])
@@ -335,13 +355,3 @@ def _ratio(numerator: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return numerator / denominator
-
-
-def _append_module(existing: Any, module: str) -> str:
-    """Append the module name to the borrower-level module audit field."""
-    if not existing:
-        return module
-    pieces = [item for item in str(existing).split(";") if item]
-    if module not in pieces:
-        pieces.append(module)
-    return ";".join(pieces)

@@ -1,10 +1,6 @@
-borrower_id,current_dscr,current_dscr_date,prior_dscr,prior_dscr_date,origination_dscr,noi,ebitda,cash_taxes,cash_distribution,cash_dividends,discretionary_cash_dividends_distribution,cash_management_fees,unfinanced_capex,global_total_outstanding,cash_paid_for_interest,principal_repayments_paid,required_principal_paid_period,fccr
-B001,0,2026-03-31,1.20,2025-12-31,1.35,150000,,,,,,,,,,,,
-B002,1.30,2026-03-31,1.20,2025-12-31,1.40,70000,,,,,,,,,,,,
-B003,1.05,2026-03-31,,,1.15,50000,,,,,,,,,,,,
-B004,,,0,2025-12-31,,30000,,,,,,,,,,,,
-B005,,,,,,,160000,20000,10000,15000,5000,3000,20000,700000,35000,20000,25000,1.80
-B006,,,,,,,80000,8000,10000,0,0,2000,15000,500000,30000,15000,50000,1.10
-B010,,,,,,,100000,10000,5000,12000,2000,2000,10000,450000,24000,12000,35000,1.50
-B011,0,2026-03-31,1.25,2025-12-31,1.30,40000,90000,9000,5000,8000,2000,1000,8000,300000,18000,10000,12000,1.60
-B013,,,,,,,70000,7000,4000,6000,1000,1000,6000,100000,6000,5000,6000,1.30
+borrower_id,ebitda,cash_taxes,cash_distribution,cash_dividends,discretionary_cash_dividends_distribution,cash_management_fees,unfinanced_capex,global_total_outstanding,cash_paid_for_interest,principal_repayments_paid,required_principal_paid_period
+B005,160000,20000,10000,15000,5000,3000,20000,700000,35000,20000,25000
+B006,80000,8000,10000,0,0,2000,15000,500000,30000,15000,50000
+B010,100000,10000,5000,12000,2000,2000,10000,450000,24000,12000,35000
+B011,90000,9000,5000,8000,2000,1000,8000,300000,18000,10000,12000
+B013,70000,7000,4000,6000,1000,1000,6000,100000,6000,5000,6000

@@ -9,7 +9,7 @@ import pandas as pd
 
 from .exceptions import record_exception
 from .io import LoadedTable
-from .utils import as_list, compare_values, stable_name, to_number
+from .utils import as_list, compare_values, condition_fields, stable_name, to_number
 
 
 def apply_tags(
@@ -33,10 +33,10 @@ def apply_tags(
     for tag in tag_defs:
         name = tag["name"]
         tag_col = f"tag_{stable_name(name)}"
-        include = tag.get("include", tag.get("conditions", []))
+        include = tag.get("include", [])
         exclude = tag.get("exclude", [])
         missing_condition_fields = sorted(
-            field for field in (_condition_fields(include) | _condition_fields(exclude)) if field not in result.columns
+            field for field in (condition_fields(include) | condition_fields(exclude)) if field not in result.columns
         )
         for field in missing_condition_fields:
             record_exception(
@@ -57,14 +57,9 @@ def apply_tags(
         _apply_assignments(
             result,
             result[tag_col],
-            tag.get("assign", tag.get("set_fields", {})),
+            tag.get("assign", {}),
             exceptions,
             name,
-        )
-        result.loc[result[tag_col], "all_tags"] = (
-            result.loc[result[tag_col], "all_tags"].fillna("")
-            if "all_tags" in result.columns
-            else ""
         )
 
         tagged = result[result[tag_col]]
@@ -72,7 +67,6 @@ def apply_tags(
             "tag": name,
             "tag_column": tag_col,
             "model_eligible": bool(tag.get("model_eligible", True)),
-            "internal_only": bool(tag.get("internal_only", False)),
             "borrower_count": int(len(tagged)),
             "balance_field": balance_field,
             "balance": float(pd.to_numeric(tagged.get(balance_field, pd.Series(dtype=float)), errors="coerce").sum()),
@@ -131,17 +125,19 @@ def apply_tags(
 
 
 def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
-    """Normalize object-style or list-style scenario tag definitions."""
-    if isinstance(tags, Mapping):
-        out = []
-        for name, spec in tags.items():
-            item = dict(spec)
-            item.setdefault("name", name)
-            out.append(item)
-        return out
-    if isinstance(tags, list):
-        return [dict(item) for item in tags]
-    raise ValueError("Scenario tags must be an object or a list.")
+    """Convert the required object-style tag definitions to a list."""
+    if not isinstance(tags, Mapping):
+        raise ValueError("Scenario tags must be a JSON object keyed by tag name.")
+    out = []
+    for name, spec in tags.items():
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"Tag '{name}' must be a JSON object.")
+        if "name" in spec:
+            raise ValueError(f"Tag '{name}' must use its object key as the name; remove the nested name field.")
+        item = dict(spec)
+        item["name"] = str(name)
+        out.append(item)
+    return out
 
 
 def evaluate_conditions(df: pd.DataFrame, conditions: Any) -> pd.Series:
@@ -180,14 +176,14 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
         return pd.Series(False, index=df.index)
     series = df[field]
 
-    if op in {"eq", "=="}:
+    if op == "eq":
         return series.apply(lambda item: compare_values(item, value))
-    if op in {"ne", "!="}:
+    if op == "ne":
         return ~series.apply(lambda item: compare_values(item, value))
     if op == "in":
         values = set(as_list(value))
         return series.isin(values)
-    if op in {"not_in", "notin"}:
+    if op == "not_in":
         values = set(as_list(value))
         return ~series.isin(values)
     if op == "gt":
@@ -206,13 +202,13 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
         return series.astype(str).str.contains(
             str(value), case=bool(condition.get("case", False)), regex=False, na=False
         )
-    if op in {"has_token", "token_in"}:
+    if op == "has_token":
         values = set(_normalize_tokens(value, condition))
         return series.apply(lambda item: bool(set(_split_tokens(item, condition)) & values))
-    if op in {"has_any_token", "contains_any"}:
+    if op == "has_any_token":
         values = set(_normalize_tokens(value, condition))
         return series.apply(lambda item: bool(set(_split_tokens(item, condition)) & values))
-    if op in {"has_all_tokens", "contains_all"}:
+    if op == "has_all_tokens":
         values = set(_normalize_tokens(value, condition))
         if not values:
             return pd.Series(False, index=df.index)
@@ -231,9 +227,9 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
             left = left.str.lower()
             right = right.lower()
         return left.str.endswith(right, na=False)
-    if op in {"is_null", "null"}:
+    if op == "is_null":
         return series.isna()
-    if op in {"not_null", "notnull"}:
+    if op == "not_null":
         return series.notna()
     if op == "regex":
         return series.astype(str).str.contains(
@@ -284,20 +280,6 @@ def _apply_assignments(
         df.loc[write_mask, field] = candidate.loc[write_mask]
 
 
-def _condition_fields(conditions: Any) -> set[str]:
-    """Collect field references from nested condition blocks for validation."""
-    if isinstance(conditions, Mapping):
-        fields = {str(conditions["field"])} if conditions.get("field") else set()
-        for key in ("all", "any"):
-            for item in as_list(conditions.get(key)):
-                fields.update(_condition_fields(item))
-        return fields
-    fields: set[str] = set()
-    for item in as_list(conditions):
-        fields.update(_condition_fields(item))
-    return fields
-
-
 def _normalize_tokens(value: Any, condition: Mapping[str, Any]) -> List[str]:
     """Normalize a condition value into comparable delimited tokens."""
     tokens: List[str] = []
@@ -336,7 +318,7 @@ def _evaluate_tieout(
     constants or an external tie-out input table.
     """
     source_name = tieout.get("source")
-    actual_field = tieout.get("actual_field", tieout.get("balance_field", default_balance_field))
+    actual_field = tieout.get("actual_field", default_balance_field)
     tolerance = float(tieout.get("tolerance", 0.0))
     actual = float(pd.to_numeric(borrowers.loc[borrowers[tag_col], actual_field], errors="coerce").sum())
     expected = tieout.get("expected")
@@ -365,7 +347,6 @@ def _evaluate_tieout(
         "tag": tag_name,
         "tag_column": tag_col,
         "model_eligible": np.nan,
-        "internal_only": np.nan,
         "borrower_count": int(borrowers[tag_col].sum()),
         "balance_field": actual_field,
         "balance": actual,
@@ -400,12 +381,12 @@ def model_eligible_tag_names(scenario: Mapping[str, Any]) -> set[str]:
     return {str(tag["name"]) for tag in tags if tag.get("model_eligible", True)}
 
 
-def apply_module_priority(
+def assign_primary_modules(
     df: pd.DataFrame,
     scenario: Mapping[str, Any],
     exceptions: List[Dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    """Resolve one primary stress module from active model tags.
+    """Assign one primary stress module from active model tags.
 
     The active model tags remain visible in ``model_tags`` for auditability, but
     downstream stress modules use ``primary_module`` to avoid double-stressing
@@ -414,18 +395,15 @@ def apply_module_priority(
     exceptions = exceptions if exceptions is not None else []
     result = df.copy()
     modules = scenario.get("modules", {})
-    priority = [str(item) for item in scenario.get("module_priority", scenario.get("module_order", list(modules)))]
-    priority_rank = {_normalize_module_name(name): idx for idx, name in enumerate(priority)}
+    priority = [str(item) for item in scenario.get("module_order", list(modules))]
+    priority_rank = {name: idx for idx, name in enumerate(priority)}
     module_specs = []
     for module_name, config in modules.items():
-        normalized = _normalize_module_name(module_name)
         module_specs.append(
             {
                 "name": str(module_name),
-                "normalized": normalized,
-                "rank": int(config.get("priority", priority_rank.get(normalized, len(priority_rank) + len(module_specs)))),
+                "rank": priority_rank.get(str(module_name), len(priority_rank) + len(module_specs)),
                 "eligible_tags": [str(tag) for tag in as_list(config.get("eligible_tags"))],
-                "portfolio_label": config.get("portfolio_label", str(module_name)),
             }
         )
     module_specs.sort(key=lambda item: (item["rank"], item["name"]))
@@ -483,7 +461,7 @@ def apply_module_priority(
             )
         result.at[idx, "primary_module"] = selected["name"]
         result.at[idx, module_field] = selected["name"]
-        result.at[idx, portfolio_field] = selected["portfolio_label"]
+        result.at[idx, portfolio_field] = selected["name"]
         selected_module_config = modules.get(selected["name"], {})
         cecl_rollup = selected_module_config.get("cecl_portfolio_rollup")
         cecl_source_field = selected_module_config.get("cecl_portfolio_field")
@@ -492,10 +470,5 @@ def apply_module_priority(
         elif cecl_source_field and cecl_source_field in result.columns and pd.notna(row.get(cecl_source_field)):
             result.at[idx, cecl_portfolio_field] = row.get(cecl_source_field)
         else:
-            result.at[idx, cecl_portfolio_field] = selected["portfolio_label"]
+            result.at[idx, cecl_portfolio_field] = selected["name"]
     return result
-
-
-def _normalize_module_name(value: Any) -> str:
-    """Normalize module labels before comparing scenario names."""
-    return str(value).lower().replace("&", "and").replace(" ", "_")

@@ -1,0 +1,141 @@
+{
+  "tags": {
+    "CRE_Model": {
+      "model_eligible": true,
+      "include": {
+        "any": [
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Multifamily Rent Regulated"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Multifamily Market"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Traditional Office"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Medical Office"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Industrial"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Skilled Nursing Facilities"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Senior Living"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Retail"
+          },
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Hotel"
+          }
+        ]
+      },
+      "exclude": {
+        "any": [
+          {
+            "field": "status",
+            "op": "in",
+            "value": [
+              "Paid Off",
+              "Charged Off"
+            ]
+          }
+        ]
+      },
+      "assign": {
+        "model_portfolio": "CRE",
+        "model_module": "CRE"
+      }
+    },
+    "CI_Model": {
+      "model_eligible": true,
+      "include": {
+        "any": [
+          {
+            "field": "subsector",
+            "op": "has_any_token",
+            "value": [
+              "Sponsor and Specialty",
+              "Middle Market",
+              "Asset-Based Lending"
+            ]
+          },
+          {
+            "field": "tag_hint",
+            "op": "has_any_token",
+            "value": [
+              "Middle Market"
+            ]
+          }
+        ]
+      },
+      "assign": {
+        "model_portfolio": "C&I",
+        "model_module": "C&I"
+      }
+    },
+    "Consumer_Model": {
+      "model_eligible": true,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Consumer"
+        }
+      ],
+      "assign": {
+        "model_portfolio": "Consumer",
+        "model_module": "Consumer"
+      }
+    },
+    "Equipment_Finance_Overlay": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Equipment Finance"
+        }
+      ],
+      "assign": {
+        "model_portfolio": "EF",
+        "model_module": "Overlay"
+      }
+    },
+    "Business_Credit_Center_Overlay": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Business Credit Center"
+        }
+      ],
+      "assign": {
+        "model_portfolio": "BCC",
+        "model_module": "Overlay"
+      }
+    }
+  }
+}

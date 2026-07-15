@@ -33,6 +33,26 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertIn("subsector", identity_columns)
             self.assertIn("tag_hint", identity_columns)
 
+            financial_columns = set(pd.read_csv(ROOT / "examples" / "data" / "financials.csv").columns)
+            collateral_columns = set(pd.read_csv(ROOT / "examples" / "data" / "collateral.csv").columns)
+            self.assertTrue({"current_dscr", "prior_dscr", "origination_dscr", "noi"}.isdisjoint(financial_columns))
+            self.assertNotIn("fccr", financial_columns)
+            self.assertTrue(
+                {"Current DSCR", "Prior DSCR", "Origination DSCR", "Net Operating Income"}.issubset(
+                    collateral_columns
+                )
+            )
+            self.assertTrue({"current_dscr", "prior_dscr", "origination_dscr", "noi"}.isdisjoint(collateral_columns))
+
+            financial_import = scenario["inputs"]["sources"]["financials"]
+            collateral_import = scenario["inputs"]["sources"]["collateral"]
+            self.assertNotIn("fccr", financial_import["numeric_columns"])
+            self.assertNotIn("aggregation", financial_import)
+            self.assertIn("dscr", collateral_import["aggregation"])
+            self.assertIn("noi", collateral_import["aggregation"])
+            self.assertEqual(collateral_import["column_aliases"]["current_dscr"], "Current DSCR")
+            self.assertEqual(collateral_import["column_aliases"]["noi"], "Net Operating Income")
+
             borrowers = result["borrowers"]
             self.assertEqual(len(borrowers), 15)
             b001 = borrowers.loc[borrowers["borrower_id"] == "B001"].iloc[0]
@@ -75,7 +95,7 @@ class SampleScenarioRunTest(unittest.TestCase):
                 (overlay_summary["portfolio"] == "BCC")
                 & (overlay_summary["stress_level"] == "S1")
             ].iloc[0]
-            self.assertEqual(bcc_overlay["source_portfolios"], "CRE;C&I")
+            self.assertEqual(bcc_overlay["source_names"], "CRE;C&I")
             self.assertEqual(bcc_overlay["source_weights"], "CRE=0.65;C&I=0.35")
             self.assertEqual(
                 bcc_overlay["source_selection"],

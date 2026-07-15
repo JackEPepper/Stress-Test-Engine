@@ -11,12 +11,17 @@ import pandas as pd
 from .utils import deep_merge, hash_json, resolve_path
 
 
-def load_scenario(paths: str | Path | Iterable[str | Path]) -> Tuple[Dict[str, Any], Path]:
-    """Load one or more JSON files and deep-merge them in order.
+_INCLUDE_KEY = "$include"
 
-    Later files override earlier files. Relative input paths are resolved from
-    the directory of the first scenario file, which makes layered scenario JSONs
-    portable.
+
+def load_scenario(paths: str | Path | Iterable[str | Path]) -> Tuple[Dict[str, Any], Path]:
+    """Load one or more JSON files, including manifests, and deep-merge them.
+
+    A file can declare ``"$include": ["relative/file.json", ...]``. Includes
+    are merged in listed order, followed by the declaring file, so local values
+    override included defaults. Explicitly supplied files are then merged in
+    command-line order. Relative data input paths remain anchored to the first
+    explicitly supplied scenario file.
     """
     if isinstance(paths, (str, Path)):
         path_list = [Path(paths)]
@@ -28,13 +33,9 @@ def load_scenario(paths: str | Path | Iterable[str | Path]) -> Tuple[Dict[str, A
     merged: Dict[str, Any] = {}
     resolved_paths: List[str] = []
     for path in path_list:
-        actual = path.resolve()
-        with actual.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if not isinstance(payload, dict):
-            raise ValueError(f"Scenario file must contain a JSON object: {actual}")
+        payload, loaded_paths = _load_scenario_file(path.resolve(), stack=())
         merged = deep_merge(merged, payload)
-        resolved_paths.append(str(actual))
+        resolved_paths.extend(str(item) for item in loaded_paths)
 
     base_dir = path_list[0].resolve().parent
     merged.setdefault("_metadata", {})
@@ -46,6 +47,45 @@ def load_scenario(paths: str | Path | Iterable[str | Path]) -> Tuple[Dict[str, A
     )
     validate_scenario(merged)
     return merged, base_dir
+
+
+def _load_scenario_file(path: Path, stack: Tuple[Path, ...]) -> Tuple[Dict[str, Any], List[Path]]:
+    """Load one scenario fragment and recursively expand its relative includes."""
+    actual = path.resolve()
+    if actual in stack:
+        cycle = " -> ".join(str(item) for item in (*stack, actual))
+        raise ValueError(f"Scenario include cycle detected: {cycle}")
+
+    with actual.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Scenario file must contain a JSON object: {actual}")
+
+    local_payload = dict(payload)
+    raw_includes = local_payload.pop(_INCLUDE_KEY, [])
+    if isinstance(raw_includes, (str, Path)):
+        includes = [raw_includes]
+    elif isinstance(raw_includes, list):
+        includes = raw_includes
+    else:
+        raise ValueError(f"Scenario {_INCLUDE_KEY} must be a string or list: {actual}")
+
+    merged: Dict[str, Any] = {}
+    resolved_paths: List[Path] = []
+    next_stack = (*stack, actual)
+    for include in includes:
+        if not isinstance(include, str) or not include.strip():
+            raise ValueError(f"Scenario {_INCLUDE_KEY} entries must be nonblank strings: {actual}")
+        include_path = Path(include)
+        if not include_path.is_absolute():
+            include_path = actual.parent / include_path
+        included, included_paths = _load_scenario_file(include_path, next_stack)
+        merged = deep_merge(merged, included)
+        resolved_paths.extend(included_paths)
+
+    merged = deep_merge(merged, local_payload)
+    resolved_paths.append(actual)
+    return merged, resolved_paths
 
 
 def validate_scenario(scenario: Dict[str, Any]) -> None:
@@ -65,9 +105,9 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         raise ValueError("Scenario stress_levels must contain unique, nonblank levels.")
     if any(not level.strip() for level in levels):
         raise ValueError("Scenario stress_levels cannot contain blank names.")
-    cre = scenario.get("modules", {}).get("CRE", scenario.get("modules", {}).get("cre", {}))
+    cre = scenario.get("modules", {}).get("CRE", {})
     if cre and cre.get("enabled", True):
-        cutoff = scenario.get("run", {}).get("cutoff_date", scenario.get("cutoff_date"))
+        cutoff = scenario.get("run", {}).get("cutoff_date")
         if cutoff is None or pd.isna(pd.to_datetime(cutoff, errors="coerce")):
             raise ValueError("An enabled CRE module requires a valid run.cutoff_date.")
 

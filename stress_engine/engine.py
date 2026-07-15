@@ -6,7 +6,7 @@ import json
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Mapping
 
 import pandas as pd
 
@@ -18,7 +18,7 @@ from .borrower import (
     record_identity_data_issues,
 )
 from .comparison import build_comparison_report
-from .config import load_scenario, output_dir_for
+from .config import output_dir_for
 from .exceptions import exception_frame
 from .io import load_inputs, metadata_for_inputs, write_csv, write_json
 from .modules.base import initialize_results
@@ -26,36 +26,17 @@ from .modules.ci import run_ci
 from .modules.consumer import run_consumer
 from .modules.cre import run_cre
 from .reporting import build_reports
-from .tagging import apply_module_priority, apply_tags
+from .tagging import apply_tags, assign_primary_modules
 from .utils import hash_json
-
-
-ENGINE_VERSION = "0.2.0"
-MANAGED_CSV_FILES = {
-    "borrower_audit_raw.csv",
-    "stressed_borrower_results.csv",
-    "migration_summary.csv",
-    "overlay_summary.csv",
-    "cecl_summary.csv",
-    "cre_summary.csv",
-    "ci_summary.csv",
-    "consumer_summary.csv",
-    "out_of_scope_summary.csv",
-    "out_of_scope_detail.csv",
-    "input_summary.csv",
-    "tag_summary.csv",
-    "source_reconciliation.csv",
-    "exception_log.csv",
-    "scenario_diff.csv",
-}
+from .version import VERSION
 
 
 class StressEngine:
     """Run the full scenario pipeline from raw inputs through final reports.
 
-    Called by the CLI (`stress_engine.cli.main`) and the convenience helper
-    `run_scenario`. This class is the only orchestrator; stress modules and
-    reporting functions are intentionally pure transformations of DataFrames.
+    Called by the CLI (`stress_engine.cli.main`) and batch runner. This class is
+    the only orchestrator; stress modules and reporting functions are
+    intentionally pure transformations of DataFrames.
     """
 
     def __init__(self, scenario: Mapping[str, Any], base_dir: str | Path):
@@ -81,7 +62,7 @@ class StressEngine:
         record_identity_data_issues(identity, self.scenario, exceptions)
         borrowers = build_borrowers(identity, self.scenario, exceptions)
         borrowers, tag_summary = apply_tags(borrowers, self.scenario, loaded, exceptions)
-        borrowers = apply_module_priority(borrowers, self.scenario, exceptions)
+        borrowers = assign_primary_modules(borrowers, self.scenario, exceptions)
 
         # 3. Enrichment runs after tagging so sources can be restricted by tag
         # if the scenario requests it. The audit copy is the post-tag/enriched
@@ -98,20 +79,14 @@ class StressEngine:
         out_of_scope_frames = []
         module_order = self.scenario.get("module_order", ["CRE", "C&I", "Consumer"])
         for module_name in module_order:
-            raw_name = str(module_name).lower()
-            normalized = raw_name.replace("&", "and").replace(" ", "_")
-            if normalized in {"cre", "commercial real estate", "commercial_real_estate"}:
+            if module_name == "CRE":
                 results, out = run_cre(results, self.scenario, exceptions)
-            elif raw_name in {"c&i", "ci"} or normalized in {
-                "candi",
-                "commercial_and_industrial",
-                "commercial_industrial",
-            }:
+            elif module_name == "C&I":
                 results, out = run_ci(results, self.scenario, exceptions)
-            elif normalized == "consumer":
+            elif module_name == "Consumer":
                 results, out = run_consumer(results, self.scenario, loaded, exceptions)
             else:
-                continue
+                raise ValueError(f"Unsupported module in module_order: {module_name}")
             if out is not None and not out.empty:
                 out_of_scope_frames.append(out)
         out_of_scope = pd.concat(out_of_scope_frames, ignore_index=True) if out_of_scope_frames else pd.DataFrame()
@@ -166,7 +141,7 @@ class StressEngine:
             else {}
         )
         return {
-            "engine_version": ENGINE_VERSION,
+            "engine_version": VERSION,
             "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "python_version": platform.python_version(),
             "platform": platform.platform(),
@@ -208,25 +183,15 @@ class StressEngine:
         write_json(_scenario_for_audit(self.scenario), output_dir / "scenario_used.json")
         _remove_stale_outputs(output_dir, current_files)
         write_json(
-            {"engine_version": ENGINE_VERSION, "files": sorted(current_files | {"output_manifest.json"})},
+            {"engine_version": VERSION, "files": sorted(current_files | {"output_manifest.json"})},
             output_dir / "output_manifest.json",
         )
-
-
-def run_scenario(
-    scenario_paths: str | Path | Iterable[str | Path],
-    output_dir: str | Path | None = None,
-    write_outputs: bool = True,
-) -> Dict[str, Any]:
-    """Load JSON scenario files and immediately execute `StressEngine.run`."""
-    scenario, base_dir = load_scenario(scenario_paths)
-    return StressEngine(scenario, base_dir).run(output_dir=output_dir, write_outputs=write_outputs)
 
 
 def _previous_scenarios(scenario: Mapping[str, Any]) -> list[str]:
     """Normalize optional comparison scenario config to a list of paths."""
     comparison = scenario.get("comparison", {})
-    previous = comparison.get("previous_scenarios", comparison.get("previous_scenario", []))
+    previous = comparison.get("previous_scenarios", [])
     if previous is None:
         return []
     if isinstance(previous, (str, Path)):
@@ -257,12 +222,19 @@ def _scenario_for_audit(scenario: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _remove_stale_outputs(output_dir: Path, current_files: set[str]) -> None:
     """Remove only prior engine-owned files that are absent from the current run."""
-    prior_files = set(MANAGED_CSV_FILES)
+    prior_files: set[str] = set()
     manifest = output_dir / "output_manifest.json"
     if manifest.exists():
         try:
             with manifest.open("r", encoding="utf-8") as handle:
-                prior_files.update(json.load(handle).get("files", []))
+                payload = json.load(handle)
+            files = payload.get("files", []) if isinstance(payload, Mapping) else []
+            if isinstance(files, list):
+                prior_files.update(
+                    filename
+                    for filename in files
+                    if isinstance(filename, str) and Path(filename).name == filename
+                )
         except (OSError, ValueError, TypeError):
             pass
     for filename in sorted(prior_files - current_files - {"output_manifest.json"}):

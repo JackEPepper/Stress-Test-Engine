@@ -20,7 +20,6 @@ BUCKET_ORDER = {
     "Substandard": 2,
     "Unknown": -1,
 }
-ORDER_BUCKET = {value: key for key, value in BUCKET_ORDER.items()}
 
 
 def stable_name(value: Any) -> str:
@@ -39,6 +38,20 @@ def as_list(value: Any) -> List[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def condition_fields(conditions: Any) -> set[str]:
+    """Collect canonical field names from a nested tag-condition block."""
+    if isinstance(conditions, Mapping):
+        fields = {str(conditions["field"])} if conditions.get("field") else set()
+        for key in ("all", "any"):
+            for item in as_list(conditions.get(key)):
+                fields.update(condition_fields(item))
+        return fields
+    fields: set[str] = set()
+    for item in as_list(conditions):
+        fields.update(condition_fields(item))
+    return fields
 
 
 def is_missing(value: Any) -> bool:
@@ -72,12 +85,6 @@ def to_number(value: Any, default: float = np.nan) -> float:
         return default
 
 
-def to_bool_series(series: pd.Series) -> pd.Series:
-    if series.dtype == bool:
-        return series.fillna(False)
-    return series.fillna(False).astype(bool)
-
-
 def coerce_numeric_frame(df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFrame:
     """Coerce configured numeric columns after stripping common formatting."""
     out = df.copy()
@@ -91,12 +98,6 @@ def coerce_numeric_frame(df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFram
             numeric = pd.to_numeric(cleaned, errors="coerce")
             out[field] = numeric.where(~is_percent, numeric / 100.0)
     return out
-
-
-def parse_date(value: Any) -> pd.Timestamp:
-    if is_missing(value):
-        return pd.NaT
-    return pd.to_datetime(value, errors="coerce")
 
 
 def parse_date_series(series: pd.Series) -> pd.Series:
@@ -161,39 +162,6 @@ def annual_debt_payment(balance: float, annual_rate: float, amortization_years: 
 def get_levels(scenario: Mapping[str, Any]) -> List[str]:
     """Return scenario stress levels, defaulting to S1/S2."""
     return [str(level) for level in scenario.get("stress_levels", ["S1", "S2"])]
-
-
-def lookup_parameter(table: Any, subsector: Any, level: str, default: Any = np.nan) -> Any:
-    """Lookup a scenario assumption supporting default/all and level maps.
-
-    Supported forms:
-      {"default": {"S1": 0.1}, "Office": {"S1": 0.2}}
-      {"S1": 0.1, "S2": 0.2}
-      0.1
-    """
-    if isinstance(table, Mapping):
-        sector_key = str(subsector) if not is_missing(subsector) else None
-        choices: List[Any] = []
-        if sector_key and sector_key in table:
-            choices.append(table[sector_key])
-        for key in ("default", "all", "*"):
-            if key in table:
-                choices.append(table[key])
-        if level in table:
-            return table[level]
-        for candidate in choices:
-            if isinstance(candidate, Mapping):
-                if level in candidate:
-                    return candidate[level]
-                for key in ("default", "all", "*"):
-                    if key in candidate:
-                        return candidate[key]
-            elif candidate is not None:
-                return candidate
-        return default
-    if table is None:
-        return default
-    return table
 
 
 def lookup_parameter_with_source(
@@ -301,17 +269,51 @@ def flatten_json(data: Any, prefix: str = "") -> Dict[str, Any]:
 _PATH_TOKEN_RE = re.compile(r"([^\.\[\]]+)|\[(\d+)\]")
 
 
+def json_path_tokens(path: str) -> List[Any]:
+    """Tokenize dotted JSON paths such as ``modules.CRE.x[0]``."""
+    tokens = [
+        match.group(1) if match.group(1) is not None else int(match.group(2))
+        for match in _PATH_TOKEN_RE.finditer(path)
+    ]
+    if not tokens:
+        raise ValueError(f"Invalid JSON path: {path}")
+    return tokens
+
+
+def get_json_path(data: Mapping[str, Any], path: str) -> Any:
+    """Return a value from a dotted/list-index JSON path."""
+    cursor: Any = data
+    for token in json_path_tokens(path):
+        cursor = cursor[token]
+    return cursor
+
+
+def set_json_path_in_place(data: Dict[str, Any], path: str, value: Any, allow_create: bool = False) -> None:
+    """Set a JSON path, optionally creating missing dictionary keys."""
+    tokens = json_path_tokens(path)
+    cursor: Any = data
+    for token, next_token in zip(tokens[:-1], tokens[1:]):
+        if isinstance(token, int):
+            cursor = cursor[token]
+            continue
+        if token not in cursor:
+            if not allow_create:
+                raise KeyError(path)
+            cursor[token] = [] if isinstance(next_token, int) else {}
+        cursor = cursor[token]
+    final = tokens[-1]
+    if isinstance(final, int):
+        cursor[final] = copy.deepcopy(value)
+    else:
+        if final not in cursor and not allow_create:
+            raise KeyError(path)
+        cursor[final] = copy.deepcopy(value)
+
+
 def set_json_path(data: Any, path: str, value: Any) -> Any:
     """Return a deep copy with one flattened-json path replaced."""
     result = copy.deepcopy(data)
-    tokens: List[Any] = []
-    for match in _PATH_TOKEN_RE.finditer(path):
-        token = match.group(1) if match.group(1) is not None else int(match.group(2))
-        tokens.append(token)
-    cursor = result
-    for token in tokens[:-1]:
-        cursor = cursor[token]
-    cursor[tokens[-1]] = copy.deepcopy(value)
+    set_json_path_in_place(result, path, value)
     return result
 
 

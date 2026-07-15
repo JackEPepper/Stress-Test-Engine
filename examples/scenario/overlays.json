@@ -1,0 +1,35 @@
+{
+  "overlays": {
+    "EF": {
+      "enabled": true,
+      "sources": [
+        {
+          "name": "C&I",
+          "tags": [
+            "CI_Model"
+          ],
+          "weight": 1.0
+        }
+      ]
+    },
+    "BCC": {
+      "enabled": true,
+      "sources": [
+        {
+          "name": "CRE",
+          "tags": [
+            "CRE_Model"
+          ],
+          "weight": 0.65
+        },
+        {
+          "name": "C&I",
+          "tags": [
+            "CI_Model"
+          ],
+          "weight": 0.35
+        }
+      ]
+    }
+  }
+}

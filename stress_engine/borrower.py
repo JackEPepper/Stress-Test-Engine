@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, MutableMapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from .exceptions import record_exception
 from .io import LoadedTable
-from .utils import as_list, ensure_columns, first_non_null, join_unique, parse_date_series, stable_name
+from .utils import as_list, condition_fields, ensure_columns, first_non_null, join_unique, parse_date_series
 
 
 def build_borrowers(
@@ -28,7 +28,7 @@ def build_borrowers(
     config = scenario.get("borrower", {})
     borrower_id = config["borrower_id_field"]
     balance_field = config["balance_field"]
-    balance_fields = set(config.get("sum_fields", config.get("balance_fields", [config["balance_field"]])))
+    balance_fields = set(config.get("sum_fields", [config["balance_field"]]))
     aggregations: Dict[str, Any] = dict(config.get("aggregation", {}))
     loan_id_field = config.get("loan_id_field")
 
@@ -36,6 +36,7 @@ def build_borrowers(
     identity = identity.copy()
     _separate_missing_borrower_ids(identity, borrower_id, exceptions)
     _record_identity_key_issues(identity, borrower_id, loan_id_field, exceptions)
+    largest_fields = _largest_loan_fields(scenario, identity.columns)
     for field in balance_fields:
         if field in identity.columns:
             aggregations.setdefault(field, "sum")
@@ -44,9 +45,9 @@ def build_borrowers(
 
     agg_map: Dict[str, Any] = {}
     for column in identity.columns:
-        if column in {borrower_id, "_source_row"}:
+        if column in {borrower_id, "_source_row"} or column in largest_fields:
             continue
-        method = aggregations.get(column, config.get("default_aggregation", "first"))
+        method = aggregations.get(column, "first")
         agg_map[column] = _aggregation_callable(method)
 
     borrowers = (
@@ -59,14 +60,9 @@ def build_borrowers(
     borrowers = borrowers.merge(loan_counts, on=borrower_id, how="left")
     # Rating, maturity, and every tag-driving attribute must come from the same
     # loan. The largest balance is the deterministic representative loan.
-    largest_fields = _largest_loan_fields(scenario, identity.columns)
     largest_rows = _largest_loan_rows(identity, borrower_id, balance_field, largest_fields)
     if not largest_rows.empty:
-        borrowers = borrowers.drop(columns=[field for field in largest_fields if field in borrowers.columns]).merge(
-            largest_rows,
-            on=borrower_id,
-            how="left",
-        )
+        borrowers = borrowers.merge(largest_rows, on=borrower_id, how="left")
     _record_largest_loan_conflicts(
         identity,
         borrower_id,
@@ -144,34 +140,13 @@ def _largest_loan_fields(scenario: Mapping[str, Any], columns: Sequence[str]) ->
         config.get("portfolio_field"),
         config.get("module_field"),
     }
-    for tag in _iter_tag_specs(scenario.get("tags", {})):
-        fields.update(_condition_fields(tag.get("include", tag.get("conditions", []))))
-        fields.update(_condition_fields(tag.get("exclude", [])))
-        for value_spec in tag.get("assign", tag.get("set_fields", {})).values():
+    for tag in scenario.get("tags", {}).values():
+        fields.update(condition_fields(tag.get("include", [])))
+        fields.update(condition_fields(tag.get("exclude", [])))
+        for value_spec in tag.get("assign", {}).values():
             if isinstance(value_spec, Mapping) and value_spec.get("from_field"):
                 fields.add(value_spec["from_field"])
     return sorted(field for field in fields if field and field in columns)
-
-
-def _iter_tag_specs(tags: Any) -> List[Mapping[str, Any]]:
-    """Normalize tag definitions locally to avoid a tagging-module cycle."""
-    if isinstance(tags, Mapping):
-        return [spec for spec in tags.values() if isinstance(spec, Mapping)]
-    return [spec for spec in as_list(tags) if isinstance(spec, Mapping)]
-
-
-def _condition_fields(conditions: Any) -> set[str]:
-    """Collect all field references from nested tag condition blocks."""
-    if isinstance(conditions, Mapping):
-        fields = {str(conditions["field"])} if conditions.get("field") else set()
-        for key in ("all", "any"):
-            for item in as_list(conditions.get(key)):
-                fields.update(_condition_fields(item))
-        return fields
-    fields: set[str] = set()
-    for item in as_list(conditions):
-        fields.update(_condition_fields(item))
-    return fields
 
 
 def _largest_loan_rows(
@@ -240,9 +215,8 @@ def enrich_borrowers(
 ) -> pd.DataFrame:
     """Merge configured non-identity sources onto borrower rows.
 
-    Called after tagging in `StressEngine.run`, which lets source specs use
-    `required_tags` to enrich only the populations that need a document. Each
-    source is aggregated first by borrower key to avoid many-to-many joins.
+    Each source is aggregated first by borrower key to avoid many-to-many
+    joins.
     """
     out = borrowers.copy()
     borrower_id = scenario["borrower"]["borrower_id_field"]
@@ -256,7 +230,7 @@ def enrich_borrowers(
         aggregated = aggregate_source(name, loaded[name].frame, spec, borrower_id)
         if aggregated.empty:
             continue
-        out = _merge_source(out, aggregated, borrower_id, spec)
+        out = _merge_source(out, aggregated, borrower_id)
     return out
 
 
@@ -537,7 +511,7 @@ def _source_entity_value_conflicts(frame: pd.DataFrame, key: str, spec: Mapping[
                 elif isinstance(candidate, Mapping):
                     candidate_specs.append(
                         (
-                            candidate.get("field") or candidate.get("value_field") or candidate.get("score_field"),
+                            candidate.get("field"),
                             candidate.get("date_field"),
                         )
                     )
@@ -566,9 +540,6 @@ def aggregate_source(name: str, df: pd.DataFrame, spec: Mapping[str, Any], borro
     if key not in df.columns:
         raise ValueError(f"Source '{name}' key column '{key}' is missing.")
     frame = df.copy()
-    for field in spec.get("date_columns", []):
-        if field in frame.columns:
-            frame[field] = parse_date_series(frame[field])
     aggregation = spec.get("aggregation", {})
     if not aggregation:
         aggregation = {
@@ -734,7 +705,7 @@ def _best_available_unique_sum(
 ) -> pd.DataFrame:
     """Select one best value per collateral/entity and sum those values by borrower."""
     candidates = _normalize_best_available_candidates(options, output_field)
-    unique_fields = [str(field) for field in as_list(options.get("unique_fields", options.get("entity_fields")))]
+    unique_fields = [str(field) for field in as_list(options.get("unique_fields"))]
     if not unique_fields:
         raise ValueError(f"Best available unique sum for '{output_field}' requires unique_fields.")
     required = [key, *unique_fields]
@@ -816,7 +787,7 @@ def _normalize_best_available_candidates(options: Mapping[str, Any], output_fiel
         if isinstance(candidate, str):
             candidates.append({"field": candidate})
             continue
-        field = candidate.get("field") or candidate.get("value_field") or candidate.get("score_field")
+        field = candidate.get("field")
         if not field:
             raise ValueError(f"Best available aggregation for '{output_field}' includes a candidate without a field.")
         normalized = dict(candidate)
@@ -848,10 +819,6 @@ def _best_available_output_columns(key: str, output_field: str, options: Mapping
 
 def _aggregation_callable(method: Any) -> Any:
     """Map scenario aggregation names to pandas groupby callables."""
-    if callable(method):
-        return method
-    if isinstance(method, MutableMapping):
-        method = method.get("method", "first")
     method = str(method)
     if method == "first":
         return first_non_null
@@ -910,39 +877,9 @@ def _merge_source(
     borrowers: pd.DataFrame,
     source: pd.DataFrame,
     borrower_id: str,
-    spec: Mapping[str, Any],
 ) -> pd.DataFrame:
-    """Apply one pre-aggregated source to borrower rows.
-
-    Called by `enrich_borrowers`. `required_tags` narrows which borrowers can
-    receive values, while `on_conflict` controls how source columns interact
-    with existing borrower columns.
-    """
-    required_tags = [f"tag_{stable_name(tag)}" for tag in as_list(spec.get("required_tags"))]
-    on_conflict = spec.get("on_conflict", "fill_missing")
-    result = borrowers.copy()
-    mask = pd.Series(True, index=result.index)
-    for tag_col in required_tags:
-        if tag_col in result.columns:
-            mask &= result[tag_col].fillna(False).astype(bool)
-        else:
-            mask &= False
-    merged = result[[borrower_id]].merge(source, on=borrower_id, how="left")
-    for column in source.columns:
-        if column == borrower_id:
-            continue
-        values = merged[column]
-        values = values.where(mask, np.nan)
-        if column not in result.columns:
-            result[column] = values
-        elif on_conflict == "overwrite":
-            result[column] = values.combine_first(result[column])
-        elif on_conflict == "fill_missing":
-            result[column] = result[column].combine_first(values)
-        elif on_conflict == "suffix":
-            result[f"{column}_{stable_name(spec.get('name', 'source'))}"] = values
-        elif on_conflict == "error":
-            raise ValueError(f"Enrichment column conflict for '{column}'.")
-        else:
-            raise ValueError(f"Unsupported on_conflict mode: {on_conflict}")
-    return result
+    """Merge one borrower-level source and reject ambiguous field collisions."""
+    conflicts = sorted((set(borrowers.columns) & set(source.columns)) - {borrower_id})
+    if conflicts:
+        raise ValueError(f"Enrichment columns already exist on borrowers: {', '.join(conflicts)}")
+    return borrowers.merge(source, on=borrower_id, how="left", validate="one_to_one")

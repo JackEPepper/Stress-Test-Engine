@@ -129,7 +129,7 @@ def build_cecl_summary(
     rows: List[Dict[str, Any]] = []
     zero_balance_tolerance = to_number(cecl.get("zero_balance_tolerance", 1e-9), 1e-9)
 
-    ratio_df = _cecl_ratio_frame(results, scenario, exceptions)
+    ratio_df = _cecl_ratio_frame_from_loans(results, scenario, exceptions)
 
     for portfolio in sorted(bucket_summary["portfolio"].dropna().unique()):
         method = method_by_portfolio.get(portfolio, "bucket_reserve_ratio")
@@ -250,7 +250,6 @@ def build_cre_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
     balance_field = scenario["borrower"]["balance_field"]
     subsector_field = config.get("subsector_field", "cre_subsector")
     dscr_field = config.get("tests", {}).get("dscr", {}).get("field", "dscr")
-    ltv_field = config.get("current_ltv_field", "ltv")
     levels = get_levels(scenario)
     rows = []
     frame = results[results.get("module_applied", "").astype(str).str.contains("CRE", na=False)] if "module_applied" in results.columns else results.iloc[0:0]
@@ -263,7 +262,6 @@ def build_cre_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
             "borrower_count": int(len(group)),
             "balance": float(pd.to_numeric(group[balance_field], errors="coerce").sum()),
             "unstressed_dscr": weighted_average(group[dscr_field], group[balance_field]) if dscr_field in group.columns else np.nan,
-            "unstressed_ltv": weighted_average(group[ltv_field], group[balance_field]) if ltv_field in group.columns else np.nan,
         }
         for level in levels:
             row[f"stressed_dscr_{level}"] = weighted_average(group.get(f"cre_dscr_{level}", _empty_series(group)), group[balance_field])
@@ -277,11 +275,10 @@ def build_cre_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
 
 def build_ci_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.DataFrame:
     """Build weighted C&I FCCR and migration summary rows."""
-    config = scenario.get("modules", {}).get("C&I", scenario.get("modules", {}).get("CI", {}))
+    config = scenario.get("modules", {}).get("C&I", {})
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
     sector_field = config.get("sector_field", "ci_sector")
-    base_fccr_field = config.get("current_fccr_field", "fccr")
     levels = get_levels(scenario)
     frame = results[results.get("module_applied", "").astype(str).str.contains("C&I", na=False)] if "module_applied" in results.columns else results.iloc[0:0]
     rows = []
@@ -293,7 +290,6 @@ def build_ci_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.D
             "sector": keys[1],
             "borrower_count": int(len(group)),
             "balance": float(pd.to_numeric(group[balance_field], errors="coerce").sum()),
-            "unstressed_fccr": weighted_average(group[base_fccr_field], group[balance_field]) if base_fccr_field in group.columns else np.nan,
         }
         for level in levels:
             row[f"stressed_fccr_{level}"] = weighted_average(group.get(f"ci_fccr_{level}", _empty_series(group)), group[balance_field])
@@ -383,8 +379,6 @@ def _cecl_methods(results: pd.DataFrame, scenario: Mapping[str, Any]) -> Dict[An
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     methods: Dict[Any, str] = {}
     configured = cecl.get("portfolios", {})
-    if isinstance(configured, list):
-        configured = {item["portfolio"]: item for item in configured}
     for portfolio, spec in configured.items():
         methods[portfolio] = spec.get("method", "bucket_reserve_ratio")
     if "module_applied" in results.columns:
@@ -392,15 +386,6 @@ def _cecl_methods(results: pd.DataFrame, scenario: Mapping[str, Any]) -> Dict[An
             if group["module_applied"].astype(str).str.contains("Consumer", na=False).any():
                 methods.setdefault(portfolio, "expected_loss")
     return methods
-
-
-def _cecl_ratio_frame(
-    results: pd.DataFrame,
-    scenario: Mapping[str, Any],
-    exceptions: List[Dict[str, Any]],
-) -> pd.DataFrame:
-    """Derive all CECL reserve ratios from loan-level data."""
-    return _cecl_ratio_frame_from_loans(results, scenario, exceptions)
 
 
 def _cecl_ratio_frame_from_loans(
@@ -411,7 +396,7 @@ def _cecl_ratio_frame_from_loans(
     """Calculate reserve ratios by CECL portfolio and base bucket.
 
     Formula: reserve ratio = sum(loan CECL reserve) / sum(loan balance).
-    Called by `_cecl_ratio_frame`.
+    Called by `build_cecl_summary`.
     """
     cecl = scenario.get("cecl", {})
     reserve_field = cecl.get("reserve_field", "cecl_reserve")

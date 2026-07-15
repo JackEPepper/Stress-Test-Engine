@@ -1,0 +1,71 @@
+{
+  "tags": {
+    "CI_Sector_Sponsor_and_Specialty": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Sponsor and Specialty"
+        }
+      ],
+      "assign": {
+        "ci_sector": "Sponsor and Specialty"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CI_Sector_Middle_Market": {
+      "model_eligible": false,
+      "include": {
+        "any": [
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Middle Market"
+          },
+          {
+            "field": "tag_hint",
+            "op": "has_token",
+            "value": "Middle Market"
+          }
+        ]
+      },
+      "assign": {
+        "ci_sector": "Middle Market"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CI_Sector_Asset_Based_Lending": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Asset-Based Lending"
+        }
+      ],
+      "assign": {
+        "ci_sector": "Asset-Based Lending"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    }
+  }
+}

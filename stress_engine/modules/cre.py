@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from .base import missing_fields, module_population, record_out_of_scope
+from .base import append_module, missing_fields, module_population, record_out_of_scope
 from ..exceptions import record_exception
 from ..utils import (
     annual_debt_payment,
@@ -29,11 +29,11 @@ def run_cre(
     """Run CRE stresses for borrowers whose `primary_module` is CRE.
 
     Called from `StressEngine.run`. The shared `module_population` helper
-    applies eligible tags plus module-priority resolution before this function
+    applies eligible tags plus module-order resolution before this function
     loops through stress levels and borrower rows.
     """
     exceptions = exceptions if exceptions is not None else []
-    config = scenario.get("modules", {}).get("CRE", scenario.get("modules", {}).get("cre", {}))
+    config = scenario.get("modules", {}).get("CRE", {})
     if not config or not config.get("enabled", True):
         return results, pd.DataFrame()
     config = dict(config)
@@ -46,15 +46,15 @@ def run_cre(
     balance_field = config.get("balance_field", borrower_cfg["balance_field"])
     maturity_field = config.get("maturity_date_field", borrower_cfg.get("maturity_date_field", "maturity_date"))
     subsector_field = config.get("subsector_field", "cre_subsector")
-    cutoff_date = pd.to_datetime(scenario.get("run", {}).get("cutoff_date", scenario.get("cutoff_date")))
-    threshold_months = int(config.get("maturity_months", config.get("maturity_threshold_months", 12)))
+    cutoff_date = pd.to_datetime(scenario["run"]["cutoff_date"])
+    threshold_months = int(config.get("maturity_threshold_months", 12))
     threshold_date = cutoff_date + pd.DateOffset(months=threshold_months)
     out_scope: List[Dict[str, Any]] = []
     fallback_events: set[tuple[str, str, str]] = set()
 
     for level in levels:
         for idx, row in out.loc[mask].iterrows():
-            out.at[idx, "module_applied"] = _append_module(out.at[idx, "module_applied"], "CRE")
+            out.at[idx, "module_applied"] = append_module(out.at[idx, "module_applied"], "CRE")
             base_bucket = row.get("base_bucket", "Unknown")
             if base_bucket == "Substandard":
                 # Substandard is already the highest modeled commercial bucket,
@@ -111,7 +111,7 @@ def _run_dscr(
     Called only from `run_cre` for loans maturing after the configured
     threshold date. Formula: stressed DSCR = current DSCR * (1 - decline).
     """
-    dscr_cfg = config.get("tests", {}).get("dscr", config.get("dscr", {}))
+    dscr_cfg = config.get("tests", {}).get("dscr", {})
     if not dscr_cfg.get("enabled", True):
         return row.get("base_bucket", "Pass")
     dscr_field = dscr_cfg.get("field", "dscr")
@@ -121,11 +121,11 @@ def _run_dscr(
         _mark_out(out, idx, level, row, scenario, out_scope, "DSCR", missing, "missing_required_field")
         return None
     dscr = to_number(row.get(dscr_field))
-    if not _in_range(dscr, dscr_cfg.get("acceptable_range", config.get("dscr_acceptable_range"))):
+    if not _in_range(dscr, dscr_cfg.get("acceptable_range")):
         _mark_out(out, idx, level, row, scenario, out_scope, "DSCR", [dscr_field], "outside_acceptable_range")
         return None
     decline = _resolve_assumption(
-        dscr_cfg.get("decline", config.get("dscr_decline")),
+        dscr_cfg.get("decline"),
         row.get(subsector_field),
         level,
         "dscr_decline",
@@ -137,7 +137,7 @@ def _run_dscr(
         return None
     stressed_dscr = dscr * (1 - decline)
     out.at[idx, f"cre_dscr_{level}"] = stressed_dscr
-    return lower_metric_bucket(stressed_dscr, dscr_cfg.get("cutoffs", config.get("dscr_cutoffs", {})))
+    return lower_metric_bucket(stressed_dscr, dscr_cfg.get("cutoffs", {}))
 
 
 def _run_refi_ltv(
@@ -159,8 +159,8 @@ def _run_refi_ltv(
     the worst bucket from base rating, refinance DSCR, and LTV.
     """
     tests = config.get("tests", {})
-    refi_cfg = tests.get("refinance", config.get("refinance", {}))
-    ltv_cfg = tests.get("ltv", config.get("ltv", {}))
+    refi_cfg = tests.get("refinance", {})
+    ltv_cfg = tests.get("ltv", {})
     noi_field = refi_cfg.get("noi_field", ltv_cfg.get("noi_field", "noi"))
     required = [subsector_field, balance_field, noi_field]
     missing = missing_fields(row, required)
@@ -173,14 +173,14 @@ def _run_refi_ltv(
         _mark_out(out, idx, level, row, scenario, out_scope, "Refinance/LTV", [balance_field], "nonpositive_balance")
         return None
     ratio = noi / balance if balance else np.nan
-    if not _in_range(ratio, config.get("noi_balance_ratio_acceptable_range", ltv_cfg.get("noi_balance_ratio_acceptable_range"))):
+    if not _in_range(ratio, config.get("noi_balance_ratio_acceptable_range")):
         _mark_out(out, idx, level, row, scenario, out_scope, "Refinance/LTV", [noi_field, balance_field], "outside_noi_balance_ratio_range")
         return None
 
     best = row.get("base_bucket", "Pass")
     if refi_cfg.get("enabled", True):
-        dscr_cfg = tests.get("dscr", config.get("dscr", {}))
-        decline_table = refi_cfg.get("noi_decline", dscr_cfg.get("decline", config.get("dscr_decline")))
+        dscr_cfg = tests.get("dscr", {})
+        decline_table = refi_cfg.get("noi_decline", dscr_cfg.get("decline"))
         sector = row.get(subsector_field)
         noi_decline = _resolve_assumption(
             decline_table, sector, level, "refinance_noi_decline", exceptions, fallback_events
@@ -188,7 +188,7 @@ def _run_refi_ltv(
         spread = _resolve_assumption(
             refi_cfg.get("credit_spreads"), sector, level, "credit_spread", exceptions, fallback_events
         )
-        treasury = to_number(refi_cfg.get("treasury_rate", config.get("treasury_rate")), np.nan)
+        treasury = to_number(refi_cfg.get("treasury_rate"), np.nan)
         amort_years = _resolve_assumption(
             refi_cfg.get("amortization_years"), sector, level, "amortization_years", exceptions, fallback_events
         )
@@ -226,11 +226,11 @@ def _run_refi_ltv(
         stressed_dscr = stressed_noi / payment
         out.at[idx, f"cre_refi_dscr_{level}"] = stressed_dscr
         out.at[idx, f"cre_dscr_{level}"] = stressed_dscr
-        best = worse_bucket(best, lower_metric_bucket(stressed_dscr, refi_cfg.get("cutoffs", config.get("dscr_cutoffs", {}))))
+        best = worse_bucket(best, lower_metric_bucket(stressed_dscr, refi_cfg.get("cutoffs", {})))
 
     if ltv_cfg.get("enabled", True):
         cap_rate = _resolve_assumption(
-            ltv_cfg.get("cap_rates", config.get("ltv_cap_rates")),
+            ltv_cfg.get("cap_rates"),
             row.get(subsector_field),
             level,
             "cap_rate",
@@ -244,7 +244,7 @@ def _run_refi_ltv(
         # divided by NOI. Higher values map to worse buckets.
         stressed_ltv = balance * cap_rate / noi
         out.at[idx, f"cre_ltv_{level}"] = stressed_ltv
-        best = worse_bucket(best, higher_metric_bucket(stressed_ltv, ltv_cfg.get("cutoffs", config.get("ltv_cutoffs", {}))))
+        best = worse_bucket(best, higher_metric_bucket(stressed_ltv, ltv_cfg.get("cutoffs", {})))
     return best
 
 
@@ -322,13 +322,3 @@ def _mark_out(
     """Mark a CRE borrower/level out of scope and add detail rows."""
     out.at[idx, f"out_of_scope_{level}"] = True
     record_out_of_scope(out_scope, row, scenario, "CRE", level, test, fields, reason)
-
-
-def _append_module(existing: Any, module: str) -> str:
-    """Append the module name to the borrower-level module audit field."""
-    if not existing:
-        return module
-    pieces = [item for item in str(existing).split(";") if item]
-    if module not in pieces:
-        pieces.append(module)
-    return ";".join(pieces)

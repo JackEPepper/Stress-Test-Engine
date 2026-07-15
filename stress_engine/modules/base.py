@@ -34,9 +34,9 @@ def initialize_results(
         result["base_bucket"] = "Unknown"
     borrower_id = config.get("borrower_id_field", "borrower_id")
     module_field = "primary_module" if "primary_module" in result.columns else config.get("module_field", "model_module")
-    affected_modules = {"cre", "c&i", "ci", "overlay"}
+    affected_modules = {"CRE", "C&I", "Overlay"}
     for _, row in result[result["base_bucket"] == "Unknown"].iterrows():
-        module = str(row.get(module_field, "")).lower()
+        module = str(row.get(module_field, ""))
         if module not in affected_modules:
             continue
         record_exception(
@@ -60,8 +60,8 @@ def initialize_results(
 def module_population(df: pd.DataFrame, scenario: Mapping[str, Any], module_config: Mapping[str, Any]) -> pd.Series:
     """Return rows eligible for one stress module.
 
-    Called inside each module. It checks model-eligible tags, optional
-    portfolio/module filters, and the resolved `primary_module` field.
+    Called inside each module. It checks model-eligible tags and the resolved
+    ``primary_module`` field.
     """
     mask = pd.Series(True, index=df.index)
     eligible_tags = as_list(module_config.get("eligible_tags"))
@@ -69,26 +69,15 @@ def module_population(df: pd.DataFrame, scenario: Mapping[str, Any], module_conf
         allowed = model_eligible_tag_names(scenario)
         tag_mask = pd.Series(False, index=df.index)
         for tag in eligible_tags:
-            if tag not in allowed and not module_config.get("allow_non_model_tags", False):
+            if tag not in allowed:
                 continue
             column = f"tag_{stable_name(tag)}"
             if column in df.columns:
                 tag_mask |= df[column].fillna(False).astype(bool)
         mask &= tag_mask
-
-    portfolio_field = module_config.get("portfolio_field", scenario.get("borrower", {}).get("portfolio_field"))
-    portfolio_values = as_list(module_config.get("portfolio_values"))
-    if portfolio_field and portfolio_values and portfolio_field in df.columns:
-        mask &= df[portfolio_field].isin(portfolio_values)
-
-    module_field = module_config.get("module_field", scenario.get("borrower", {}).get("module_field"))
-    module_values = as_list(module_config.get("module_values"))
-    if module_field and module_values and module_field in df.columns:
-        mask &= df[module_field].isin(module_values)
-    priority_field = module_config.get("priority_field", "primary_module")
-    module_name = module_config.get("_module_name", module_config.get("module_name"))
-    if module_name and priority_field in df.columns:
-        mask &= df[priority_field].astype(str).map(_normalize_module_name) == _normalize_module_name(module_name)
+    module_name = module_config.get("_module_name")
+    if module_name and "primary_module" in df.columns:
+        mask &= df["primary_module"].astype(str) == str(module_name)
     return mask.fillna(False)
 
 
@@ -129,6 +118,11 @@ def missing_fields(row: Mapping[str, Any], fields: Iterable[str]) -> List[str]:
     return missing
 
 
-def _normalize_module_name(value: Any) -> str:
-    """Normalize labels before comparing module names."""
-    return str(value).lower().replace("&", "and").replace(" ", "_")
+def append_module(existing: Any, module: str) -> str:
+    """Append a module name to the borrower-level audit field once."""
+    if not existing:
+        return module
+    pieces = [item for item in str(existing).split(";") if item]
+    if module not in pieces:
+        pieces.append(module)
+    return ";".join(pieces)

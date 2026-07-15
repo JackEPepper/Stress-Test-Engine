@@ -1,9 +1,6 @@
 {
   "scenario_batch": {
     "mode": "grid",
-    "output_directory": "outputs/example_batch",
-    "include_base": true,
-    "delta_from_base": true,
     "max_scenarios": 20,
     "variables": [
       {
@@ -19,8 +16,12 @@
       {
         "name": "Consumer PD S2 factor",
         "path": "modules.Consumer.pd_increase_factor.S2",
-        "values": [1.25, 1.50]
+        "values": [
+          1.25,
+          1.75
+        ]
       }
-    ]
+    ],
+    "output_directory": "outputs/example_batch"
   }
 }

@@ -277,7 +277,6 @@ def _without_comparison(scenario: Mapping[str, Any]) -> Dict[str, Any]:
     """Disable recursive comparison before comparison reruns."""
     result = copy.deepcopy(dict(scenario))
     result["comparison"] = {}
-    result.setdefault("outputs", {})
     return result
 
 

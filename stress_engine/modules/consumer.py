@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from .base import module_population, record_out_of_scope
+from .base import append_module, module_population, record_out_of_scope
 from ..exceptions import record_exception
 from ..utils import get_levels, is_missing, lookup_parameter_with_source, to_number
 
@@ -25,7 +25,7 @@ def run_consumer(
     loss metrics for base and stress levels.
     """
     exceptions = exceptions if exceptions is not None else []
-    config = scenario.get("modules", {}).get("Consumer", scenario.get("modules", {}).get("consumer", {}))
+    config = scenario.get("modules", {}).get("Consumer", {})
     if not config or not config.get("enabled", True):
         return results, pd.DataFrame()
     config = dict(config)
@@ -44,16 +44,11 @@ def run_consumer(
     fallback_events: set[tuple[str, str, str]] = set()
 
     for idx, row in out.loc[mask].iterrows():
-        out.at[idx, "module_applied"] = _append_module(out.at[idx, "module_applied"], "Consumer")
-        # The candidates lists let scenarios choose current/origination fields.
-        # `_latest_candidate` uses date and configured order for deterministic
-        # selection.
-        fico, fico_field = _latest_candidate(row, config.get("fico_candidates", [{"score_field": "fico_score", "date_field": "fico_date"}]), "score_field")
-        appraisal, appraisal_field = _latest_candidate(
-            row,
-            config.get("appraisal_candidates", [{"value_field": "appraised_value", "date_field": "appraisal_date"}]),
-            "value_field",
-        )
+        out.at[idx, "module_applied"] = append_module(out.at[idx, "module_applied"], "Consumer")
+        fico_field = config["fico_field"]
+        appraisal_field = config["appraisal_field"]
+        fico = row.get(fico_field)
+        appraisal = row.get(appraisal_field)
         balance = to_number(row.get(balance_field))
         missing = []
         if is_missing(fico):
@@ -157,36 +152,23 @@ def run_consumer(
 
 
 def _pd_lookup_table(config: Mapping[str, Any], inputs: Mapping[str, Any]) -> pd.DataFrame:
-    """Return the FICO-to-PD lookup table from JSON or a loaded source."""
-    if "pd_lookup" in config:
-        return pd.DataFrame(config["pd_lookup"])
-    source = config.get("pd_lookup_source")
-    if source:
-        if source not in inputs:
-            raise ValueError(f"Consumer PD lookup source '{source}' was not loaded.")
-        return inputs[source].frame.copy()
-    raise ValueError("Consumer module requires pd_lookup or pd_lookup_source.")
+    """Return the configured FICO-to-PD input table."""
+    source = config["pd_lookup_source"]
+    if source not in inputs:
+        raise ValueError(f"Consumer PD lookup source '{source}' was not loaded.")
+    return inputs[source].frame.copy()
 
 
 def _lookup_pd(score: float, table: pd.DataFrame) -> float:
-    """Map FICO score to PD using exact score or min/max band rows."""
-    if table.empty:
+    """Map a FICO score to one canonical min/max PD band."""
+    required = {"min_score", "max_score", "pd"}
+    if table.empty or not required <= set(table.columns):
         return np.nan
-    if "fico" in table.columns and "pd" in table.columns:
-        exact = table[pd.to_numeric(table["fico"], errors="coerce") == score]
-        if len(exact) == 1:
-            return to_number(exact.iloc[0]["pd"])
-        if len(exact) > 1:
-            return np.nan
-    min_cols = [col for col in ("min_score", "fico_min", "min_fico") if col in table.columns]
-    max_cols = [col for col in ("max_score", "fico_max", "max_fico") if col in table.columns]
-    pd_col = "pd" if "pd" in table.columns else "probability_of_default"
-    if min_cols and max_cols and pd_col in table.columns:
-        lo = pd.to_numeric(table[min_cols[0]], errors="coerce")
-        hi = pd.to_numeric(table[max_cols[0]], errors="coerce")
-        match = table[(score >= lo) & (score <= hi)]
-        if len(match) == 1:
-            return to_number(match.iloc[0][pd_col])
+    lo = pd.to_numeric(table["min_score"], errors="coerce")
+    hi = pd.to_numeric(table["max_score"], errors="coerce")
+    match = table[(score >= lo) & (score <= hi)]
+    if len(match) == 1:
+        return to_number(match.iloc[0]["pd"])
     return np.nan
 
 
@@ -202,25 +184,22 @@ def _validate_pd_lookup(table: pd.DataFrame, exceptions: List[Dict[str, Any]]) -
             field="fico_pd_lookup",
         )
         return
-    min_cols = [col for col in ("min_score", "fico_min", "min_fico") if col in table.columns]
-    max_cols = [col for col in ("max_score", "fico_max", "max_fico") if col in table.columns]
-    pd_col = "pd" if "pd" in table.columns else "probability_of_default"
-    if not min_cols or not max_cols or pd_col not in table.columns:
-        if not ({"fico", "pd"} <= set(table.columns)):
-            record_exception(
-                exceptions,
-                "ERROR",
-                "Consumer",
-                "CONSUMER_PD_LOOKUP_COLUMNS_INVALID",
-                "Consumer PD lookup table did not contain an exact-score or min/max band structure.",
-                field="fico_pd_lookup",
-            )
+    required = {"min_score", "max_score", "pd"}
+    if not required <= set(table.columns):
+        record_exception(
+            exceptions,
+            "ERROR",
+            "Consumer",
+            "CONSUMER_PD_LOOKUP_COLUMNS_INVALID",
+            "Consumer PD lookup table did not contain min_score, max_score, and pd.",
+            field="fico_pd_lookup",
+        )
         return
     work = pd.DataFrame(
         {
-            "lo": pd.to_numeric(table[min_cols[0]], errors="coerce"),
-            "hi": pd.to_numeric(table[max_cols[0]], errors="coerce"),
-            "pd": pd.to_numeric(table[pd_col], errors="coerce"),
+            "lo": pd.to_numeric(table["min_score"], errors="coerce"),
+            "hi": pd.to_numeric(table["max_score"], errors="coerce"),
+            "pd": pd.to_numeric(table["pd"], errors="coerce"),
         }
     ).sort_values(["lo", "hi"], kind="mergesort")
     invalid = work[work[["lo", "hi", "pd"]].isna().any(axis=1) | (work["lo"] > work["hi"]) | ~work["pd"].between(0, 1)]
@@ -264,47 +243,6 @@ def _validate_pd_lookup(table: pd.DataFrame, exceptions: List[Dict[str, Any]]) -
             field="fico_pd_lookup",
             details=f"gap_count={gaps}",
         )
-
-
-def _latest_candidate(row: Mapping[str, Any], candidates: List[Mapping[str, Any]], value_key: str) -> tuple[float, str | None]:
-    """Pick the latest usable candidate value by date.
-
-    Called for both FICO scores and appraisals. Blank values are skipped, and
-    zeros are skipped by default because neither a FICO score nor an appraisal
-    of zero should block fallback to a lower-priority candidate.
-    """
-    available: List[tuple[pd.Timestamp, int, float, str]] = []
-    for order, candidate in enumerate(candidates):
-        field = candidate.get(value_key)
-        if not field:
-            continue
-        value = row.get(field)
-        if pd.isna(value):
-            continue
-        numeric_value = to_number(value)
-        if candidate.get("treat_zero_as_missing", True) and numeric_value == 0:
-            continue
-        date_field = candidate.get("date_field")
-        date = pd.to_datetime(row.get(date_field), errors="coerce") if date_field else pd.Timestamp.min
-        if pd.isna(date):
-            date = pd.Timestamp.min
-        available.append((date, -order, numeric_value, field))
-    if not available:
-        first_field = candidates[0].get(value_key) if candidates else None
-        return np.nan, first_field
-    available.sort()
-    _, _, value, field = available[-1]
-    return value, field
-
-
-def _append_module(existing: Any, module: str) -> str:
-    """Append the module name to the borrower-level module audit field."""
-    if not existing:
-        return module
-    pieces = [item for item in str(existing).split(";") if item]
-    if module not in pieces:
-        pieces.append(module)
-    return ";".join(pieces)
 
 
 def _log_consumer_default(

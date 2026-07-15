@@ -4,21 +4,23 @@ from __future__ import annotations
 
 import copy
 import itertools
-import re
+import json
+from math import prod
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from .config import output_dir_for
-from .engine import ENGINE_VERSION, StressEngine
+from .engine import StressEngine
 from .io import write_csv, write_json
-from .utils import hash_json, json_safe, resolve_path, stable_name, to_number
+from .utils import get_json_path, hash_json, json_safe, resolve_path, set_json_path_in_place, stable_name, to_number
+from .version import VERSION
 
 
-_PATH_TOKEN_RE = re.compile(r"([^\.\[\]]+)|\[(\d+)\]")
-_BATCH_SECTION_NAMES = ("scenario_batch", "batch")
+_BATCH_MANIFEST_NAME = "batch_output_manifest.json"
+_BATCH_MANIFEST_KIND = "stress_engine_batch_outputs"
 
 
 def run_batch_scenarios(
@@ -40,35 +42,32 @@ def run_batch_scenarios(
     base_dir = Path(base_dir).resolve()
     base_scenario = copy.deepcopy(dict(scenario))
     batch_config = _batch_config(base_scenario)
+    if mode_override:
+        batch_config["mode"] = mode_override
     expanded = expand_batch_scenarios(base_scenario, max_scenarios=max_scenarios, mode_override=mode_override)
     batch_dir = _batch_output_dir(base_scenario, base_dir, output_dir)
 
-    include_base = bool(batch_config.get("include_base", True))
-    delta_from_base = bool(batch_config.get("delta_from_base", True))
-    base_result = None
-    if include_base or delta_from_base:
-        base_output = batch_dir / "scenarios" / "base" if write_child_outputs else None
-        base_result = StressEngine(base_scenario, base_dir).run(
-            output_dir=base_output,
-            write_outputs=write_outputs and write_child_outputs,
-            run_comparison=run_comparison,
-        )
+    base_output = batch_dir / "scenarios" / "base" if write_child_outputs else None
+    base_result = StressEngine(base_scenario, base_dir).run(
+        output_dir=base_output,
+        write_outputs=write_outputs and write_child_outputs,
+        run_comparison=run_comparison,
+    )
 
     run_records: List[Dict[str, Any]] = []
     result_records: List[Dict[str, Any]] = []
-    if include_base and base_result is not None:
-        result_records.append(
-            {
-                "run_id": "base",
-                "scenario_id": str(base_scenario.get("scenario_id", "base")),
-                "scenario_label": "Base",
-                "is_base": True,
-                "variables": {},
-                "variable_rows": [],
-                "output_dir": str(batch_dir / "scenarios" / "base") if write_child_outputs else "",
-                "result": base_result,
-            }
-        )
+    result_records.append(
+        {
+            "run_id": "base",
+            "scenario_id": str(base_scenario.get("scenario_id", "base")),
+            "scenario_label": "Base",
+            "is_base": True,
+            "variables": {},
+            "variable_rows": [],
+            "output_dir": str(batch_dir / "scenarios" / "base") if write_child_outputs else "",
+            "result": base_result,
+        }
+    )
 
     for record in expanded:
         child_output = batch_dir / "scenarios" / record["run_id"] if write_child_outputs else None
@@ -96,7 +95,12 @@ def run_batch_scenarios(
     reports = _batch_reports(result_records, base_result)
     metadata = _batch_metadata(base_scenario, batch_config, expanded, reports, result_records, base_result)
     if write_outputs:
-        _write_batch_outputs(batch_dir, reports, metadata)
+        child_directories = (
+            [Path("scenarios") / record["run_id"] for record in result_records]
+            if write_child_outputs
+            else []
+        )
+        _write_batch_outputs(batch_dir, reports, metadata, child_directories)
 
     return {
         "batch_config": batch_config,
@@ -120,34 +124,34 @@ def expand_batch_scenarios(
     if not config:
         raise ValueError("Batch execution requires a 'scenario_batch' section.")
     mode = str(mode_override or config.get("mode", "grid")).lower()
-    if mode == "named":
-        records = _named_records(base, config)
-    else:
-        variables = _variable_specs(base, config)
-        if mode == "grid":
-            records = _grid_records(base, variables)
-        elif mode == "paired":
-            records = _paired_records(base, variables)
-        else:
-            raise ValueError(f"Unsupported scenario_batch mode: {mode}")
-
+    if mode not in {"grid", "paired"}:
+        raise ValueError(f"Unsupported scenario_batch mode: {mode}")
+    variables = _variable_specs(base, config)
     limit = max_scenarios if max_scenarios is not None else int(config.get("max_scenarios", 500))
-    if len(records) > limit:
-        raise ValueError(f"Batch expansion produced {len(records)} scenarios, above max_scenarios={limit}.")
-    run_ids = [record["run_id"] for record in records]
-    duplicates = sorted({run_id for run_id in run_ids if run_ids.count(run_id) > 1})
-    if duplicates:
-        raise ValueError(f"Batch scenario run IDs must be unique: {', '.join(duplicates)}")
+    scenario_count = _expansion_count(mode, variables)
+    if scenario_count > limit:
+        raise ValueError(f"Batch expansion produced {scenario_count} scenarios, above max_scenarios={limit}.")
+
+    if mode == "grid":
+        records = _grid_records(base, variables)
+    else:
+        records = _paired_records(base, variables)
     return records
 
 
+def _expansion_count(mode: str, variables: Sequence[Mapping[str, Any]]) -> int:
+    """Return child scenario count without constructing child scenarios."""
+    lengths = [len(variable["_values"]) for variable in variables]
+    if mode == "grid":
+        return prod(lengths)
+    if len(set(lengths)) > 1:
+        raise ValueError("Paired batch mode requires every variable to have the same number of values.")
+    return lengths[0] if lengths else 0
+
+
 def _batch_config(scenario: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return the optional batch config under supported section names."""
-    for name in _BATCH_SECTION_NAMES:
-        config = scenario.get(name)
-        if config:
-            return dict(config)
-    return {}
+    """Return the optional ``scenario_batch`` configuration."""
+    return dict(scenario.get("scenario_batch", {}))
 
 
 def _variable_specs(scenario: Mapping[str, Any], config: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -166,7 +170,7 @@ def _variable_specs(scenario: Mapping[str, Any], config: Mapping[str, Any]) -> L
         if not spec["_values"]:
             raise ValueError(f"Batch variable '{spec['name']}' produced no values.")
         if not spec.get("allow_create", False):
-            _get_json_path(scenario, spec["path"])
+            get_json_path(scenario, spec["path"])
         variables.append(spec)
     return variables
 
@@ -179,7 +183,7 @@ def _variable_values(scenario: Mapping[str, Any], spec: Mapping[str, Any]) -> Li
         return _range_values(spec["range"], spec)
     if "linspace" in spec:
         return _linspace_values(spec["linspace"], spec)
-    base_value = _get_json_path(scenario, spec["path"])
+    base_value = get_json_path(scenario, spec["path"])
     if "multipliers" in spec:
         base_number = to_number(base_value)
         return [_clean_numeric(base_number * to_number(multiplier), spec) for multiplier in spec["multipliers"]]
@@ -222,7 +226,7 @@ def _linspace_values(linspace_spec: Mapping[str, Any], variable_spec: Mapping[st
 
 def _clean_numeric(value: float, spec: Mapping[str, Any]) -> Any:
     """Round generated numeric values for stable JSON and CSV output."""
-    precision = int(spec.get("precision", spec.get("round", 12)))
+    precision = int(spec.get("precision", 12))
     rounded = round(float(value), precision)
     return int(rounded) if rounded.is_integer() else rounded
 
@@ -256,39 +260,6 @@ def _paired_records(base: Mapping[str, Any], variables: Sequence[Mapping[str, An
     return records
 
 
-def _named_records(base: Mapping[str, Any], config: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Expand explicitly named override sets."""
-    records = []
-    named = config.get("scenarios", config.get("named_scenarios", []))
-    if not named:
-        raise ValueError("Named batch mode requires at least one named scenario.")
-    for run_index, item in enumerate(named, start=1):
-        label = str(item.get("label", item.get("name", f"scenario_{run_index:04d}")))
-        run_id = stable_name(item.get("run_id", label)) or f"scenario_{run_index:04d}"
-        overrides = _named_overrides(item)
-        records.append(_scenario_record(base, run_id, run_index, overrides, label=label))
-    return records
-
-
-def _named_overrides(item: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Normalize one named scenario's path/value overrides."""
-    raw = item.get("overrides", item.get("variables", {}))
-    if isinstance(raw, Mapping):
-        return [
-            {"name": path, "path": path, "value": value, "allow_create": bool(item.get("allow_create", False))}
-            for path, value in raw.items()
-        ]
-    return [
-        {
-            "name": override.get("name", override.get("path")),
-            "path": override["path"],
-            "value": override.get("value"),
-            "allow_create": bool(override.get("allow_create", item.get("allow_create", False))),
-        }
-        for override in raw
-    ]
-
-
 def _override_from_variable(variable: Mapping[str, Any], value: Any) -> Dict[str, Any]:
     """Build one override row from a variable/value pair."""
     return {
@@ -304,7 +275,6 @@ def _scenario_record(
     run_id: str,
     run_index: int,
     overrides: Sequence[Mapping[str, Any]],
-    label: str | None = None,
 ) -> Dict[str, Any]:
     """Apply overrides to a child scenario and return its audit record."""
     child = copy.deepcopy(dict(base))
@@ -312,8 +282,13 @@ def _scenario_record(
     variable_rows = []
     for override in overrides:
         if not override.get("allow_create", False):
-            _get_json_path(child, override["path"])
-        _set_json_path(child, override["path"], override.get("value"), allow_create=bool(override.get("allow_create", False)))
+            get_json_path(child, override["path"])
+        set_json_path_in_place(
+            child,
+            override["path"],
+            override.get("value"),
+            allow_create=bool(override.get("allow_create", False)),
+        )
         variable_values[str(override["path"])] = override.get("value")
         variable_rows.append(
             {
@@ -339,7 +314,7 @@ def _scenario_record(
         "run_id": run_id,
         "run_index": run_index,
         "scenario_id": scenario_id,
-        "scenario_label": label or run_id,
+        "scenario_label": run_id,
         "variables": variable_values,
         "variable_rows": variable_rows,
         "scenario": child,
@@ -465,7 +440,7 @@ def _batch_metadata(
             }
         )
     return {
-        "engine_version": ENGINE_VERSION,
+        "engine_version": VERSION,
         "base_scenario_id": scenario.get("scenario_id"),
         "scenario_files": scenario.get("_metadata", {}).get("scenario_files", []),
         "base_scenario_hash": scenario.get("_metadata", {}).get("scenario_hash"),
@@ -481,18 +456,133 @@ def _batch_metadata(
     }
 
 
-def _write_batch_outputs(output_dir: Path, reports: Mapping[str, pd.DataFrame], metadata: Mapping[str, Any]) -> None:
+def _write_batch_outputs(
+    output_dir: Path,
+    reports: Mapping[str, pd.DataFrame],
+    metadata: Mapping[str, Any],
+    child_directories: Sequence[Path],
+) -> None:
     """Write batch-level CSV/JSON artifacts."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    prior_manifest = _read_batch_manifest(output_dir)
     sort_columns = {
         "batch_summary": ["run_id", "stress_level"],
         "batch_variables": ["run_id", "path"],
         "batch_cecl_summary": ["run_id", "portfolio", "stress_level", "bucket"],
         "batch_exceptions": ["run_id", "severity", "stage", "code"],
     }
+    current_files = {f"{name}.csv" for name in reports}
+    current_files.update({"batch_metadata.json", _BATCH_MANIFEST_NAME})
+    current_children = {path.as_posix() for path in child_directories}
     for name, frame in reports.items():
         write_csv(frame, output_dir / f"{name}.csv", sort_columns.get(name, []))
     write_json(metadata, output_dir / "batch_metadata.json")
+    _remove_stale_batch_outputs(output_dir, prior_manifest, current_files, current_children)
+    write_json(
+        {
+            "engine_version": VERSION,
+            "kind": _BATCH_MANIFEST_KIND,
+            "files": sorted(current_files),
+            "child_directories": sorted(current_children),
+        },
+        output_dir / _BATCH_MANIFEST_NAME,
+    )
+
+
+def _read_batch_manifest(output_dir: Path) -> Dict[str, Any]:
+    """Read an engine-created batch manifest, ignoring invalid or unrelated JSON."""
+    manifest = output_dir / _BATCH_MANIFEST_NAME
+    if not manifest.is_file():
+        return {}
+    try:
+        with manifest.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict) or data.get("kind") != _BATCH_MANIFEST_KIND:
+        return {}
+    return data
+
+
+def _remove_stale_batch_outputs(
+    output_dir: Path,
+    prior_manifest: Mapping[str, Any],
+    current_files: set[str],
+    current_children: set[str],
+) -> None:
+    """Remove only files and child directories owned by the prior batch run."""
+    prior_files = _manifest_strings(prior_manifest, "files")
+    for filename in sorted(prior_files - current_files):
+        path = _direct_child(output_dir, filename)
+        if path is not None and path.is_file():
+            path.unlink()
+
+    prior_children = _manifest_strings(prior_manifest, "child_directories")
+    for relative in sorted(prior_children - current_children):
+        child = _scenario_child(output_dir, relative)
+        if child is not None:
+            _remove_engine_child_outputs(child)
+
+    scenarios_dir = output_dir / "scenarios"
+    if scenarios_dir.is_dir():
+        try:
+            scenarios_dir.rmdir()
+        except OSError:
+            pass
+
+
+def _manifest_strings(manifest: Mapping[str, Any], field: str) -> set[str]:
+    """Return one manifest string-list field, treating malformed data as empty."""
+    values = manifest.get(field, [])
+    if not isinstance(values, list):
+        return set()
+    return {value for value in values if isinstance(value, str)}
+
+
+def _direct_child(parent: Path, name: str) -> Path | None:
+    """Resolve a direct child filename while rejecting paths and traversal."""
+    relative = Path(name)
+    if relative.is_absolute() or len(relative.parts) != 1 or relative.name in {"", ".", ".."}:
+        return None
+    return parent / relative.name
+
+
+def _scenario_child(output_dir: Path, relative: str) -> Path | None:
+    """Resolve a manifest child only when it is directly below ``scenarios``."""
+    path = Path(relative)
+    if path.is_absolute() or len(path.parts) != 2 or path.parts[0] != "scenarios":
+        return None
+    if path.parts[1] in {"", ".", ".."}:
+        return None
+    scenarios_dir = (output_dir / "scenarios").resolve()
+    child = (output_dir / path).resolve()
+    if child.parent != scenarios_dir:
+        return None
+    return child
+
+
+def _remove_engine_child_outputs(child: Path) -> None:
+    """Remove files named by one child engine manifest, preserving user files."""
+    if not child.is_dir():
+        return
+    manifest = child / "output_manifest.json"
+    owned_files: Sequence[Any] = []
+    if manifest.is_file():
+        try:
+            with manifest.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict) and isinstance(data.get("files"), list):
+                owned_files = data["files"]
+        except (OSError, ValueError, TypeError):
+            pass
+    for filename in sorted({str(value) for value in owned_files}):
+        path = _direct_child(child, filename)
+        if path is not None and path.is_file():
+            path.unlink()
+    try:
+        child.rmdir()
+    except OSError:
+        pass
 
 
 def _batch_output_dir(scenario: Mapping[str, Any], base_dir: Path, override: str | Path | None) -> Path:
@@ -504,43 +594,3 @@ def _batch_output_dir(scenario: Mapping[str, Any], base_dir: Path, override: str
         return resolve_path(config["output_directory"], base_dir)
     single_dir = output_dir_for(dict(scenario), base_dir)
     return single_dir.parent / f"{single_dir.name}_batch"
-
-
-def _get_json_path(data: Mapping[str, Any], path: str) -> Any:
-    """Return a value from dotted/list-index JSON path syntax."""
-    cursor: Any = data
-    for token in _path_tokens(path):
-        cursor = cursor[token]
-    return cursor
-
-
-def _set_json_path(data: Dict[str, Any], path: str, value: Any, allow_create: bool) -> None:
-    """Set a JSON path in place, optionally creating missing dict keys."""
-    tokens = _path_tokens(path)
-    cursor: Any = data
-    for token, next_token in zip(tokens[:-1], tokens[1:]):
-        if isinstance(token, int):
-            cursor = cursor[token]
-            continue
-        if token not in cursor:
-            if not allow_create:
-                raise KeyError(path)
-            cursor[token] = [] if isinstance(next_token, int) else {}
-        cursor = cursor[token]
-    final = tokens[-1]
-    if isinstance(final, int):
-        cursor[final] = copy.deepcopy(value)
-    else:
-        if final not in cursor and not allow_create:
-            raise KeyError(path)
-        cursor[final] = copy.deepcopy(value)
-
-
-def _path_tokens(path: str) -> List[Any]:
-    """Tokenize flattened JSON paths such as `modules.CRE.x[0].value`."""
-    tokens: List[Any] = []
-    for match in _PATH_TOKEN_RE.finditer(path):
-        tokens.append(match.group(1) if match.group(1) is not None else int(match.group(2)))
-    if not tokens:
-        raise ValueError(f"Invalid JSON path: {path}")
-    return tokens

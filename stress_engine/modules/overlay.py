@@ -32,17 +32,15 @@ def apply_overlays(
     overlays = scenario.get("overlays", {})
     if not overlays:
         return bucket_summary, pd.DataFrame()
-    if isinstance(overlays, list):
-        overlay_items = {item["portfolio"]: item for item in overlays}
-    else:
-        overlay_items = overlays
+    if not isinstance(overlays, Mapping):
+        raise ValueError("Scenario overlays must be a JSON object keyed by portfolio name.")
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
     levels = get_levels(scenario)
     summary = bucket_summary.copy()
     overlay_rows: List[Dict[str, Any]] = []
 
-    for portfolio, config in overlay_items.items():
+    for portfolio, config in overlays.items():
         if not config or not config.get("enabled", True):
             continue
         source_specs = _source_specs(config)
@@ -53,10 +51,10 @@ def apply_overlays(
         if total_balance <= 0:
             continue
         base_ratios = _portfolio_base_ratios(base_rows, balance_field)
-        source_base = _source_ratios(summary, borrowers, source_specs, scenario, "Base", config, exceptions, portfolio)
+        source_base = _source_ratios(borrowers, source_specs, scenario, "Base", exceptions, portfolio)
         replacement: List[Dict[str, Any]] = []
         for level in levels:
-            source_level = _source_ratios(summary, borrowers, source_specs, scenario, level, config, exceptions, portfolio)
+            source_level = _source_ratios(borrowers, source_specs, scenario, level, exceptions, portfolio)
             # Overlay ratios scale the overlay portfolio's own base SM/Sub
             # ratios by observed growth in the source portfolio set.
             sm_ratio = _grown_ratio(
@@ -104,7 +102,7 @@ def apply_overlays(
                 {
                     "portfolio": portfolio,
                     "stress_level": level,
-                    "source_portfolios": source_base["source_names"],
+                    "source_names": source_base["source_names"],
                     "source_weights": source_base["source_weights"],
                     "source_selection": source_base["source_selection"],
                     "base_special_mention_ratio": base_ratios["Special Mention"],
@@ -150,94 +148,30 @@ def _portfolio_base_ratios(rows: pd.DataFrame, balance_field: str) -> Dict[str, 
 
 
 def _source_specs(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Normalize legacy and weighted/tagged source configuration.
-
-    Legacy `source_portfolios: ["CRE", "C&I"]` remains balance-weighted from
-    migration summary rows. New `sources` specs can define `tags` plus explicit
-    `weight` values, which are calculated from borrower-level stressed results.
-    """
-    raw = config.get("sources", config.get("source_portfolios", config.get("basis_portfolios", [])))
-    if isinstance(raw, Mapping):
-        raw_items = []
-        for name, spec in raw.items():
-            if isinstance(spec, Mapping):
-                item = dict(spec)
-                item.setdefault("name", name)
-            else:
-                item = {"name": name, "portfolio": name, "weight": spec}
-            raw_items.append(item)
-    else:
-        raw_items = as_list(raw)
-
-    source_weights = config.get("source_weights", {})
-    source_tags = config.get("source_tags", config.get("source_portfolio_tags", {}))
+    """Validate and copy weighted borrower-level overlay source definitions."""
+    raw = config.get("sources", [])
+    if not isinstance(raw, list):
+        raise ValueError("Overlay sources must be a JSON list.")
     specs: List[Dict[str, Any]] = []
-    for item in raw_items:
-        if isinstance(item, Mapping):
-            spec = dict(item)
-            name = spec.get("name", spec.get("label", spec.get("portfolio", spec.get("source"))))
-            if name is None and spec.get("tags"):
-                name = "+".join(map(str, as_list(spec.get("tags"))))
-            spec["name"] = str(name) if name is not None else "source"
-        else:
-            spec = {"name": str(item), "portfolio": item, "_auto_portfolio": True}
-
-        lookup_name = str(spec.get("name", spec.get("portfolio", "")))
-        if "weight" not in spec and isinstance(source_weights, Mapping) and lookup_name in source_weights:
-            spec["weight"] = source_weights[lookup_name]
-        if not spec.get("tags") and isinstance(source_tags, Mapping) and lookup_name in source_tags:
-            spec["tags"] = source_tags[lookup_name]
-            if spec.get("_auto_portfolio"):
-                spec.pop("portfolio", None)
-        spec.pop("_auto_portfolio", None)
-        specs.append(spec)
+    for item in raw:
+        if not isinstance(item, Mapping) or not item.get("name"):
+            raise ValueError("Each overlay source must be an object with a nonblank name.")
+        specs.append(dict(item))
     return specs
 
 
 def _source_ratios(
-    summary: pd.DataFrame,
     borrowers: pd.DataFrame,
     source_specs: List[Mapping[str, Any]],
     scenario: Mapping[str, Any],
     level: str,
-    config: Mapping[str, Any],
     exceptions: List[Dict[str, Any]],
     overlay_portfolio: Any,
 ) -> Dict[str, Any]:
-    """Calculate source bucket ratios for one stress level.
-
-    If no source spec uses tags, weights, or conditions, this preserves the
-    original balance-weighted summary behavior. Otherwise each source spec is
-    evaluated independently and combined using normalized configured weights.
-    """
-    if not _uses_weighted_source_specs(source_specs, config):
-        portfolios = [spec.get("portfolio", spec.get("name")) for spec in source_specs]
-        ratios = _summary_source_ratios(summary, portfolios, level)
-        ratios.update(_source_audit_fields(source_specs, use_weights=False))
-        return ratios
+    """Calculate weighted borrower-level source ratios for one stress level."""
     ratios = _weighted_source_ratios(borrowers, source_specs, scenario, level, exceptions, overlay_portfolio)
-    ratios.update(_source_audit_fields(source_specs, use_weights=True))
+    ratios.update(_source_audit_fields(source_specs))
     return ratios
-
-
-def _uses_weighted_source_specs(source_specs: List[Mapping[str, Any]], config: Mapping[str, Any]) -> bool:
-    """Return whether overlay source ratios need row-level weighted logic."""
-    if "sources" in config or "source_weights" in config or "source_tags" in config or "source_portfolio_tags" in config:
-        return True
-    for spec in source_specs:
-        if any(key in spec for key in ("weight", "tags", "tag", "conditions", "include", "exclude")):
-            return True
-    return False
-
-
-def _summary_source_ratios(summary: pd.DataFrame, portfolios: List[Any], level: str) -> Dict[str, float]:
-    """Calculate legacy balance-weighted source portfolio ratios."""
-    rows = summary[(summary["portfolio"].isin(portfolios)) & (summary["stress_level"] == level)]
-    total = float(pd.to_numeric(rows["balance"], errors="coerce").sum())
-    return {
-        bucket: pct(pd.to_numeric(rows.loc[rows["bucket"] == bucket, "balance"], errors="coerce").sum(), total)
-        for bucket in BUCKETS
-    }
 
 
 def _weighted_source_ratios(
@@ -266,7 +200,7 @@ def _weighted_source_ratios(
                 "Overlay source population matched no borrowers and its configured weight was excluded.",
                 portfolio=overlay_portfolio,
                 stress_level=level,
-                source=str(spec.get("name", spec.get("portfolio", "source"))),
+                source=str(spec["name"]),
                 details=_source_selection_text(spec),
             )
             continue
@@ -280,7 +214,7 @@ def _weighted_source_ratios(
                 "Overlay source ratios were unavailable and its configured weight was excluded.",
                 portfolio=overlay_portfolio,
                 stress_level=level,
-                source=str(spec.get("name", spec.get("portfolio", "source"))),
+                source=str(spec["name"]),
                 details=_source_selection_text(spec),
             )
             continue
@@ -300,7 +234,7 @@ def _source_mask(df: pd.DataFrame, spec: Mapping[str, Any], scenario: Mapping[st
     if portfolio is not None and portfolio_field in df.columns:
         mask &= df[portfolio_field] == portfolio
 
-    tags = as_list(spec.get("tags", spec.get("tag")))
+    tags = as_list(spec.get("tags"))
     if tags:
         tag_masks = []
         for tag in tags:
@@ -315,44 +249,25 @@ def _source_mask(df: pd.DataFrame, spec: Mapping[str, Any], scenario: Mapping[st
             for item in tag_masks:
                 tag_mask &= item
         mask &= tag_mask
-        # Keep tag-based source populations aligned with module priority. This
-        # excludes a CRE-priority overlap from a source labeled C&I.
-        if spec.get("respect_module_priority", True) and "primary_module" in df.columns:
-            source_module = _recognized_source_module(spec.get("module", spec.get("name")))
-            if source_module:
-                mask &= df["primary_module"].astype(str).map(_normalize_module_name) == source_module
+        # Keep tag-based source populations aligned with the selected module.
+        # This excludes a CRE-priority overlap from a source labeled C&I.
+        if "primary_module" in df.columns:
+            source_module = str(spec.get("module", spec["name"]))
+            mask &= df["primary_module"].astype(str) == source_module
 
-    exclude_tags = as_list(spec.get("exclude_tags", spec.get("exclude_tag")))
+    exclude_tags = as_list(spec.get("exclude_tags"))
     for tag in exclude_tags:
         column = f"tag_{stable_name(tag)}"
         if column in df.columns:
             mask &= ~df[column].fillna(False).astype(bool)
 
-    include = spec.get("conditions", spec.get("include"))
+    include = spec.get("include")
     if include:
         mask &= evaluate_conditions(df, include)
     exclude = spec.get("exclude")
     if exclude:
         mask &= ~evaluate_conditions(df, exclude)
     return mask.fillna(False)
-
-
-def _recognized_source_module(value: Any) -> str | None:
-    """Map common overlay source labels to normalized model module names."""
-    aliases = {
-        "cre": "cre",
-        "commercial_real_estate": "cre",
-        "candi": "candi",
-        "ci": "candi",
-        "commercial_and_industrial": "candi",
-        "consumer": "consumer",
-    }
-    return aliases.get(_normalize_module_name(value))
-
-
-def _normalize_module_name(value: Any) -> str:
-    """Normalize module labels consistently with model routing."""
-    return str(value).lower().replace("&", "and").replace(" ", "_")
 
 
 def _bucket_ratios_from_rows(rows: pd.DataFrame, balance_field: str, level: str) -> Dict[str, float]:
@@ -367,39 +282,36 @@ def _bucket_ratios_from_rows(rows: pd.DataFrame, balance_field: str, level: str)
     }
 
 
-def _source_audit_fields(source_specs: List[Mapping[str, Any]], use_weights: bool) -> Dict[str, str]:
+def _source_audit_fields(source_specs: List[Mapping[str, Any]]) -> Dict[str, str]:
     """Build semicolon-delimited overlay source audit fields."""
     return {
-        "source_names": ";".join(str(spec.get("name", spec.get("portfolio", "source"))) for spec in source_specs),
-        "source_weights": ";".join(_source_weight_text(spec, use_weights) for spec in source_specs),
+        "source_names": ";".join(str(spec["name"]) for spec in source_specs),
+        "source_weights": ";".join(_source_weight_text(spec) for spec in source_specs),
         "source_selection": ";".join(_source_selection_text(spec) for spec in source_specs),
-        "source_description": ";".join(str(spec.get("name", spec.get("portfolio", "source"))) for spec in source_specs),
+        "source_description": ";".join(str(spec["name"]) for spec in source_specs),
     }
 
 
-def _source_weight_text(spec: Mapping[str, Any], use_weights: bool) -> str:
+def _source_weight_text(spec: Mapping[str, Any]) -> str:
     """Format one source weight for overlay_summary."""
-    name = str(spec.get("name", spec.get("portfolio", "source")))
-    if not use_weights:
-        return f"{name}=balance_weighted"
+    name = str(spec["name"])
     return f"{name}={to_number(spec.get('weight', 1.0), 1.0):g}"
 
 
 def _source_selection_text(spec: Mapping[str, Any]) -> str:
     """Describe how one source population was selected."""
-    name = str(spec.get("name", spec.get("portfolio", "source")))
+    name = str(spec["name"])
     pieces = []
     if spec.get("portfolio") is not None:
         pieces.append(f"portfolio={spec.get('portfolio')}")
-    if spec.get("tags") or spec.get("tag"):
-        pieces.append(f"tags={','.join(map(str, as_list(spec.get('tags', spec.get('tag')))))}")
-        if spec.get("respect_module_priority", True):
-            pieces.append("primary_module=required")
-    if spec.get("conditions") or spec.get("include"):
+    if spec.get("tags"):
+        pieces.append(f"tags={','.join(map(str, as_list(spec.get('tags'))))}")
+        pieces.append("primary_module=required")
+    if spec.get("include"):
         pieces.append("conditions=configured")
-    if spec.get("exclude") or spec.get("exclude_tags") or spec.get("exclude_tag"):
+    if spec.get("exclude") or spec.get("exclude_tags"):
         pieces.append("exclusions=configured")
-    return f"{name}({';'.join(pieces) if pieces else 'summary_portfolio'})"
+    return f"{name}({';'.join(pieces) if pieces else 'all borrowers'})"
 
 
 def _grown_ratio(

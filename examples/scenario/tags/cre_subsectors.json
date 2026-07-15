@@ -1,0 +1,184 @@
+{
+  "tags": {
+    "CRE_Subsector_Multifamily_Rent_Regulated": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Multifamily Rent Regulated"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Multifamily Rent Regulated"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Multifamily_Market": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Multifamily Market"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Multifamily Market"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Traditional_Office": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Traditional Office"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Traditional Office"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Medical_Office": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Medical Office"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Medical Office"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Industrial": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Industrial"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Industrial"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Skilled_Nursing_Facilities": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Skilled Nursing Facilities"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Skilled Nursing Facilities"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Senior_Living": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Senior Living"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Senior Living"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Retail": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Retail"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Retail"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    },
+    "CRE_Subsector_Hotel": {
+      "model_eligible": false,
+      "include": [
+        {
+          "field": "subsector",
+          "op": "has_token",
+          "value": "Hotel"
+        }
+      ],
+      "assign": {
+        "cre_subsector": "Hotel"
+      },
+      "tie_out": {
+        "source": "tag_tieouts",
+        "key_field": "tag",
+        "amount_field": "expected_balance",
+        "actual_field": "outstanding_balance",
+        "tolerance": 0.01
+      }
+    }
+  }
+}

@@ -37,27 +37,49 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
         raise FileNotFoundError(f"Input source '{name}' not found: {path}")
     file_type = str(spec.get("type") or path.suffix.lstrip(".")).lower()
     read_options = dict(spec.get("read_options", {}))
+    rename = _column_rename_map(name, spec)
+    source_for_canonical = {canonical: source for source, canonical in rename.items()}
     string_columns = [str(field) for field in spec.get("string_columns", [])]
     if string_columns:
+        source_string_columns = [source_for_canonical.get(field, field) for field in string_columns]
         configured_dtype = read_options.get("dtype")
         if configured_dtype is None:
-            read_options["dtype"] = {field: "string" for field in string_columns}
+            read_options["dtype"] = {field: "string" for field in source_string_columns}
         elif isinstance(configured_dtype, Mapping):
             merged_dtype = dict(configured_dtype)
-            for field in string_columns:
+            for field in source_string_columns:
                 merged_dtype.setdefault(field, "string")
             read_options["dtype"] = merged_dtype
-    if file_type in {"csv", "txt"}:
+    if file_type == "csv":
         df = pd.read_csv(path, **read_options)
-    elif file_type in {"xlsx", "xlsm", "xls"}:
-        sheet_name = spec.get("sheet_name", spec.get("sheet", 0))
+    elif file_type in {"xlsx", "xlsm"}:
+        sheet_name = spec.get("sheet_name", 0)
         df = pd.read_excel(path, sheet_name=sheet_name, **read_options)
     else:
         raise ValueError(f"Unsupported input type for '{name}': {file_type}")
 
-    rename = spec.get("rename", {})
-    if rename:
-        df = df.rename(columns=rename)
+    if not rename:
+        raise ValueError(f"Input source '{name}' must define column_aliases for every source column.")
+    missing_aliases = [source for source in rename if source not in df.columns]
+    if missing_aliases:
+        raise ValueError(
+            f"Input source '{name}' is missing configured aliased columns: {', '.join(missing_aliases)}"
+        )
+    unmapped = [str(column) for column in df.columns if column not in rename]
+    if unmapped:
+        raise ValueError(f"Input source '{name}' has columns missing from column_aliases: {', '.join(unmapped)}")
+    collisions = [
+        (source, canonical)
+        for source, canonical in rename.items()
+        if source != canonical and source in df.columns and canonical in df.columns
+    ]
+    if collisions:
+        details = ", ".join(f"{source} -> {canonical}" for source, canonical in collisions)
+        raise ValueError(f"Input source '{name}' alias collides with an existing canonical column: {details}")
+    df = df.rename(columns=rename)
+    duplicates = df.columns[df.columns.duplicated()].unique().tolist()
+    if duplicates:
+        raise ValueError(f"Input source '{name}' aliases create duplicate columns: {', '.join(duplicates)}")
 
     coercion_issues: List[Dict[str, Any]] = []
     for field in spec.get("date_columns", []):
@@ -77,9 +99,6 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
             df[field] = converted
 
     numeric_fields = set(spec.get("numeric_columns", []))
-    numeric_fields.update(spec.get("balance_fields", []))
-    numeric_fields.update(spec.get("sum_fields", []))
-    numeric_fields.update(spec.get("dollar_fields", []))
     for field in sorted(numeric_fields):
         if field not in df.columns:
             continue
@@ -113,6 +132,31 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
         profile=profile,
         coercion_issues=coercion_issues,
     )
+
+
+def _column_rename_map(name: str, spec: Mapping[str, Any]) -> Dict[str, str]:
+    """Return source-to-canonical renames from ``column_aliases``."""
+    aliases = spec.get("column_aliases", {}) or {}
+    if not isinstance(aliases, Mapping):
+        raise ValueError(f"Input source '{name}' column_aliases must be a JSON object.")
+
+    rename: Dict[str, str] = {}
+    for canonical, source in aliases.items():
+        _add_column_rename(name, rename, source, canonical)
+    return rename
+
+
+def _add_column_rename(name: str, rename: Dict[str, str], source: Any, canonical: Any) -> None:
+    source_name = str(source).strip()
+    canonical_name = str(canonical).strip()
+    if not source_name or not canonical_name:
+        raise ValueError(f"Input source '{name}' column aliases must use nonblank names.")
+    existing = rename.get(source_name)
+    if existing is not None and existing != canonical_name:
+        raise ValueError(
+            f"Input source '{name}' maps source column '{source_name}' to both '{existing}' and '{canonical_name}'."
+        )
+    rename[source_name] = canonical_name
 
 
 def load_inputs(scenario: Mapping[str, Any], base_dir: Path) -> Dict[str, LoadedTable]:

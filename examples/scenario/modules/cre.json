@@ -1,0 +1,98 @@
+{
+  "modules": {
+    "CRE": {
+      "enabled": true,
+      "eligible_tags": [
+        "CRE_Model"
+      ],
+      "subsector_field": "cre_subsector",
+      "cecl_portfolio_field": "cre_subsector",
+      "cecl_portfolio_rollup": "CRE",
+      "maturity_threshold_months": 12,
+      "noi_balance_ratio_acceptable_range": [
+        0.01,
+        0.3
+      ],
+      "tests": {
+        "dscr": {
+          "field": "dscr",
+          "decline": {
+            "default": {
+              "S1": 0.05,
+              "S2": 0.1
+            },
+            "Multifamily Rent Regulated": {
+              "S1": 0.04,
+              "S2": 0.08
+            },
+            "Medical Office": {
+              "S1": 0.04,
+              "S2": 0.08
+            },
+            "Industrial": {
+              "S1": 0.04,
+              "S2": 0.08
+            },
+            "Skilled Nursing Facilities": {
+              "S1": 0.06,
+              "S2": 0.12
+            },
+            "Senior Living": {
+              "S1": 0.06,
+              "S2": 0.12
+            },
+            "Retail": {
+              "S1": 0.06,
+              "S2": 0.12
+            },
+            "Hotel": {
+              "S1": 0.08,
+              "S2": 0.15
+            }
+          },
+          "cutoffs": {
+            "special_mention": 1.15,
+            "substandard": 1.0
+          },
+          "acceptable_range": [
+            0.2,
+            5.0
+          ]
+        },
+        "refinance": {
+          "noi_field": "noi",
+          "treasury_rate": 0.04,
+          "credit_spreads": {
+            "default": {
+              "S1": 0.02,
+              "S2": 0.03
+            }
+          },
+          "amortization_years": {
+            "default": {
+              "S1": 25,
+              "S2": 25
+            }
+          },
+          "cutoffs": {
+            "special_mention": 1.15,
+            "substandard": 1.0
+          }
+        },
+        "ltv": {
+          "noi_field": "noi",
+          "cap_rates": {
+            "default": {
+              "S1": 0.075,
+              "S2": 0.085
+            }
+          },
+          "cutoffs": {
+            "special_mention": 0.75,
+            "substandard": 0.9
+          }
+        }
+      }
+    }
+  }
+}

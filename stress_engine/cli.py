@@ -14,7 +14,11 @@ from .engine import StressEngine
 def build_parser() -> argparse.ArgumentParser:
     """Define CLI arguments for scenario execution."""
     parser = argparse.ArgumentParser(description="Run a JSON-defined credit stress scenario.")
-    parser.add_argument("scenario", nargs="+", help="Scenario JSON file(s). Later files override earlier files.")
+    parser.add_argument(
+        "scenario",
+        nargs="+",
+        help="Scenario JSON manifest/file(s). Includes load first; later files override earlier files.",
+    )
     parser.add_argument("--output-dir", help="Override output directory.")
     parser.add_argument(
         "--previous-scenario",
@@ -25,8 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-comparison", action="store_true", help="Disable previous-scenario comparison.")
     parser.add_argument("--no-write", action="store_true", help="Run calculations without writing output files.")
     parser.add_argument("--batch", action="store_true", help="Expand and run scenario_batch variables.")
-    parser.add_argument("--batch-output-dir", help="Override batch output directory.")
-    parser.add_argument("--batch-mode", choices=["grid", "paired", "named"], help="Override scenario_batch mode.")
+    parser.add_argument("--batch-mode", choices=["grid", "paired"], help="Override scenario_batch mode.")
     parser.add_argument("--max-scenarios", type=int, help="Maximum generated child scenarios allowed in a batch.")
     parser.add_argument(
         "--no-write-child-outputs",
@@ -47,11 +50,10 @@ def main(argv: list[str] | None = None) -> int:
             existing = [existing]
         scenario["comparison"]["previous_scenarios"] = list(existing) + args.previous_scenario
     if args.batch:
-        output_dir = args.batch_output_dir or args.output_dir
         result = run_batch_scenarios(
             scenario,
             base_dir,
-            output_dir=output_dir,
+            output_dir=args.output_dir,
             write_outputs=not args.no_write,
             run_comparison=not args.no_comparison,
             max_scenarios=args.max_scenarios,

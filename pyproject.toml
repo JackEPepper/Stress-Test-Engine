@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "credit-stress-engine"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Deterministic JSON-driven credit stress testing engine."
 requires-python = ">=3.9"
 dependencies = [
@@ -15,6 +15,10 @@ dependencies = [
 
 [project.scripts]
 credit-stress = "stress_engine.cli:main"
+credit-stress-config = "stress_engine.config_tool:main"
 
 [tool.setuptools.packages.find]
 include = ["stress_engine*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "stress_engine.version.VERSION"}
