@@ -1,0 +1,2 @@
+borrower_id,current_fico_score,current_fico_date,origination_fico_score,origination_fico_date,collateral_id,current_appraisal_date,current_appraised_value_raw,prior_appraisal_date,prior_appraised_value,origination_appraised_value
+B007,0,2026-01-01,700,2023-06-30,H-700,2025-01-01,0,2024-05-01,350000,360000

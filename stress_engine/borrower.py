@@ -45,7 +45,7 @@ def build_borrowers(
 
     agg_map: Dict[str, Any] = {}
     for column in identity.columns:
-        if column in {borrower_id, "_source_row"} or column in largest_fields:
+        if column == borrower_id or str(column).startswith("_source_") or column in largest_fields:
             continue
         method = aggregations.get(column, "first")
         agg_map[column] = _aggregation_callable(method)
@@ -256,7 +256,7 @@ def build_source_reconciliation(
                 "Nonblank input values could not be parsed and were coerced to missing.",
                 source=loaded_name,
                 field=issue["field"],
-                details=f"kind={issue['kind']}; count={issue['count']}",
+                details=f"kind={issue['kind']}; count={issue['count']}; path={issue.get('path', '')}",
             )
 
     borrower_keys = set(borrowers[borrower_id].dropna().astype(str))
@@ -270,7 +270,8 @@ def build_source_reconciliation(
         key = spec.get("key", borrower_id)
         base_row: Dict[str, Any] = {
             "source": name,
-            "path": str(table.path),
+            "path": ";".join(str(path) for path in table.paths),
+            "file_count": len(table.paths),
             "merge_enabled": merge_enabled,
             "key_field": key,
             "source_row_count": int(len(frame)),
@@ -374,7 +375,7 @@ def build_source_reconciliation(
                 "WARNING",
                 "source_reconciliation",
                 "SOURCE_ENTITY_VALUE_CONFLICT",
-                "Repeated collateral/entity keys contained conflicting candidate values; deterministic row/date precedence selected the retained values.",
+                "Repeated borrower/entity keys contained conflicting candidate values; deterministic row/date precedence selected the retained values.",
                 source=name,
                 field=key,
                 details=f"conflict_group_count={conflicts}",
@@ -489,6 +490,8 @@ def record_best_available_fallbacks(
                     source=source_name,
                     details=f"preferred={first_value}; selected={selected}",
                 )
+
+
 def _source_entity_value_conflicts(frame: pd.DataFrame, key: str, spec: Mapping[str, Any]) -> int:
     """Count repeated entity keys whose configured candidate values disagree."""
     conflict_groups: set[tuple[Any, ...]] = set()
@@ -496,16 +499,28 @@ def _source_entity_value_conflicts(frame: pd.DataFrame, key: str, spec: Mapping[
         if not isinstance(method_spec, Mapping):
             continue
         method = method_spec.get("method")
-        if method not in {"unique_sum", "best_available_unique_sum"}:
+        if method not in {"unique_sum", "best_available", "best_available_unique_sum"}:
             continue
-        unique_fields = [str(field) for field in as_list(method_spec.get("unique_fields"))]
-        if not unique_fields or any(field not in frame.columns for field in unique_fields):
+        unique_fields = (
+            [str(field) for field in as_list(method_spec.get("unique_fields"))]
+            if method != "best_available"
+            else []
+        )
+        if any(field not in frame.columns for field in unique_fields):
             continue
         candidate_specs: List[tuple[str, str | None]] = []
         if method == "unique_sum":
             candidate_specs = [(method_spec.get("field", output_field), None)]
         else:
-            for candidate in as_list(method_spec.get("candidates")):
+            raw_candidates = as_list(method_spec.get("candidates"))
+            if not raw_candidates:
+                raw_candidates = [
+                    {
+                        "field": method_spec.get("field", output_field),
+                        "date_field": method_spec.get("date_field"),
+                    }
+                ]
+            for candidate in raw_candidates:
                 if isinstance(candidate, str):
                     candidate_specs.append((candidate, None))
                 elif isinstance(candidate, Mapping):
@@ -545,7 +560,7 @@ def aggregate_source(name: str, df: pd.DataFrame, spec: Mapping[str, Any], borro
         aggregation = {
             column: "first"
             for column in frame.columns
-            if column not in {key, "_source_row"}
+            if column != key and not str(column).startswith("_source_")
         }
 
     pieces: List[pd.DataFrame] = []
@@ -648,9 +663,8 @@ def _best_available_field(
         columns = [key, field]
         if date_field:
             columns.append(date_field)
-        if "_source_row" in df.columns:
-            columns.append("_source_row")
-        part = df[columns].copy()
+        columns.extend(_source_audit_columns(df))
+        part = df[list(dict.fromkeys(columns))].copy()
         part["_candidate_order"] = order
         part["_candidate_field"] = field
         part["_candidate_label"] = candidate.get("label", field)
@@ -663,6 +677,7 @@ def _best_available_field(
             part["_selected_date"] = pd.NaT
         if "_source_row" not in part.columns:
             part["_source_row"] = 0
+        part["_source_record"] = _source_record_series(part)
         parts.append(part)
 
     if not parts:
@@ -694,6 +709,9 @@ def _best_available_field(
     candidate_output = options.get("candidate_output")
     if candidate_output:
         result[candidate_output] = chosen["_candidate_label"]
+    source_record_output = options.get("source_record_output")
+    if source_record_output:
+        result[source_record_output] = chosen["_source_record"]
     return result
 
 
@@ -722,8 +740,7 @@ def _best_available_unique_sum(
         columns = [key, *unique_fields, field]
         if date_field:
             columns.append(date_field)
-        if "_source_row" in df.columns:
-            columns.append("_source_row")
+        columns.extend(_source_audit_columns(df))
         part = df[list(dict.fromkeys(columns))].copy()
         part["_candidate_order"] = order
         part["_candidate_field"] = field
@@ -737,6 +754,7 @@ def _best_available_unique_sum(
             part["_selected_date"] = pd.NaT
         if "_source_row" not in part.columns:
             part["_source_row"] = 0
+        part["_source_record"] = _source_record_series(part)
         parts.append(part)
 
     work = pd.concat(parts, ignore_index=True, sort=False)
@@ -773,6 +791,12 @@ def _best_available_unique_sum(
     if candidate_output:
         labels = chosen.groupby(key, dropna=False)["_candidate_label"].agg(join_unique).reset_index(name=candidate_output)
         result = result.merge(labels, on=key, how="left")
+    source_record_output = options.get("source_record_output")
+    if source_record_output:
+        records = chosen.groupby(key, dropna=False)["_source_record"].agg(join_unique).reset_index(
+            name=source_record_output
+        )
+        result = result.merge(records, on=key, how="left")
     return result
 
 
@@ -810,11 +834,35 @@ def _valid_best_available_values(values: pd.Series, treat_zero_as_missing: bool)
 def _best_available_output_columns(key: str, output_field: str, options: Mapping[str, Any]) -> List[str]:
     """Return the empty-frame columns emitted by `best_available`."""
     columns = [key, output_field]
-    for option in ("date_output", "source_field_output", "candidate_output"):
+    for option in ("date_output", "source_field_output", "candidate_output", "source_record_output"):
         value = options.get(option)
         if value:
             columns.append(value)
     return columns
+
+
+def _source_audit_columns(frame: pd.DataFrame) -> List[str]:
+    """Return internal provenance columns available on a loaded frame."""
+    return [
+        column
+        for column in ("_source_row", "_source_file", "_source_file_row")
+        if column in frame.columns
+    ]
+
+
+def _source_record_series(frame: pd.DataFrame) -> pd.Series:
+    """Format a physical file and row reference for selected source values."""
+    if "_source_file" in frame.columns and "_source_file_row" in frame.columns:
+        row_text = frame["_source_file_row"].apply(
+            lambda value: str(int(value)) if pd.notna(value) else ""
+        )
+        return frame["_source_file"].fillna("").astype(str) + "#row=" + row_text
+    if "_source_row" in frame.columns:
+        row_text = frame["_source_row"].apply(
+            lambda value: str(int(value)) if pd.notna(value) else ""
+        )
+        return "row=" + row_text
+    return pd.Series("", index=frame.index, dtype=object)
 
 
 def _aggregation_callable(method: Any) -> Any:

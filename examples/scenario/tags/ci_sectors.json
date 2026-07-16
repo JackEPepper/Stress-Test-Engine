@@ -33,6 +33,11 @@
             "field": "tag_hint",
             "op": "has_token",
             "value": "Middle Market"
+          },
+          {
+            "field": "tag_hint_2",
+            "op": "has_token",
+            "value": "Middle Market"
           }
         ]
       },

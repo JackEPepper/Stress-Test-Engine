@@ -18,26 +18,24 @@ class LoadedTable:
     """Container for one loaded input plus audit metadata."""
     name: str
     frame: pd.DataFrame
-    path: Path
-    file_hash: str
+    paths: List[Path]
+    file_hashes: List[str]
+    file_row_counts: List[int]
     profile: pd.DataFrame
     coercion_issues: List[Dict[str, Any]]
 
 
 def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTable:
-    """Load one CSV/XLSX input according to its scenario spec.
+    """Load and concatenate one or more CSV/XLSX files for an input source.
 
     Called by `load_inputs`; the returned profile is later written to
     `input_summary.csv`.
     """
-    if "path" not in spec:
-        raise ValueError(f"Input source '{name}' must define a path.")
-    path = resolve_path(spec["path"], base_dir)
-    if not path.exists():
-        raise FileNotFoundError(f"Input source '{name}' not found: {path}")
-    file_type = str(spec.get("type") or path.suffix.lstrip(".")).lower()
+    paths = _input_paths(name, spec, base_dir)
     read_options = dict(spec.get("read_options", {}))
     rename = _column_rename_map(name, spec)
+    if not rename:
+        raise ValueError(f"Input source '{name}' must define column_aliases for every source column.")
     source_for_canonical = {canonical: source for source, canonical in rename.items()}
     string_columns = [str(field) for field in spec.get("string_columns", [])]
     if string_columns:
@@ -50,36 +48,23 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
             for field in source_string_columns:
                 merged_dtype.setdefault(field, "string")
             read_options["dtype"] = merged_dtype
-    if file_type == "csv":
-        df = pd.read_csv(path, **read_options)
-    elif file_type in {"xlsx", "xlsm"}:
-        sheet_name = spec.get("sheet_name", 0)
-        df = pd.read_excel(path, sheet_name=sheet_name, **read_options)
-    else:
-        raise ValueError(f"Unsupported input type for '{name}': {file_type}")
-
-    if not rename:
-        raise ValueError(f"Input source '{name}' must define column_aliases for every source column.")
-    missing_aliases = [source for source in rename if source not in df.columns]
-    if missing_aliases:
-        raise ValueError(
-            f"Input source '{name}' is missing configured aliased columns: {', '.join(missing_aliases)}"
-        )
-    unmapped = [str(column) for column in df.columns if column not in rename]
-    if unmapped:
-        raise ValueError(f"Input source '{name}' has columns missing from column_aliases: {', '.join(unmapped)}")
-    collisions = [
-        (source, canonical)
-        for source, canonical in rename.items()
-        if source != canonical and source in df.columns and canonical in df.columns
-    ]
-    if collisions:
-        details = ", ".join(f"{source} -> {canonical}" for source, canonical in collisions)
-        raise ValueError(f"Input source '{name}' alias collides with an existing canonical column: {details}")
-    df = df.rename(columns=rename)
-    duplicates = df.columns[df.columns.duplicated()].unique().tolist()
-    if duplicates:
-        raise ValueError(f"Input source '{name}' aliases create duplicate columns: {', '.join(duplicates)}")
+    frames: List[pd.DataFrame] = []
+    file_row_counts: List[int] = []
+    for path in paths:
+        frame = _read_input_file(name, path, spec, read_options)
+        _validate_source_columns(name, path, frame, rename)
+        frame = frame.rename(columns=rename)
+        duplicates = frame.columns[frame.columns.duplicated()].unique().tolist()
+        if duplicates:
+            raise ValueError(
+                f"Input source '{name}' aliases create duplicate columns in {path.name}: "
+                f"{', '.join(duplicates)}"
+            )
+        frame["_source_file"] = str(path)
+        frame["_source_file_row"] = np.arange(1, len(frame) + 1)
+        frames.append(frame)
+        file_row_counts.append(len(frame))
+    df = pd.concat(frames, ignore_index=True)
 
     coercion_issues: List[Dict[str, Any]] = []
     for field in spec.get("date_columns", []):
@@ -88,13 +73,14 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
             converted = pd.to_datetime(original, errors="coerce")
             invalid = original.notna() & original.astype(str).str.strip().ne("") & converted.isna()
             if invalid.any():
-                coercion_issues.append(
-                    {
-                        "source": name,
-                        "field": field,
-                        "kind": "invalid_date_coerced_to_missing",
-                        "count": int(invalid.sum()),
-                    }
+                coercion_issues.extend(
+                    _coercion_issue_rows(
+                        name,
+                        df,
+                        invalid,
+                        field,
+                        "invalid_date_coerced_to_missing",
+                    )
                 )
             df[field] = converted
 
@@ -106,13 +92,14 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
         converted = coerce_numeric_frame(df[[field]], [field])[field]
         invalid = original.notna() & original.astype(str).str.strip().ne("") & converted.isna()
         if invalid.any():
-            coercion_issues.append(
-                {
-                    "source": name,
-                    "field": field,
-                    "kind": "invalid_numeric_coerced_to_missing",
-                    "count": int(invalid.sum()),
-                }
+            coercion_issues.extend(
+                _coercion_issue_rows(
+                    name,
+                    df,
+                    invalid,
+                    field,
+                    "invalid_numeric_coerced_to_missing",
+                )
             )
     df = coerce_numeric_frame(df, numeric_fields)
     df = df.reset_index(drop=True)
@@ -123,15 +110,116 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
     if missing:
         raise ValueError(f"Input source '{name}' missing required columns: {', '.join(missing)}")
 
-    profile = profile_frame(name, df, str(path))
+    path_text = ";".join(str(path) for path in paths)
+    profile = profile_frame(name, df, path_text)
     return LoadedTable(
         name=name,
         frame=df,
-        path=path,
-        file_hash=hash_file(path),
+        paths=paths,
+        file_hashes=[hash_file(path) for path in paths],
+        file_row_counts=file_row_counts,
         profile=profile,
         coercion_issues=coercion_issues,
     )
+
+
+def _input_paths(name: str, spec: Mapping[str, Any], base_dir: Path) -> List[Path]:
+    """Resolve the exclusive ``path`` or ``paths`` setting for one source."""
+    has_path = "path" in spec
+    has_paths = "paths" in spec
+    if has_path == has_paths:
+        raise ValueError(f"Input source '{name}' must define exactly one of path or paths.")
+    raw_paths = [spec["path"]] if has_path else spec["paths"]
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise ValueError(f"Input source '{name}' paths must be a nonempty JSON list.")
+    paths: List[Path] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, (str, Path)) or not str(raw_path).strip():
+            raise ValueError(f"Input source '{name}' paths must contain nonblank file names.")
+        path = resolve_path(raw_path, base_dir).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Input source '{name}' not found: {path}")
+        path_key = str(path).casefold()
+        if path_key in seen:
+            raise ValueError(f"Input source '{name}' paths contains the same file more than once: {path}")
+        seen.add(path_key)
+        paths.append(path)
+    return paths
+
+
+def _read_input_file(
+    name: str,
+    path: Path,
+    spec: Mapping[str, Any],
+    read_options: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Read one physical file belonging to a logical input source."""
+    file_type = str(spec.get("type") or path.suffix.lstrip(".")).lower()
+    if file_type == "csv":
+        return pd.read_csv(path, **dict(read_options))
+    if file_type in {"xlsx", "xlsm"}:
+        return pd.read_excel(
+            path,
+            sheet_name=spec.get("sheet_name", 0),
+            **dict(read_options),
+        )
+    raise ValueError(f"Unsupported input type for '{name}' file '{path.name}': {file_type}")
+
+
+def _validate_source_columns(
+    name: str,
+    path: Path,
+    frame: pd.DataFrame,
+    rename: Mapping[str, str],
+) -> None:
+    """Require every physical file in a logical source to use the same aliases."""
+    missing_aliases = [source for source in rename if source not in frame.columns]
+    if missing_aliases:
+        raise ValueError(
+            f"Input source '{name}' file '{path.name}' is missing configured aliased columns: "
+            f"{', '.join(missing_aliases)}"
+        )
+    unmapped = [str(column) for column in frame.columns if column not in rename]
+    if unmapped:
+        raise ValueError(
+            f"Input source '{name}' file '{path.name}' has columns missing from column_aliases: "
+            f"{', '.join(unmapped)}"
+        )
+    collisions = [
+        (source, canonical)
+        for source, canonical in rename.items()
+        if source != canonical and source in frame.columns and canonical in frame.columns
+    ]
+    if collisions:
+        details = ", ".join(f"{source} -> {canonical}" for source, canonical in collisions)
+        raise ValueError(
+            f"Input source '{name}' file '{path.name}' alias collides with an existing canonical column: "
+            f"{details}"
+        )
+
+
+def _coercion_issue_rows(
+    name: str,
+    frame: pd.DataFrame,
+    invalid: pd.Series,
+    field: str,
+    kind: str,
+) -> List[Dict[str, Any]]:
+    """Describe coercion failures by physical source file."""
+    rows: List[Dict[str, Any]] = []
+    counts = frame.loc[invalid, "_source_file"].value_counts(sort=False)
+    for path, count in counts.items():
+        rows.append(
+            {
+                "source": name,
+                "path": str(path),
+                "field": field,
+                "kind": kind,
+                "count": int(count),
+            }
+        )
+    return rows
 
 
 def _column_rename_map(name: str, spec: Mapping[str, Any]) -> Dict[str, str]:
@@ -186,7 +274,7 @@ def profile_frame(name: str, df: pd.DataFrame, path: str) -> pd.DataFrame:
     """Build field-level counts and numeric stats for input reporting."""
     rows: List[Dict[str, Any]] = []
     for column in sorted(df.columns):
-        if column == "_source_row":
+        if str(column).startswith("_source_"):
             continue
         series = df[column]
         numeric = pd.to_numeric(series, errors="coerce")
@@ -221,15 +309,17 @@ def metadata_for_inputs(loaded: Mapping[str, LoadedTable]) -> List[Dict[str, Any
     rows: List[Dict[str, Any]] = []
     for name in sorted(loaded):
         item = loaded[name]
-        rows.append(
-            {
-                "name": name,
-                "path": str(item.path),
-                "sha256": item.file_hash,
-                "rows": int(len(item.frame)),
-                "columns": int(len(item.frame.columns) - (1 if "_source_row" in item.frame.columns else 0)),
-            }
-        )
+        column_count = sum(not str(column).startswith("_source_") for column in item.frame.columns)
+        for path, file_hash, row_count in zip(item.paths, item.file_hashes, item.file_row_counts):
+            rows.append(
+                {
+                    "name": name,
+                    "path": str(path),
+                    "sha256": file_hash,
+                    "rows": int(row_count),
+                    "columns": column_count,
+                }
+            )
     return rows
 
 

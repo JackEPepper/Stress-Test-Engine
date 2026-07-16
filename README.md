@@ -102,7 +102,8 @@ examples/
 │   ├── loans.csv
 │   ├── financials.csv
 │   ├── collateral.csv
-│   ├── consumer_scores.csv
+│   ├── consumer_scores_1.csv
+│   ├── consumer_scores_2.csv
 │   ├── fico_pd_lookup.csv
 │   └── tag_tieouts.csv
 ├── scenario.json                 Small manifest that includes the fragments
@@ -187,6 +188,20 @@ Each input can be:
 For Excel files, set `type` to `xlsx` or `xlsm` and use `sheet_name` if
 the required data is not on the first sheet.
 
+Use `path` when a logical source has one file. Use `paths` with a JSON list
+when the same source is delivered in multiple files. Every listed file must
+have the same source columns and use the same aliases, date rules, numeric
+rules, and aggregation. The engine loads the files in listed order,
+concatenates their rows, and records each physical file separately in
+`metadata.json`.
+
+```json
+"paths": [
+  "data/consumer_scores_1.csv",
+  "data/consumer_scores_2.csv"
+]
+```
+
 ### Column aliases
 
 Every source column must appear exactly once in that source's
@@ -241,6 +256,7 @@ source does not enter the results; it is reported as an orphan source key.
 | `status` | Tag inclusion or exclusion, such as Paid Off |
 | `subsector` | Model and sector tagging; may contain delimited tokens |
 | `tag_hint` | Optional additional tag indicator |
+| `tag_hint_2` | Second optional tag indicator |
 | `risk_rating` | In-place commercial risk rating |
 | `maturity_date` | Determines the CRE DSCR or refinance/LTV path |
 | `outstanding_balance` | Exposure amount |
@@ -249,6 +265,9 @@ source does not enter the results; it is reported as an orphan source key.
 `loan_id`, `borrower_id`, `subsector`, and `outstanding_balance` are
 required in the example. The other fields become operationally required when a
 tag, module, or report uses them.
+
+Tag definitions can reference any canonical identity field. The example checks
+both `tag_hint` and `tag_hint_2`, so either source column can route a borrower.
 
 ### Financial file: C&I cash-flow inputs
 
@@ -272,17 +291,17 @@ The financial source contains the components used to calculate stressed FCCR:
 Source-reported FCCR is deliberately not imported. The engine calculates FCCR
 from these components so the stressed result has one consistent definition.
 
-### Collateral file: appraisals, DSCR, and NOI
+### Commercial collateral file: appraisals, DSCR, and NOI
 
 | Canonical field | Purpose |
 |---|---|
 | `borrower_id` | Merge key |
-| `collateral_id` | Prevents duplicate collateral from being summed twice |
-| `current_appraisal_date` | Date of current appraisal |
-| `current_appraised_value_raw` | Current appraisal candidate |
-| `prior_appraisal_date` | Date of prior appraisal |
-| `prior_appraised_value` | Prior appraisal candidate |
-| `origination_appraised_value` | Origination appraisal candidate |
+| `collateral_id` | Prevents duplicate commercial collateral from being summed twice |
+| `current_appraisal_date` | Date of current commercial appraisal |
+| `current_appraised_value_raw` | Current commercial appraisal candidate |
+| `prior_appraisal_date` | Date of prior commercial appraisal |
+| `prior_appraised_value` | Prior commercial appraisal candidate |
+| `origination_appraised_value` | Origination commercial appraisal candidate |
 | `current_dscr` | Current DSCR candidate |
 | `current_dscr_date` | Date of current DSCR |
 | `prior_dscr` | Prior DSCR candidate |
@@ -293,11 +312,14 @@ from these components so the stressed result has one consistent definition.
 The example selects DSCR in this order: current, prior, origination. Blank and
 zero candidates are skipped. Within a candidate, the newest dated row wins.
 
-Appraisals use the same current/prior/origination idea separately for each
-`collateral_id`, then sum the selected collateral values by borrower.
-Repeated rows for the same collateral ID therefore do not inflate value.
+Commercial appraisals use the same fallback order separately for each
+`collateral_id`, then sum the selected values by borrower. These values remain
+separate from the Consumer appraisal total.
 
-### Consumer score file
+### Consumer files: FICO and appraisals
+
+The example treats two physical CSVs as one logical `consumer_scores` source.
+Each file carries both the FICO and appraisal fields for its borrowers.
 
 | Canonical field | Purpose |
 |---|---|
@@ -306,10 +328,26 @@ Repeated rows for the same collateral ID therefore do not inflate value.
 | `current_fico_date` | Current FICO date |
 | `origination_fico_score` | Origination FICO fallback |
 | `origination_fico_date` | Origination FICO date |
+| `collateral_id` | Identifies a Consumer collateral item |
+| `current_appraisal_date` | Date of current appraisal |
+| `current_appraised_value_raw` | Current appraisal candidate |
+| `prior_appraisal_date` | Date of prior appraisal |
+| `prior_appraised_value` | Prior appraisal candidate |
+| `origination_appraised_value` | Origination appraisal candidate |
 
 The source aggregation produces the canonical `fico_score`, which enters the
 Consumer calculation, and `fico_date`, which records the selected score date
-for audit purposes.
+for audit purposes. Appraisals use the same current/prior/origination fallback
+chain separately for each `collateral_id`; the selected collateral values are
+then summed into `consumer_appraised_value` for the borrower. Repeated history
+rows for one collateral ID therefore do not inflate the total.
+
+The borrower audit also records `fico_source_record` and
+`consumer_appraisal_source_record` as `full file path#row=N`. This identifies
+the physical file and row that supplied a selected value. If two files report
+different candidate values for the same borrower/entity and date, the engine
+uses deterministic listed-file order and records a source reconciliation
+warning for review. Listing the same resolved file twice is rejected.
 
 ### FICO-to-PD lookup
 
@@ -440,7 +478,8 @@ is recorded in the exception log.
 
 ### Consumer
 
-Consumer uses the aggregated FICO score and appraised collateral value:
+Consumer uses the aggregated FICO score and `consumer_appraised_value` from the
+same logical multi-file source:
 
 1. FICO maps to an unstressed PD through the lookup table.
 2. Unstressed loss given default dollars equal balance less collateral, floored

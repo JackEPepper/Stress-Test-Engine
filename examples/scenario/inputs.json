@@ -10,6 +10,7 @@
         "status": "status",
         "subsector": "subsector",
         "tag_hint": "tag_hint",
+        "tag_hint_2": "tag_hint_2",
         "risk_rating": "risk_rating",
         "maturity_date": "maturity_date",
         "outstanding_balance": "outstanding_balance",
@@ -106,6 +107,7 @@
             "date_output": "dscr_date",
             "source_field_output": "dscr_source_field",
             "candidate_output": "dscr_candidate",
+            "source_record_output": "dscr_source_record",
             "candidates": [
               {
                 "field": "current_dscr",
@@ -134,6 +136,7 @@
             "date_output": "appraisal_date",
             "source_field_output": "appraisal_source_field",
             "candidate_output": "appraisal_candidate",
+            "source_record_output": "appraisal_source_record",
             "candidates": [
               {
                 "field": "current_appraised_value_raw",
@@ -154,7 +157,10 @@
         }
       },
       "consumer_scores": {
-        "path": "data/consumer_scores.csv",
+        "paths": [
+          "data/consumer_scores_1.csv",
+          "data/consumer_scores_2.csv"
+        ],
         "type": "csv",
         "key": "borrower_id",
         "column_aliases": {
@@ -162,15 +168,26 @@
           "current_fico_score": "current_fico_score",
           "current_fico_date": "current_fico_date",
           "origination_fico_score": "origination_fico_score",
-          "origination_fico_date": "origination_fico_date"
+          "origination_fico_date": "origination_fico_date",
+          "collateral_id": "collateral_id",
+          "current_appraisal_date": "current_appraisal_date",
+          "current_appraised_value_raw": "current_appraised_value_raw",
+          "prior_appraisal_date": "prior_appraisal_date",
+          "prior_appraised_value": "prior_appraised_value",
+          "origination_appraised_value": "origination_appraised_value"
         },
         "date_columns": [
           "current_fico_date",
-          "origination_fico_date"
+          "origination_fico_date",
+          "current_appraisal_date",
+          "prior_appraisal_date"
         ],
         "numeric_columns": [
           "current_fico_score",
-          "origination_fico_score"
+          "origination_fico_score",
+          "current_appraised_value_raw",
+          "prior_appraised_value",
+          "origination_appraised_value"
         ],
         "aggregation": {
           "fico_score": {
@@ -180,6 +197,7 @@
             "date_output": "fico_date",
             "source_field_output": "fico_source_field",
             "candidate_output": "fico_candidate",
+            "source_record_output": "fico_source_record",
             "candidates": [
               {
                 "field": "current_fico_score",
@@ -189,6 +207,34 @@
               {
                 "field": "origination_fico_score",
                 "date_field": "origination_fico_date",
+                "label": "origination"
+              }
+            ]
+          },
+          "consumer_appraised_value": {
+            "method": "best_available_unique_sum",
+            "selection": "precedence",
+            "treat_zero_as_missing": true,
+            "unique_fields": [
+              "collateral_id"
+            ],
+            "date_output": "consumer_appraisal_date",
+            "source_field_output": "consumer_appraisal_source_field",
+            "candidate_output": "consumer_appraisal_candidate",
+            "source_record_output": "consumer_appraisal_source_record",
+            "candidates": [
+              {
+                "field": "current_appraised_value_raw",
+                "date_field": "current_appraisal_date",
+                "label": "current"
+              },
+              {
+                "field": "prior_appraised_value",
+                "date_field": "prior_appraisal_date",
+                "label": "prior"
+              },
+              {
+                "field": "origination_appraised_value",
                 "label": "origination"
               }
             ]

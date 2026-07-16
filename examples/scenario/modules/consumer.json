@@ -7,7 +7,7 @@
       ],
       "pd_lookup_source": "fico_pd_lookup",
       "fico_field": "fico_score",
-      "appraisal_field": "current_appraised_value",
+      "appraisal_field": "consumer_appraised_value",
       "pd_increase_factor": {
         "S1": 1.25,
         "S2": 1.5

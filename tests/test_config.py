@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from stress_engine.borrower import build_source_reconciliation
 from stress_engine.config import load_scenario
 from stress_engine.config_tool import batch_config_from_csv
 from stress_engine.io import read_table
@@ -32,17 +33,20 @@ class ScenarioConfigTest(unittest.TestCase):
         specs = {"identity": scenario["inputs"]["identity"], **scenario["inputs"]["sources"]}
 
         for name, spec in specs.items():
-            source_path = base_dir / spec["path"]
-            raw_columns = set(pd.read_csv(source_path, nrows=0).columns)
             aliases = spec.get("column_aliases", {})
-            self.assertEqual(
-                set(aliases.values()),
-                raw_columns,
-                msg=f"{name} must map every source column exactly once",
-            )
+            relative_paths = [spec["path"]] if "path" in spec else spec["paths"]
+            for relative_path in relative_paths:
+                raw_columns = set(pd.read_csv(base_dir / relative_path, nrows=0).columns)
+                self.assertEqual(
+                    set(aliases.values()),
+                    raw_columns,
+                    msg=f"{name}:{relative_path} must map every source column exactly once",
+                )
 
             loaded = read_table(name, spec, base_dir)
-            canonical_columns = set(loaded.frame.columns) - {"_source_row"}
+            canonical_columns = {
+                column for column in loaded.frame.columns if not str(column).startswith("_source_")
+            }
             self.assertEqual(set(aliases), canonical_columns)
 
     def test_manifest_values_override_includes(self):
@@ -122,6 +126,87 @@ class ScenarioConfigTest(unittest.TestCase):
             self.assertEqual(loaded.frame.at[0, "borrower_id"], "001")
             self.assertEqual(float(loaded.frame.at[0, "current_dscr"]), 1.25)
             self.assertNotIn("Borrower Number", loaded.frame.columns)
+
+    def test_multi_file_input_source_concatenates_in_listed_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "first.csv").write_text("Borrower Number,Score\n001,680\n", encoding="utf-8")
+            (directory / "second.csv").write_text("Borrower Number,Score\n002,720\n", encoding="utf-8")
+
+            loaded = read_table(
+                "consumer",
+                {
+                    "paths": ["first.csv", "second.csv"],
+                    "column_aliases": {"borrower_id": "Borrower Number", "fico_score": "Score"},
+                    "string_columns": ["borrower_id"],
+                    "numeric_columns": ["fico_score"],
+                },
+                directory,
+            )
+
+            self.assertEqual(loaded.frame["borrower_id"].tolist(), ["001", "002"])
+            self.assertEqual([path.name for path in loaded.paths], ["first.csv", "second.csv"])
+            self.assertEqual(loaded.file_row_counts, [1, 1])
+            self.assertEqual(loaded.frame["_source_file_row"].tolist(), [1, 1])
+
+    def test_multi_file_input_rejects_duplicate_resolved_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "source.csv").write_text("Borrower Number\n001\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "same file more than once"):
+                read_table(
+                    "consumer",
+                    {
+                        "paths": ["source.csv", "./source.csv"],
+                        "column_aliases": {"borrower_id": "Borrower Number"},
+                    },
+                    directory,
+                )
+
+    def test_multi_file_best_available_conflict_is_reconciled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            header = "Borrower Number,Current Score,Score Date\n"
+            (directory / "first.csv").write_text(header + "001,680,2026-06-30\n", encoding="utf-8")
+            (directory / "second.csv").write_text(header + "001,690,2026-06-30\n", encoding="utf-8")
+            source_spec = {
+                "paths": ["first.csv", "second.csv"],
+                "key": "borrower_id",
+                "column_aliases": {
+                    "borrower_id": "Borrower Number",
+                    "current_fico_score": "Current Score",
+                    "current_fico_date": "Score Date",
+                },
+                "string_columns": ["borrower_id"],
+                "date_columns": ["current_fico_date"],
+                "numeric_columns": ["current_fico_score"],
+                "aggregation": {
+                    "fico_score": {
+                        "method": "best_available",
+                        "candidates": [
+                            {"field": "current_fico_score", "date_field": "current_fico_date"}
+                        ],
+                    }
+                },
+            }
+            loaded = read_table("consumer", source_spec, directory)
+            exceptions = []
+            reconciliation = build_source_reconciliation(
+                pd.DataFrame({"borrower_id": ["001"], "outstanding_balance": [100.0]}),
+                {"consumer": loaded},
+                {
+                    "borrower": {
+                        "borrower_id_field": "borrower_id",
+                        "balance_field": "outstanding_balance",
+                    },
+                    "inputs": {"sources": {"consumer": source_spec}},
+                },
+                exceptions,
+            )
+
+            self.assertEqual(int(reconciliation.at[0, "entity_value_conflict_count"]), 1)
+            self.assertIn("SOURCE_ENTITY_VALUE_CONFLICT", {item["code"] for item in exceptions})
 
     def test_missing_configured_source_alias_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

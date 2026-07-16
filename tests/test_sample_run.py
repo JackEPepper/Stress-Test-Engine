@@ -32,9 +32,11 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertNotIn("ci_sector", identity_columns)
             self.assertIn("subsector", identity_columns)
             self.assertIn("tag_hint", identity_columns)
+            self.assertIn("tag_hint_2", identity_columns)
 
             financial_columns = set(pd.read_csv(ROOT / "examples" / "data" / "financials.csv").columns)
             collateral_columns = set(pd.read_csv(ROOT / "examples" / "data" / "collateral.csv").columns)
+            consumer_columns = set(pd.read_csv(ROOT / "examples" / "data" / "consumer_scores_1.csv").columns)
             self.assertTrue({"current_dscr", "prior_dscr", "origination_dscr", "noi"}.isdisjoint(financial_columns))
             self.assertNotIn("fccr", financial_columns)
             self.assertTrue(
@@ -43,15 +45,31 @@ class SampleScenarioRunTest(unittest.TestCase):
                 )
             )
             self.assertTrue({"current_dscr", "prior_dscr", "origination_dscr", "noi"}.isdisjoint(collateral_columns))
+            self.assertTrue(
+                {"collateral_id", "current_appraised_value_raw", "prior_appraised_value"}.issubset(
+                    collateral_columns
+                )
+            )
+            self.assertTrue(
+                {"current_fico_score", "collateral_id", "current_appraised_value_raw"}.issubset(
+                    consumer_columns
+                )
+            )
 
             financial_import = scenario["inputs"]["sources"]["financials"]
             collateral_import = scenario["inputs"]["sources"]["collateral"]
+            consumer_import = scenario["inputs"]["sources"]["consumer_scores"]
             self.assertNotIn("fccr", financial_import["numeric_columns"])
             self.assertNotIn("aggregation", financial_import)
             self.assertIn("dscr", collateral_import["aggregation"])
             self.assertIn("noi", collateral_import["aggregation"])
+            self.assertIn("current_appraised_value", collateral_import["aggregation"])
+            self.assertNotIn("consumer_appraised_value", collateral_import["aggregation"])
             self.assertEqual(collateral_import["column_aliases"]["current_dscr"], "Current DSCR")
             self.assertEqual(collateral_import["column_aliases"]["noi"], "Net Operating Income")
+            self.assertEqual(len(consumer_import["paths"]), 2)
+            self.assertIn("fico_score", consumer_import["aggregation"])
+            self.assertIn("consumer_appraised_value", consumer_import["aggregation"])
 
             borrowers = result["borrowers"]
             self.assertEqual(len(borrowers), 15)
@@ -67,7 +85,8 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertIn("CRE_Subsector_Retail", overlap["all_tags"])
             self.assertIn("CI_Sector_Middle_Market", overlap["all_tags"])
             self.assertEqual(overlap["subsector"], "Retail")
-            self.assertEqual(overlap["tag_hint"], "Middle Market")
+            self.assertTrue(pd.isna(overlap["tag_hint"]))
+            self.assertEqual(overlap["tag_hint_2"], "Middle Market")
             self.assertEqual(overlap["eligible_modules"], "CRE;C&I")
             self.assertEqual(overlap["primary_module"], "CRE")
             self.assertEqual(overlap["model_portfolio"], "CRE")
@@ -79,12 +98,31 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertEqual(overlap["dscr_source_field"], "prior_dscr")
             b002 = borrowers.loc[borrowers["borrower_id"] == "B002"].iloc[0]
             self.assertEqual(float(b002["current_appraised_value"]), 1500000.0)
+            self.assertTrue(pd.isna(b002["consumer_appraised_value"]))
 
             consumer_borrower = borrowers.loc[borrowers["borrower_id"] == "B007"].iloc[0]
             self.assertEqual(float(consumer_borrower["fico_score"]), 680.0)
             self.assertEqual(consumer_borrower["fico_source_field"], "current_fico_score")
-            self.assertEqual(float(consumer_borrower["current_appraised_value"]), 340000.0)
-            self.assertEqual(consumer_borrower["appraisal_source_field"], "current_appraised_value_raw")
+            self.assertTrue(consumer_borrower["fico_source_record"].endswith("consumer_scores_2.csv#row=1"))
+            self.assertEqual(float(consumer_borrower["consumer_appraised_value"]), 340000.0)
+            self.assertEqual(
+                consumer_borrower["consumer_appraisal_source_field"],
+                "current_appraised_value_raw",
+            )
+            self.assertEqual(consumer_borrower["consumer_appraisal_candidate"], "current")
+            self.assertTrue(
+                consumer_borrower["consumer_appraisal_source_record"].endswith(
+                    "consumer_scores_2.csv#row=1"
+                )
+            )
+
+            reconciliation = result["reports"]["source_reconciliation"]
+            consumer_reconciliation = reconciliation.loc[reconciliation["source"] == "consumer_scores"].iloc[0]
+            self.assertEqual(int(consumer_reconciliation["file_count"]), 2)
+            consumer_metadata = [
+                item for item in result["metadata"]["input_files"] if item["name"] == "consumer_scores"
+            ]
+            self.assertEqual(len(consumer_metadata), 2)
 
             tag_summary = result["reports"]["tag_summary"]
             tieouts = tag_summary[tag_summary["tie_out_name"].notna()]
