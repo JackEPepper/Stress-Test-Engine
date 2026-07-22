@@ -40,6 +40,9 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertTrue({"current_dscr", "prior_dscr", "origination_dscr", "noi"}.isdisjoint(financial_columns))
             self.assertNotIn("fccr", financial_columns)
             self.assertTrue(
+                {"interest_expense", "non_cash_interest_expense"}.issubset(financial_columns)
+            )
+            self.assertTrue(
                 {"Current DSCR", "Prior DSCR", "Origination DSCR", "Net Operating Income"}.issubset(
                     collateral_columns
                 )
@@ -55,12 +58,24 @@ class SampleScenarioRunTest(unittest.TestCase):
                     consumer_columns
                 )
             )
+            self.assertIn("account_number", consumer_columns)
+            self.assertNotIn("borrower_id", consumer_columns)
 
             financial_import = scenario["inputs"]["sources"]["financials"]
             collateral_import = scenario["inputs"]["sources"]["collateral"]
             consumer_import = scenario["inputs"]["sources"]["consumer_scores"]
             self.assertNotIn("fccr", financial_import["numeric_columns"])
             self.assertNotIn("aggregation", financial_import)
+            self.assertEqual(
+                financial_import["column_aliases"]["interest_expense"],
+                "interest_expense",
+            )
+            self.assertEqual(
+                financial_import["column_aliases"]["non_cash_interest_expense"],
+                "non_cash_interest_expense",
+            )
+            self.assertIn("interest_expense", financial_import["numeric_columns"])
+            self.assertIn("non_cash_interest_expense", financial_import["numeric_columns"])
             self.assertIn("dscr", collateral_import["aggregation"])
             self.assertIn("noi", collateral_import["aggregation"])
             self.assertIn("current_appraised_value", collateral_import["aggregation"])
@@ -68,8 +83,17 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertEqual(collateral_import["column_aliases"]["current_dscr"], "Current DSCR")
             self.assertEqual(collateral_import["column_aliases"]["noi"], "Net Operating Income")
             self.assertEqual(len(consumer_import["paths"]), 2)
+            self.assertEqual(consumer_import["key"], "loan_id")
+            self.assertEqual(consumer_import["identity_key"], "loan_id")
+            self.assertEqual(consumer_import["column_aliases"]["loan_id"], "account_number")
+            self.assertNotIn("borrower_id", consumer_import["column_aliases"])
             self.assertIn("fico_score", consumer_import["aggregation"])
             self.assertIn("consumer_appraised_value", consumer_import["aggregation"])
+            self.assertTrue(
+                scenario["modules"]["C&I"]["sectors"]["Asset-Based Lending"][
+                    "use_calculated_cash_paid_for_interest"
+                ]
+            )
 
             borrowers = result["borrowers"]
             self.assertEqual(len(borrowers), 15)
@@ -119,6 +143,14 @@ class SampleScenarioRunTest(unittest.TestCase):
             reconciliation = result["reports"]["source_reconciliation"]
             consumer_reconciliation = reconciliation.loc[reconciliation["source"] == "consumer_scores"].iloc[0]
             self.assertEqual(int(consumer_reconciliation["file_count"]), 2)
+            self.assertEqual(consumer_reconciliation["key_field"], "loan_id")
+            self.assertEqual(consumer_reconciliation["identity_key_field"], "loan_id")
+            self.assertEqual(int(consumer_reconciliation["unique_key_count"]), 1)
+            self.assertEqual(int(consumer_reconciliation["matched_source_key_count"]), 1)
+            self.assertEqual(int(consumer_reconciliation["orphan_source_key_count"]), 0)
+            self.assertEqual(int(consumer_reconciliation["matched_borrower_count"]), 1)
+            self.assertEqual(int(consumer_reconciliation["unmatched_borrower_count"]), 14)
+            self.assertEqual(float(consumer_reconciliation["matched_borrower_balance"]), 300000.0)
             consumer_metadata = [
                 item for item in result["metadata"]["input_files"] if item["name"] == "consumer_scores"
             ]
@@ -149,6 +181,17 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertGreater(float(overlap_result["cre_dscr_S1"]), 0)
             self.assertTrue(pd.isna(overlap_result["ci_fccr_S1"]))
 
+            abl_result = result["results"].loc[result["results"]["borrower_id"] == "B010"].iloc[0]
+            self.assertEqual(float(abl_result["calculated_cash_paid_for_interest"]), 24000.0)
+            self.assertEqual(
+                abl_result["calculated_cash_paid_for_interest_source"],
+                "interest_expense_less_non_cash_interest_expense",
+            )
+            self.assertTrue(
+                pd.isna(abl_result["calculated_cash_paid_for_interest_fallback_reason"])
+            )
+            self.assertEqual(float(abl_result["ci_debt_service_S1"]), 63500.0)
+
             consumer = result["reports"]["consumer_summary"]
             s1 = float(consumer.loc[consumer["stress_level"] == "S1", "expected_loss"].iloc[0])
             s2 = float(consumer.loc[consumer["stress_level"] == "S2", "expected_loss"].iloc[0])
@@ -177,6 +220,7 @@ class SampleScenarioRunTest(unittest.TestCase):
 
             exceptions = result["reports"]["exception_log"]
             self.assertNotIn("CECL_RESERVE_RATIO_UNAVAILABLE", set(exceptions["code"]))
+            self.assertNotIn("CI_CALCULATED_CASH_INTEREST_FALLBACK", set(exceptions["code"]))
             self.assertIn("CECL_LOAN_RESERVE_MISSING_TREATED_AS_ZERO", set(exceptions["code"]))
             self.assertEqual(result["metadata"]["exception_count"], len(exceptions))
 

@@ -252,7 +252,7 @@ def _apply_assignments(
     """
     for field, value_spec in assignments.items():
         if field not in df.columns:
-            df[field] = np.nan
+            df[field] = pd.Series(pd.NA, index=df.index, dtype=object)
         if isinstance(value_spec, Mapping) and "from_field" in value_spec:
             source = value_spec["from_field"]
             if source not in df.columns:

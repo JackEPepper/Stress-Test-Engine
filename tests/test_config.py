@@ -4,13 +4,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
-from stress_engine.borrower import build_source_reconciliation
+from stress_engine.borrower import build_borrowers, build_source_reconciliation, enrich_borrowers
 from stress_engine.config import load_scenario
 from stress_engine.config_tool import batch_config_from_csv
-from stress_engine.io import read_table
+from stress_engine.io import load_inputs, read_table
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +29,7 @@ class ScenarioConfigTest(unittest.TestCase):
         self.assertNotIn("$include", scenario)
         self.assertEqual(len(scenario["_metadata"]["scenario_files"]), 11)
 
-    def test_every_example_input_column_has_an_explicit_alias(self):
+    def test_example_aliases_import_the_intended_columns(self):
         scenario, base_dir = load_scenario(SCENARIO)
         specs = {"identity": scenario["inputs"]["identity"], **scenario["inputs"]["sources"]}
 
@@ -37,10 +38,9 @@ class ScenarioConfigTest(unittest.TestCase):
             relative_paths = [spec["path"]] if "path" in spec else spec["paths"]
             for relative_path in relative_paths:
                 raw_columns = set(pd.read_csv(base_dir / relative_path, nrows=0).columns)
-                self.assertEqual(
-                    set(aliases.values()),
-                    raw_columns,
-                    msg=f"{name}:{relative_path} must map every source column exactly once",
+                self.assertTrue(
+                    set(aliases.values()).issubset(raw_columns),
+                    msg=f"{name}:{relative_path} must contain every configured source column",
                 )
 
             loaded = read_table(name, spec, base_dir)
@@ -104,7 +104,7 @@ class ScenarioConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             (directory / "source.csv").write_text(
-                "Borrower Number,Current DSCR\n001,1.25\n",
+                "Borrower Number,Current DSCR,Unused Vendor Note\n001,1.25,ignore me\n",
                 encoding="utf-8",
             )
             loaded = read_table(
@@ -126,12 +126,20 @@ class ScenarioConfigTest(unittest.TestCase):
             self.assertEqual(loaded.frame.at[0, "borrower_id"], "001")
             self.assertEqual(float(loaded.frame.at[0, "current_dscr"]), 1.25)
             self.assertNotIn("Borrower Number", loaded.frame.columns)
+            self.assertNotIn("Unused Vendor Note", loaded.frame.columns)
+            self.assertNotIn("Unused Vendor Note", loaded.profile["field"].tolist())
 
     def test_multi_file_input_source_concatenates_in_listed_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            (directory / "first.csv").write_text("Borrower Number,Score\n001,680\n", encoding="utf-8")
-            (directory / "second.csv").write_text("Borrower Number,Score\n002,720\n", encoding="utf-8")
+            (directory / "first.csv").write_text(
+                "Borrower Number,Score,First File Only\n001,680,ignore\n",
+                encoding="utf-8",
+            )
+            (directory / "second.csv").write_text(
+                "Borrower Number,Score,Second File Only\n002,720,ignore\n",
+                encoding="utf-8",
+            )
 
             loaded = read_table(
                 "consumer",
@@ -148,6 +156,97 @@ class ScenarioConfigTest(unittest.TestCase):
             self.assertEqual([path.name for path in loaded.paths], ["first.csv", "second.csv"])
             self.assertEqual(loaded.file_row_counts, [1, 1])
             self.assertEqual(loaded.frame["_source_file_row"].tolist(), [1, 1])
+            self.assertNotIn("First File Only", loaded.frame.columns)
+            self.assertNotIn("Second File Only", loaded.frame.columns)
+
+    def test_unused_columns_are_ignored_across_identity_and_source_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "identity.csv").write_text(
+                "Account Number,Customer Number,Balance,Unused Identity\n"
+                "A001,B001,100,ignore\n",
+                encoding="utf-8",
+            )
+            (directory / "borrower_source.csv").write_text(
+                "Customer Number,Metric,outstanding_balance\n"
+                "B001,1.5,999\n",
+                encoding="utf-8",
+            )
+            (directory / "account_source.csv").write_text(
+                "Account Number,FICO,borrower_id,Other Vendor Field\n"
+                "A001,700,WRONG,ignore\n",
+                encoding="utf-8",
+            )
+            scenario = {
+                "inputs": {
+                    "identity": {
+                        "path": "identity.csv",
+                        "column_aliases": {
+                            "loan_id": "Account Number",
+                            "borrower_id": "Customer Number",
+                            "outstanding_balance": "Balance",
+                        },
+                        "numeric_columns": ["outstanding_balance"],
+                        "required_columns": [
+                            "loan_id",
+                            "borrower_id",
+                            "outstanding_balance",
+                        ],
+                    },
+                    "sources": {
+                        "borrower_metrics": {
+                            "path": "borrower_source.csv",
+                            "key": "borrower_id",
+                            "column_aliases": {
+                                "borrower_id": "Customer Number",
+                                "metric": "Metric",
+                            },
+                            "numeric_columns": ["metric"],
+                        },
+                        "consumer": {
+                            "path": "account_source.csv",
+                            "key": "loan_id",
+                            "identity_key": "loan_id",
+                            "column_aliases": {
+                                "loan_id": "Account Number",
+                                "fico_score": "FICO",
+                            },
+                            "numeric_columns": ["fico_score"],
+                        },
+                    },
+                },
+                "borrower": {
+                    "borrower_id_field": "borrower_id",
+                    "loan_id_field": "loan_id",
+                    "balance_field": "outstanding_balance",
+                    "sum_fields": ["outstanding_balance"],
+                },
+            }
+
+            loaded = load_inputs(scenario, directory)
+            exceptions = []
+            borrowers = build_borrowers(loaded["identity"].frame, scenario, exceptions)
+            enriched = enrich_borrowers(borrowers, loaded, scenario)
+            build_source_reconciliation(enriched, loaded, scenario, exceptions)
+
+            self.assertEqual(float(enriched.at[0, "outstanding_balance"]), 100.0)
+            self.assertEqual(float(enriched.at[0, "metric"]), 1.5)
+            self.assertEqual(float(enriched.at[0, "fico_score"]), 700.0)
+            for unused in (
+                "Unused Identity",
+                "outstanding_balance",
+                "borrower_id",
+                "Other Vendor Field",
+            ):
+                if unused == "outstanding_balance":
+                    self.assertNotIn(unused, loaded["borrower_metrics"].frame.columns)
+                elif unused == "borrower_id":
+                    self.assertNotIn(unused, loaded["consumer"].frame.columns)
+                else:
+                    self.assertFalse(
+                        any(unused in item.frame.columns for item in loaded.values())
+                    )
+            self.assertEqual(exceptions, [])
 
     def test_multi_file_input_rejects_duplicate_resolved_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +307,175 @@ class ScenarioConfigTest(unittest.TestCase):
             self.assertEqual(int(reconciliation.at[0, "entity_value_conflict_count"]), 1)
             self.assertIn("SOURCE_ENTITY_VALUE_CONFLICT", {item["code"] for item in exceptions})
 
+    def test_account_keyed_source_links_and_aggregates_by_borrower(self):
+        identity = pd.DataFrame(
+            {
+                "loan_id": ["A1", "A2", "A2", "B2-ACCOUNT"],
+                "borrower_id": ["B1", "B1", "B1", "B2"],
+            }
+        )
+        source = pd.DataFrame(
+            [
+                {
+                    "loan_id": "A1",
+                    "current_fico_score": 680,
+                    "current_fico_date": "2026-01-01",
+                    "collateral_id": "C1",
+                    "current_appraisal_date": "2025-01-01",
+                    "current_appraised_value_raw": 100.0,
+                    "_source_row": 1,
+                },
+                {
+                    "loan_id": "A2",
+                    "current_fico_score": 720,
+                    "current_fico_date": "2026-06-01",
+                    "collateral_id": "C1",
+                    "current_appraisal_date": "2025-02-01",
+                    "current_appraised_value_raw": 100.0,
+                    "_source_row": 2,
+                },
+                {
+                    "loan_id": "A2",
+                    "current_fico_score": 720,
+                    "current_fico_date": "2026-06-01",
+                    "collateral_id": "C2",
+                    "current_appraisal_date": "2025-02-01",
+                    "current_appraised_value_raw": 200.0,
+                    "_source_row": 3,
+                },
+                {
+                    "loan_id": "UNKNOWN",
+                    "current_fico_score": 800,
+                    "current_fico_date": "2026-06-01",
+                    "collateral_id": "ORPHAN",
+                    "current_appraisal_date": "2025-02-01",
+                    "current_appraised_value_raw": 999.0,
+                    "_source_row": 4,
+                },
+                {
+                    "loan_id": "UNKNOWN",
+                    "current_fico_score": 810,
+                    "current_fico_date": "2026-06-01",
+                    "collateral_id": "ORPHAN",
+                    "current_appraisal_date": "2025-02-01",
+                    "current_appraised_value_raw": 998.0,
+                    "_source_row": 5,
+                },
+            ]
+        )
+        source_spec = {
+            "key": "loan_id",
+            "identity_key": "loan_id",
+            "aggregation": {
+                "fico_score": {
+                    "method": "best_available",
+                    "selection": "precedence",
+                    "candidates": [
+                        {
+                            "field": "current_fico_score",
+                            "date_field": "current_fico_date",
+                        }
+                    ],
+                },
+                "consumer_appraised_value": {
+                    "method": "best_available_unique_sum",
+                    "selection": "precedence",
+                    "unique_fields": ["collateral_id"],
+                    "candidates": [
+                        {
+                            "field": "current_appraised_value_raw",
+                            "date_field": "current_appraisal_date",
+                        }
+                    ],
+                },
+            },
+        }
+        scenario = {
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "balance_field": "outstanding_balance",
+            },
+            "inputs": {"sources": {"consumer": source_spec}},
+        }
+        borrowers = pd.DataFrame(
+            {
+                "borrower_id": ["B1", "B2"],
+                "outstanding_balance": [500.0, 100.0],
+            }
+        )
+        loaded = {
+            "identity": SimpleNamespace(
+                frame=identity,
+                paths=[Path("identity.csv")],
+                coercion_issues=[],
+            ),
+            "consumer": SimpleNamespace(
+                frame=source,
+                paths=[Path("consumer.csv")],
+                coercion_issues=[],
+            ),
+        }
+
+        enriched = enrich_borrowers(borrowers, loaded, scenario).set_index("borrower_id")
+
+        self.assertEqual(float(enriched.at["B1", "fico_score"]), 720.0)
+        self.assertEqual(float(enriched.at["B1", "consumer_appraised_value"]), 300.0)
+        self.assertTrue(pd.isna(enriched.at["B2", "fico_score"]))
+
+        exceptions = []
+        reconciliation = build_source_reconciliation(
+            enriched.reset_index(), loaded, scenario, exceptions
+        ).iloc[0]
+        self.assertEqual(reconciliation["key_field"], "loan_id")
+        self.assertEqual(reconciliation["identity_key_field"], "loan_id")
+        self.assertEqual(int(reconciliation["unique_key_count"]), 3)
+        self.assertEqual(int(reconciliation["matched_source_key_count"]), 2)
+        self.assertEqual(int(reconciliation["orphan_source_key_count"]), 1)
+        self.assertEqual(int(reconciliation["orphan_source_row_count"]), 2)
+        self.assertEqual(int(reconciliation["matched_borrower_count"]), 1)
+        self.assertEqual(int(reconciliation["unmatched_borrower_count"]), 1)
+        self.assertEqual(float(reconciliation["matched_borrower_balance"]), 500.0)
+        self.assertEqual(float(reconciliation["unmatched_borrower_balance"]), 100.0)
+        self.assertIn("SOURCE_ORPHAN_KEYS", {item["code"] for item in exceptions})
+        self.assertEqual(int(reconciliation["entity_value_conflict_count"]), 2)
+        self.assertIn("SOURCE_ENTITY_VALUE_CONFLICT", {item["code"] for item in exceptions})
+
+    def test_account_link_rejects_identity_key_shared_by_multiple_borrowers(self):
+        source_spec = {
+            "key": "loan_id",
+            "identity_key": "loan_id",
+            "aggregation": {"fico_score": {"method": "first", "field": "fico_score"}},
+        }
+        scenario = {
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "balance_field": "outstanding_balance",
+            },
+            "inputs": {"sources": {"consumer": source_spec}},
+        }
+        loaded = {
+            "identity": SimpleNamespace(
+                frame=pd.DataFrame(
+                    {
+                        "loan_id": ["A1", "A1"],
+                        "borrower_id": ["B1", "B2"],
+                    }
+                )
+            ),
+            "consumer": SimpleNamespace(
+                frame=pd.DataFrame({"loan_id": ["A1"], "fico_score": [700]})
+            ),
+        }
+        borrowers = pd.DataFrame(
+            {
+                "borrower_id": ["B1", "B2"],
+                "outstanding_balance": [100.0, 100.0],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "maps to multiple borrowers"):
+            enrich_borrowers(borrowers, loaded, scenario)
+
     def test_missing_configured_source_alias_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -223,23 +491,33 @@ class ScenarioConfigTest(unittest.TestCase):
                     directory,
                 )
 
-    def test_unmapped_source_column_is_rejected(self):
+    def test_unmapped_source_columns_are_silently_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             (directory / "source.csv").write_text(
-                "Borrower Number,Unexpected Column\n001,value\n",
+                "Borrower Number,Unexpected Column,borrower_id\n001,value,wrong value\n",
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "columns missing from column_aliases"):
-                read_table(
-                    "aliased",
-                    {
-                        "path": "source.csv",
-                        "column_aliases": {"borrower_id": "Borrower Number"},
-                    },
-                    directory,
-                )
+            loaded = read_table(
+                "aliased",
+                {
+                    "path": "source.csv",
+                    "column_aliases": {"borrower_id": "Borrower Number"},
+                    "string_columns": ["borrower_id"],
+                    "required_columns": ["borrower_id"],
+                },
+                directory,
+            )
+
+            imported_columns = [
+                column
+                for column in loaded.frame.columns
+                if not str(column).startswith("_source_")
+            ]
+            self.assertEqual(imported_columns, ["borrower_id"])
+            self.assertEqual(loaded.frame.at[0, "borrower_id"], "001")
+            self.assertEqual(loaded.coercion_issues, [])
 
 
 if __name__ == "__main__":

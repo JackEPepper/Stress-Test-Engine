@@ -139,6 +139,152 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertTrue(out_of_scope.empty)
         self.assertIn("CI_SECTOR_DEFAULT_USED", {row["code"] for row in exceptions})
 
+    def test_abl_calculated_cash_interest_and_fallbacks(self):
+        scenario = {
+            "stress_levels": ["S1"],
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "portfolio_field": "portfolio",
+            },
+            "modules": {
+                "C&I": {
+                    "sector_field": "ci_sector",
+                    "ebitda_reduction": {"default": {"Pass": {"S1": 0.0}}},
+                    "interest_rate_stress": {"S1": 0.0},
+                    "cutoffs": {"special_mention": 1.15, "substandard": 1.0},
+                    "sectors": {
+                        "Asset-Based Lending": {
+                            "principal_field": "required_principal_paid_period",
+                            "include_non_discretionary_dividends": True,
+                            "use_calculated_cash_paid_for_interest": True,
+                        },
+                        "Middle Market": {
+                            "principal_field": "required_principal_paid_period",
+                            "include_non_discretionary_dividends": True,
+                        },
+                    },
+                }
+            },
+        }
+        base_row = {
+            "portfolio": "C&I",
+            "primary_module": "C&I",
+            "module_applied": "",
+            "base_bucket": "Pass",
+            "stressed_bucket_S1": "Pass",
+            "out_of_scope_S1": False,
+            "ci_sector": "Asset-Based Lending",
+            "ebitda": 100.0,
+            "cash_taxes": 0.0,
+            "cash_distribution": 0.0,
+            "cash_dividends": 0.0,
+            "discretionary_cash_dividends_distribution": 0.0,
+            "cash_management_fees": 0.0,
+            "unfinanced_capex": 0.0,
+            "global_total_outstanding": 0.0,
+            "required_principal_paid_period": 10.0,
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    **base_row,
+                    "borrower_id": "ABL-CALCULATED",
+                    "interest_expense": 30.0,
+                    "non_cash_interest_expense": 5.0,
+                    "cash_paid_for_interest": 99.0,
+                },
+                {
+                    **base_row,
+                    "borrower_id": "ABL-MISSING",
+                    "interest_expense": np.nan,
+                    "non_cash_interest_expense": np.nan,
+                    "cash_paid_for_interest": 20.0,
+                },
+                {
+                    **base_row,
+                    "borrower_id": "ABL-ZERO",
+                    "interest_expense": 5.0,
+                    "non_cash_interest_expense": 5.0,
+                    "cash_paid_for_interest": 20.0,
+                },
+                {
+                    **base_row,
+                    "borrower_id": "MM-ORIGINAL",
+                    "ci_sector": "Middle Market",
+                    "interest_expense": 30.0,
+                    "non_cash_interest_expense": 5.0,
+                    "cash_paid_for_interest": 20.0,
+                },
+                {
+                    **base_row,
+                    "borrower_id": "ABL-ONE-MISSING",
+                    "interest_expense": 30.0,
+                    "non_cash_interest_expense": np.nan,
+                    "cash_paid_for_interest": 99.0,
+                },
+            ]
+        )
+        exceptions = []
+
+        stressed, out_of_scope = run_ci(results, scenario, exceptions)
+        stressed = stressed.set_index("borrower_id")
+
+        self.assertTrue(out_of_scope.empty)
+        self.assertEqual(
+            float(stressed.at["ABL-CALCULATED", "calculated_cash_paid_for_interest"]),
+            25.0,
+        )
+        self.assertEqual(
+            stressed.at["ABL-CALCULATED", "calculated_cash_paid_for_interest_source"],
+            "interest_expense_less_non_cash_interest_expense",
+        )
+        self.assertEqual(float(stressed.at["ABL-CALCULATED", "ci_debt_service_S1"]), 35.0)
+
+        for borrower_id, reason in (
+            ("ABL-MISSING", "alternative_inputs_missing"),
+            ("ABL-ZERO", "calculated_value_zero"),
+        ):
+            self.assertEqual(
+                float(stressed.at[borrower_id, "calculated_cash_paid_for_interest"]),
+                20.0,
+            )
+            self.assertEqual(
+                stressed.at[borrower_id, "calculated_cash_paid_for_interest_source"],
+                "cash_paid_for_interest",
+            )
+            self.assertEqual(
+                stressed.at[borrower_id, "calculated_cash_paid_for_interest_fallback_reason"],
+                reason,
+            )
+            self.assertEqual(float(stressed.at[borrower_id, "ci_debt_service_S1"]), 30.0)
+
+        self.assertEqual(
+            float(stressed.at["MM-ORIGINAL", "calculated_cash_paid_for_interest"]),
+            20.0,
+        )
+        self.assertEqual(
+            stressed.at["MM-ORIGINAL", "calculated_cash_paid_for_interest_source"],
+            "cash_paid_for_interest",
+        )
+        self.assertEqual(float(stressed.at["MM-ORIGINAL", "ci_debt_service_S1"]), 30.0)
+
+        self.assertEqual(
+            float(stressed.at["ABL-ONE-MISSING", "calculated_cash_paid_for_interest"]),
+            30.0,
+        )
+        self.assertEqual(float(stressed.at["ABL-ONE-MISSING", "ci_debt_service_S1"]), 40.0)
+        fallback_rows = [
+            row for row in exceptions if row["code"] == "CI_CALCULATED_CASH_INTEREST_FALLBACK"
+        ]
+        self.assertEqual({row["borrower_id"] for row in fallback_rows}, {"ABL-MISSING", "ABL-ZERO"})
+        substitution_rows = [
+            row for row in exceptions if row["code"] == "CI_MISSING_FIELD_ZERO_SUBSTITUTION"
+        ]
+        self.assertEqual(
+            {(row["borrower_id"], row["field"]) for row in substitution_rows},
+            {("ABL-ONE-MISSING", "non_cash_interest_expense")},
+        )
+
     def test_malformed_consumer_pd_lookup_is_logged_and_out_of_scope(self):
         scenario = {
             "stress_levels": ["S1"],

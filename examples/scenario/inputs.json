@@ -46,6 +46,8 @@
           "cash_management_fees": "cash_management_fees",
           "unfinanced_capex": "unfinanced_capex",
           "global_total_outstanding": "global_total_outstanding",
+          "interest_expense": "interest_expense",
+          "non_cash_interest_expense": "non_cash_interest_expense",
           "cash_paid_for_interest": "cash_paid_for_interest",
           "principal_repayments_paid": "principal_repayments_paid",
           "required_principal_paid_period": "required_principal_paid_period"
@@ -60,6 +62,8 @@
           "cash_management_fees",
           "unfinanced_capex",
           "global_total_outstanding",
+          "interest_expense",
+          "non_cash_interest_expense",
           "cash_paid_for_interest",
           "principal_repayments_paid",
           "required_principal_paid_period"
@@ -162,9 +166,10 @@
           "data/consumer_scores_2.csv"
         ],
         "type": "csv",
-        "key": "borrower_id",
+        "key": "loan_id",
+        "identity_key": "loan_id",
         "column_aliases": {
-          "borrower_id": "borrower_id",
+          "loan_id": "account_number",
           "current_fico_score": "current_fico_score",
           "current_fico_date": "current_fico_date",
           "origination_fico_score": "origination_fico_score",

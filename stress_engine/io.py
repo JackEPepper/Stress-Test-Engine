@@ -35,7 +35,7 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
     read_options = dict(spec.get("read_options", {}))
     rename = _column_rename_map(name, spec)
     if not rename:
-        raise ValueError(f"Input source '{name}' must define column_aliases for every source column.")
+        raise ValueError(f"Input source '{name}' must define column_aliases for the columns it imports.")
     source_for_canonical = {canonical: source for source, canonical in rename.items()}
     string_columns = [str(field) for field in spec.get("string_columns", [])]
     if string_columns:
@@ -53,6 +53,10 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
     for path in paths:
         frame = _read_input_file(name, path, spec, read_options)
         _validate_source_columns(name, path, frame, rename)
+        # column_aliases is an import allowlist. Unmapped vendor fields are
+        # intentionally discarded before they can affect engine behavior.
+        mapped_columns = [column for column in frame.columns if column in rename]
+        frame = frame.loc[:, mapped_columns]
         frame = frame.rename(columns=rename)
         duplicates = frame.columns[frame.columns.duplicated()].unique().tolist()
         if duplicates:
@@ -173,29 +177,12 @@ def _validate_source_columns(
     frame: pd.DataFrame,
     rename: Mapping[str, str],
 ) -> None:
-    """Require every physical file in a logical source to use the same aliases."""
+    """Require configured source columns while allowing unrelated extra columns."""
     missing_aliases = [source for source in rename if source not in frame.columns]
     if missing_aliases:
         raise ValueError(
             f"Input source '{name}' file '{path.name}' is missing configured aliased columns: "
             f"{', '.join(missing_aliases)}"
-        )
-    unmapped = [str(column) for column in frame.columns if column not in rename]
-    if unmapped:
-        raise ValueError(
-            f"Input source '{name}' file '{path.name}' has columns missing from column_aliases: "
-            f"{', '.join(unmapped)}"
-        )
-    collisions = [
-        (source, canonical)
-        for source, canonical in rename.items()
-        if source != canonical and source in frame.columns and canonical in frame.columns
-    ]
-    if collisions:
-        details = ", ".join(f"{source} -> {canonical}" for source, canonical in collisions)
-        raise ValueError(
-            f"Input source '{name}' file '{path.name}' alias collides with an existing canonical column: "
-            f"{details}"
         )
 
 
@@ -258,6 +245,11 @@ def load_inputs(scenario: Mapping[str, Any], base_dir: Path) -> Dict[str, Loaded
         field
         for field in (borrower.get("borrower_id_field"), borrower.get("loan_id_field"))
         if field
+    )
+    identity_strings.extend(
+        spec.get("identity_key")
+        for spec in inputs.get("sources", {}).values()
+        if spec.get("identity_key")
     )
     identity_spec["string_columns"] = list(dict.fromkeys(identity_strings))
     loaded["identity"] = read_table("identity", identity_spec, base_dir)

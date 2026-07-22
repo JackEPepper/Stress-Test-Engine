@@ -38,7 +38,8 @@
         },
         "Asset-Based Lending": {
           "principal_field": "required_principal_paid_period",
-          "include_non_discretionary_dividends": true
+          "include_non_discretionary_dividends": true,
+          "use_calculated_cash_paid_for_interest": true
         }
       }
     }

@@ -82,6 +82,7 @@ For each reporting period:
 1. Copy or archive the prior period's scenario folder and input files.
 2. Replace the current source files or point `inputs.json` to new files.
 3. Update only the right side of `column_aliases` when headers changed.
+   Extra source columns that the engine does not use can remain unmapped.
 4. Update dates and stress assumptions in the scenario fragments.
 5. Run the engine into a new, dated output directory.
 6. Review and resolve controls in the order shown above.
@@ -190,10 +191,11 @@ the required data is not on the first sheet.
 
 Use `path` when a logical source has one file. Use `paths` with a JSON list
 when the same source is delivered in multiple files. Every listed file must
-have the same source columns and use the same aliases, date rules, numeric
-rules, and aggregation. The engine loads the files in listed order,
-concatenates their rows, and records each physical file separately in
-`metadata.json`.
+contain the configured source columns and use the same aliases, date rules,
+numeric rules, and aggregation. Files may contain other unrelated columns;
+those columns do not need to match across files. The engine loads the files in
+listed order, concatenates their rows, and records each physical file
+separately in `metadata.json`.
 
 ```json
 "paths": [
@@ -204,7 +206,7 @@ concatenates their rows, and records each physical file separately in
 
 ### Column aliases
 
-Every source column must appear exactly once in that source's
+List only the source columns that the engine should import in that source's
 `column_aliases` block:
 
 ```json
@@ -216,7 +218,10 @@ Every source column must appear exactly once in that source's
 ```
 
 The left side is the canonical name used everywhere inside the scenario and
-engine. The right side is the exact heading in the source file.
+engine. The right side is the exact heading in the source file. Any source
+column omitted from `column_aliases` is silently ignored: it is not profiled,
+aggregated, tagged, reconciled, or written to engine outputs. This allows a
+vendor or source system to add unrelated columns without breaking a run.
 
 If `Customer Number` changes to `Borrower #`, make only this change:
 
@@ -226,11 +231,37 @@ If `Customer Number` changes to `Borrower #`, make only this change:
 
 Do not replace `borrower_id` elsewhere. Date lists, numeric lists,
 aggregations, tag rules, and model settings all continue to use canonical
-names. A missing alias, an unexpected unmapped source column, or two source
-columns mapped to the same canonical name stops the run with a clear error.
+names. A configured source heading that is missing from the file, a missing
+required canonical field, or one source heading mapped to multiple canonical
+names stops the run with a clear error. Unmapped columns do not create errors
+or exception-log entries.
 
 Aliases solve header-only changes. A genuinely different data layout may also
 require changes to keys, aggregation, tags, or model configuration.
+
+### Borrower-keyed and account-keyed sources
+
+Most supporting files use `borrower_id` directly. A source that has no
+borrower/customer number can instead use an account number already present in
+the identity file. The Consumer example uses:
+
+```json
+"key": "loan_id",
+"identity_key": "loan_id",
+"column_aliases": {
+  "loan_id": "account_number"
+}
+```
+
+Here, `account_number` is the physical Consumer-file heading and `loan_id` is
+the stable engine name. `identity_key` instructs the engine to match that value
+to `loan_id` in the master identity file and retrieve the associated
+`borrower_id`. The source rows are then aggregated at borrower level.
+
+Matching is exact and account fields are read as text, preserving leading
+zeros. An unmatched source account is reported in source reconciliation and
+does not enrich a borrower. If one master account maps to more than one
+borrower, the run stops because choosing either borrower would be ambiguous.
 
 ### Dates, numbers, and blanks
 
@@ -250,7 +281,7 @@ source does not enter the results; it is reported as an orphan source key.
 
 | Canonical field | Purpose |
 |---|---|
-| `loan_id` | Unique loan identifier and loan-count audit |
+| `loan_id` | Unique loan/account identifier, loan-count audit, and Consumer account crosswalk |
 | `borrower_id` | Key used to combine loans and supporting sources |
 | `borrower_name` | Display and audit name |
 | `status` | Tag inclusion or exclusion, such as Paid Off |
@@ -284,7 +315,9 @@ The financial source contains the components used to calculate stressed FCCR:
 | `cash_management_fees` | Management-fee outflow |
 | `unfinanced_capex` | Unfinanced capital spending |
 | `global_total_outstanding` | Balance exposed to incremental rate stress |
-| `cash_paid_for_interest` | Existing cash interest |
+| `interest_expense` | Total interest expense used by the optional ABL cash-interest calculation |
+| `non_cash_interest_expense` | Non-cash interest removed by the optional ABL calculation |
+| `cash_paid_for_interest` | Original cash-interest value and fallback |
 | `principal_repayments_paid` | Principal measure used by Middle Market |
 | `required_principal_paid_period` | Principal measure used by Sponsor/Specialty and ABL |
 
@@ -319,11 +352,12 @@ separate from the Consumer appraisal total.
 ### Consumer files: FICO and appraisals
 
 The example treats two physical CSVs as one logical `consumer_scores` source.
-Each file carries both the FICO and appraisal fields for its borrowers.
+Each file carries both the FICO and appraisal fields for its accounts. It does
+not contain a borrower or customer number.
 
 | Canonical field | Purpose |
 |---|---|
-| `borrower_id` | Merge key |
+| `loan_id` | Canonical account key; supplied by the physical `account_number` column |
 | `current_fico_score` | Current FICO candidate |
 | `current_fico_date` | Current FICO date |
 | `origination_fico_score` | Origination FICO fallback |
@@ -335,12 +369,14 @@ Each file carries both the FICO and appraisal fields for its borrowers.
 | `prior_appraised_value` | Prior appraisal candidate |
 | `origination_appraised_value` | Origination appraisal candidate |
 
-The source aggregation produces the canonical `fico_score`, which enters the
-Consumer calculation, and `fico_date`, which records the selected score date
-for audit purposes. Appraisals use the same current/prior/origination fallback
-chain separately for each `collateral_id`; the selected collateral values are
-then summed into `consumer_appraised_value` for the borrower. Repeated history
-rows for one collateral ID therefore do not inflate the total.
+Each account first maps through the identity file to a borrower. The source
+aggregation then produces one canonical `fico_score` for that borrower, which
+enters the Consumer calculation, and `fico_date`, which records the selected
+score date for audit purposes. Appraisals use the same
+current/prior/origination fallback chain separately for each `collateral_id`
+across all of the borrower's accounts; the selected collateral values are then
+summed into `consumer_appraised_value`. Repeated history rows for one collateral
+ID therefore do not inflate the total.
 
 The borrower audit also records `fico_source_record` and
 `consumer_appraisal_source_record` as `full file path#row=N`. This identifies
@@ -470,11 +506,30 @@ Missing C&I components are treated as zero and logged. A row becomes out of
 scope when available cash flow is zero or missing, or debt service is
 nonpositive. Borrowers already rated Substandard remain Substandard.
 
-Each configured sector can choose its principal field and whether to subtract
-non-discretionary dividends. Omitted options use the canonical defaults
-`principal_repayments_paid` and `false`. An unlisted sector first uses the
-optional `sectors.default` object, then those canonical defaults; the fallback
-is recorded in the exception log.
+Each configured sector can choose its principal field, whether to subtract
+non-discretionary dividends, and whether to calculate cash interest from its
+expense components. The canonical defaults are `principal_repayments_paid`,
+`false`, and `false`, respectively. An unlisted sector first uses the optional
+`sectors.default` object, then those canonical defaults; the fallback is
+recorded in the exception log.
+
+The example enables `use_calculated_cash_paid_for_interest` for Asset-Based
+Lending. When enabled, debt service uses:
+
+```text
+calculated cash paid for interest = interest expense - non-cash interest expense
+```
+
+If both alternative fields are blank, or if their difference is zero, the
+engine uses `cash_paid_for_interest` instead and records the reason. If only one
+alternative component is blank, the normal C&I lenient rule treats that
+component as zero and logs the substitution. A blank or zero fallback value is
+still subject to the ordinary debt-service and out-of-scope rules.
+
+The stressed borrower results expose the selected value in
+`calculated_cash_paid_for_interest`, identify its source in
+`calculated_cash_paid_for_interest_source`, and show any fallback reason in
+`calculated_cash_paid_for_interest_fallback_reason`.
 
 ### Consumer
 
@@ -590,11 +645,15 @@ were applied.
 `source_reconciliation.csv` shows:
 
 - null and duplicate source keys;
-- source keys absent from the identity population;
+- source keys absent from the configured borrower or identity key;
 - borrowers with and without source matches;
 - matched and unmatched borrower balance;
 - coercion issues; and
 - conflicting values for repeated collateral/entity keys.
+
+`key_field` identifies the canonical key read from the supporting source.
+`identity_key_field` is populated when that source must be translated through
+the master identity file before borrower-level aggregation.
 
 Lookup and tie-out files have `merge_enabled = false`; borrower-match measures
 are intentionally blank for those files.
@@ -746,9 +805,10 @@ when moved into an output directory.
 | JSON parsing error | Double quotes, trailing commas, and accidental comments |
 | Source file not found | Path relative to the first scenario manifest |
 | Missing configured aliased columns | Right-side alias spelling versus the exact source header |
-| Columns missing from `column_aliases` | Add every new source column to the alias block |
+| Extra or unused source columns | No action is needed; unmapped columns are ignored |
 | Missing required columns | Confirm the canonical left-side alias exists and is listed correctly |
-| Source orphan keys | Borrower IDs present in a supporting source but absent from identity |
+| Source orphan keys | Borrower or account IDs present in a supporting source but absent from its configured identity key |
+| Ambiguous account mapping | Ensure each master account number belongs to exactly one borrower |
 | Cardinality warning | Duplicate borrower keys in a source expected to have one row per borrower |
 | Failed tag tie-out | Tag logic, expected amount, source key, and tolerance |
 | Consumer CECL unavailable | Missing FICO/appraisal/lookup values or invalid Consumer assumptions |
@@ -784,6 +844,6 @@ Run the complete automated test suite:
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
-The tests cover the sample run, split manifests, complete source aliases,
-borrower aggregation, missing-data behavior, overlays, CECL, comparisons, batch
-generation, and deterministic reporting.
+The tests cover the sample run, split manifests, configured source aliases,
+ignored extra source columns, borrower aggregation, missing-data behavior,
+overlays, CECL, comparisons, batch generation, and deterministic reporting.

@@ -215,19 +215,33 @@ def enrich_borrowers(
 ) -> pd.DataFrame:
     """Merge configured non-identity sources onto borrower rows.
 
-    Each source is aggregated first by borrower key to avoid many-to-many
-    joins.
+    Account-keyed sources are crosswalked through identity first. Every source
+    is then aggregated by borrower key to avoid many-to-many joins.
     """
     out = borrowers.copy()
     borrower_id = scenario["borrower"]["borrower_id_field"]
     source_specs = scenario.get("inputs", {}).get("sources", {})
+    identity_table = loaded.get("identity")
     for name in sorted(source_specs):
         spec = source_specs[name]
         if spec.get("merge", True) is False:
             continue
         if name not in loaded:
             continue
-        aggregated = aggregate_source(name, loaded[name].frame, spec, borrower_id)
+        source_frame = loaded[name].frame
+        group_key = spec.get("key", borrower_id)
+        if spec.get("identity_key"):
+            if identity_table is None:
+                raise ValueError(f"Source '{name}' requires the identity input for account linkage.")
+            source_frame = _link_source_to_identity(
+                name,
+                source_frame,
+                spec,
+                identity_table.frame,
+                borrower_id,
+            )
+            group_key = borrower_id
+        aggregated = aggregate_source(name, source_frame, spec, group_key)
         if aggregated.empty:
             continue
         out = _merge_source(out, aggregated, borrower_id)
@@ -244,6 +258,7 @@ def build_source_reconciliation(
     borrower_id = scenario["borrower"]["borrower_id_field"]
     balance_field = scenario["borrower"]["balance_field"]
     source_specs = scenario.get("inputs", {}).get("sources", {})
+    identity_table = loaded.get("identity")
     rows: List[Dict[str, Any]] = []
 
     for loaded_name, table in loaded.items():
@@ -268,12 +283,14 @@ def build_source_reconciliation(
         frame = table.frame
         merge_enabled = spec.get("merge", True) is not False
         key = spec.get("key", borrower_id)
+        identity_key = spec.get("identity_key")
         base_row: Dict[str, Any] = {
             "source": name,
             "path": ";".join(str(path) for path in table.paths),
             "file_count": len(table.paths),
             "merge_enabled": merge_enabled,
             "key_field": key,
+            "identity_key_field": identity_key or "",
             "source_row_count": int(len(frame)),
             "nonnull_key_row_count": np.nan,
             "null_key_row_count": np.nan,
@@ -312,17 +329,40 @@ def build_source_reconciliation(
         source_key_text = nonnull[key].astype(str)
         duplicate = source_key_text.duplicated(keep=False)
         source_keys = set(source_key_text)
-        orphan_keys = source_keys - borrower_keys
+        if identity_key:
+            if identity_table is None:
+                raise ValueError(f"Source '{name}' requires the identity input for account linkage.")
+            linked = _link_source_to_identity(
+                name,
+                frame,
+                spec,
+                identity_table.frame,
+                borrower_id,
+            )
+            matched_linked = linked.loc[linked[borrower_id].notna()].copy()
+            matched_source_keys = set(matched_linked[key].dropna().astype(str))
+            orphan_keys = source_keys - matched_source_keys
+            matched_borrower_ids = set(matched_linked[borrower_id].dropna().astype(str))
+            orphan_linked = linked.loc[
+                linked[borrower_id].isna()
+                & linked[key].notna()
+                & linked[key].astype(str).str.strip().ne("")
+            ].copy()
+            conflicts = _source_entity_value_conflicts(matched_linked, borrower_id, spec)
+            conflicts += _source_entity_value_conflicts(orphan_linked, key, spec)
+        else:
+            orphan_keys = source_keys - borrower_keys
+            matched_borrower_ids = source_keys & borrower_keys
+            conflicts = _source_entity_value_conflicts(frame, key, spec)
         orphan_rows = int(source_key_text.isin(orphan_keys).sum())
-        matched_borrower = borrowers[borrower_id].astype(str).isin(source_keys)
-        conflicts = _source_entity_value_conflicts(frame, key, spec)
+        matched_borrower = borrowers[borrower_id].astype(str).isin(matched_borrower_ids)
         base_row.update(
             {
                 "nonnull_key_row_count": int((~null_key).sum()),
                 "null_key_row_count": int(null_key.sum()),
                 "unique_key_count": int(len(source_keys)),
                 "duplicate_key_row_count": int(duplicate.sum()),
-                "matched_source_key_count": int(len(source_keys & borrower_keys)),
+                "matched_source_key_count": int(len(source_keys - orphan_keys)),
                 "orphan_source_key_count": int(len(orphan_keys)),
                 "orphan_source_row_count": orphan_rows,
                 "matched_borrower_count": int(matched_borrower.sum()),
@@ -353,10 +393,13 @@ def build_source_reconciliation(
                 "WARNING",
                 "source_reconciliation",
                 "SOURCE_ORPHAN_KEYS",
-                "Source keys did not exist in the identity borrower population.",
+                "Source keys did not match the configured borrower or identity key.",
                 source=name,
                 field=key,
-                details=f"orphan_key_count={len(orphan_keys)}; orphan_row_count={orphan_rows}",
+                details=(
+                    f"orphan_key_count={len(orphan_keys)}; orphan_row_count={orphan_rows}; "
+                    f"identity_key={identity_key or borrower_id}"
+                ),
             )
         if spec.get("expect_unique_key", False) and duplicate.any():
             record_exception(
@@ -544,23 +587,68 @@ def _source_entity_value_conflicts(frame: pd.DataFrame, key: str, spec: Mapping[
     return len(conflict_groups)
 
 
-def aggregate_source(name: str, df: pd.DataFrame, spec: Mapping[str, Any], borrower_id: str) -> pd.DataFrame:
+def _link_source_to_identity(
+    name: str,
+    frame: pd.DataFrame,
+    spec: Mapping[str, Any],
+    identity: pd.DataFrame,
+    borrower_id: str,
+) -> pd.DataFrame:
+    """Attach borrower IDs to account-keyed source rows through identity data."""
+    source_key = spec.get("key", borrower_id)
+    identity_key = spec.get("identity_key")
+    if not identity_key:
+        return frame.copy()
+    if source_key == borrower_id:
+        raise ValueError(
+            f"Source '{name}' identity_key requires an account-level key other than '{borrower_id}'."
+        )
+    ensure_columns(frame, [source_key], f"Source '{name}'")
+    ensure_columns(identity, [identity_key, borrower_id], "Identity input")
+    if borrower_id in frame.columns:
+        raise ValueError(
+            f"Source '{name}' uses identity_key and must not also supply '{borrower_id}'."
+        )
+
+    crosswalk = identity[[identity_key, borrower_id]].copy()
+    valid_identity_key = (
+        crosswalk[identity_key].notna()
+        & crosswalk[identity_key].astype(str).str.strip().ne("")
+    )
+    valid_borrower = (
+        crosswalk[borrower_id].notna()
+        & crosswalk[borrower_id].astype(str).str.strip().ne("")
+    )
+    crosswalk = crosswalk.loc[valid_identity_key & valid_borrower].drop_duplicates()
+    borrower_counts = crosswalk.groupby(identity_key, dropna=False)[borrower_id].nunique()
+    ambiguous = borrower_counts[borrower_counts > 1]
+    if not ambiguous.empty:
+        examples = ", ".join(str(value) for value in ambiguous.index[:5])
+        raise ValueError(
+            f"Identity key '{identity_key}' maps to multiple borrowers for source '{name}': {examples}"
+        )
+    crosswalk = crosswalk.drop_duplicates(identity_key, keep="first")
+    if source_key != identity_key:
+        crosswalk = crosswalk.rename(columns={identity_key: source_key})
+    return frame.merge(crosswalk, on=source_key, how="left", validate="many_to_one", sort=False)
+
+
+def aggregate_source(name: str, df: pd.DataFrame, spec: Mapping[str, Any], key: str) -> pd.DataFrame:
     """Aggregate one source table before merging it into borrowers.
 
-    Called by `enrich_borrowers`. It supports borrower-level and collateral-
-    level sources by reducing them to the scenario's merge key before join.
+    Called by `enrich_borrowers`. Account-keyed sources are linked to identity
+    first, so every source is reduced to one row per borrower before merging.
     """
-    key = spec.get("key", borrower_id)
-    merge_key = spec.get("merge_key", borrower_id)
     if key not in df.columns:
         raise ValueError(f"Source '{name}' key column '{key}' is missing.")
     frame = df.copy()
     aggregation = spec.get("aggregation", {})
     if not aggregation:
+        source_key = spec.get("key", key)
         aggregation = {
             column: "first"
             for column in frame.columns
-            if column != key and not str(column).startswith("_source_")
+            if column not in {key, source_key} and not str(column).startswith("_source_")
         }
 
     pieces: List[pd.DataFrame] = []
@@ -568,13 +656,11 @@ def aggregate_source(name: str, df: pd.DataFrame, spec: Mapping[str, Any], borro
         piece = _aggregate_field(frame, key, output_field, method_spec)
         pieces.append(piece)
     if not pieces:
-        return pd.DataFrame(columns=[merge_key])
+        return pd.DataFrame(columns=[key])
     result = pieces[0]
     for piece in pieces[1:]:
         result = result.merge(piece, on=key, how="outer")
-    if merge_key != key:
-        result = result.rename(columns={key: merge_key})
-    return result.sort_values([merge_key], kind="mergesort").reset_index(drop=True)
+    return result.sort_values([key], kind="mergesort").reset_index(drop=True)
 
 
 def _aggregate_field(df: pd.DataFrame, key: str, output_field: str, method_spec: Any) -> pd.DataFrame:

@@ -15,6 +15,7 @@ from ..utils import get_levels, is_missing, lookup_parameter_with_source, lower_
 DEFAULT_SECTOR_CONFIG = {
     "principal_field": "principal_repayments_paid",
     "include_non_discretionary_dividends": False,
+    "use_calculated_cash_paid_for_interest": False,
 }
 
 
@@ -37,6 +38,13 @@ def run_ci(
     config["_module_name"] = "C&I"
 
     out = results.copy()
+    out["calculated_cash_paid_for_interest"] = np.nan
+    out["calculated_cash_paid_for_interest_source"] = pd.Series(
+        pd.NA, index=out.index, dtype="object"
+    )
+    out["calculated_cash_paid_for_interest_fallback_reason"] = pd.Series(
+        pd.NA, index=out.index, dtype="object"
+    )
     levels = get_levels(scenario)
     mask = module_population(out, scenario, config)
     out_scope: List[Dict[str, Any]] = []
@@ -52,6 +60,8 @@ def run_ci(
         "capex": "unfinanced_capex",
         "global_outstanding": "global_total_outstanding",
         "interest": "cash_paid_for_interest",
+        "interest_expense": "interest_expense",
+        "non_cash_interest_expense": "non_cash_interest_expense",
     }
 
     for level in levels:
@@ -140,6 +150,26 @@ def run_ci(
                 reduction=reduction,
                 interest_rate_stress=interest_rate_stress,
             )
+            out.at[idx, "calculated_cash_paid_for_interest"] = result["cash_interest"]
+            out.at[idx, "calculated_cash_paid_for_interest_source"] = result["cash_interest_source"]
+            out.at[idx, "calculated_cash_paid_for_interest_fallback_reason"] = (
+                result["cash_interest_fallback_reason"] or pd.NA
+            )
+            if result["cash_interest_fallback_reason"]:
+                record_exception(
+                    exceptions,
+                    "WARNING",
+                    "C&I",
+                    "CI_CALCULATED_CASH_INTEREST_FALLBACK",
+                    "Calculated cash interest was unavailable or zero; the original "
+                    "cash-paid-for-interest field was used.",
+                    borrower_id=row.get(scenario["borrower"].get("borrower_id_field", "borrower_id")),
+                    portfolio=row.get(scenario["borrower"].get("portfolio_field", "portfolio")),
+                    stress_level=level,
+                    module="C&I",
+                    field=fields["interest"],
+                    details=f"reason={result['cash_interest_fallback_reason']}",
+                )
             if result["out_of_scope"]:
                 out.at[idx, f"out_of_scope_{level}"] = True
                 record_out_of_scope(
@@ -193,7 +223,9 @@ def _calculate_fccr(
     final available cash flow is zero/missing or debt service is nonpositive.
     """
     base_bucket = row.get("base_bucket", "Pass")
-    missing = [field for field in _fields_used(sector_cfg, fields) if field not in row or pd.isna(row[field])]
+    cash_interest = _cash_interest(row, sector_cfg, fields)
+    used_fields = [*_fields_used(sector_cfg, fields), *_cash_interest_fields(cash_interest, fields)]
+    missing = [field for field in used_fields if field not in row or pd.isna(row[field])]
 
     ebitda = _value(row, fields["ebitda"])
     reduction = _ebitda_reduction(config, sector, base_bucket, level)[0] if reduction is None else reduction
@@ -232,7 +264,7 @@ def _calculate_fccr(
     # cash interest, and the sector-specific principal repayment field.
     debt_service = (
         interest_rate_stress * _value(row, fields["global_outstanding"])
-        + _value(row, fields["interest"])
+        + cash_interest["value"]
         + _value(row, principal_field)
     )
     zero_fields: List[str] = []
@@ -251,6 +283,9 @@ def _calculate_fccr(
         "available_cash_flow": available_cash_flow,
         "debt_service": debt_service,
         "fccr": fccr,
+        "cash_interest": cash_interest["value"],
+        "cash_interest_source": cash_interest["source"],
+        "cash_interest_fallback_reason": cash_interest["fallback_reason"],
         "out_of_scope": out_of_scope,
         "missing_fields": missing,
         "zero_fields": zero_fields,
@@ -337,12 +372,59 @@ def _fields_used(sector_cfg: Mapping[str, Any], fields: Mapping[str, str]) -> Li
         fields["cash_management_fees"],
         fields["capex"],
         fields["global_outstanding"],
-        fields["interest"],
         sector_cfg.get("principal_field", DEFAULT_SECTOR_CONFIG["principal_field"]),
     ]
     if sector_cfg.get("include_non_discretionary_dividends", False):
         used.extend([fields["cash_dividends"], fields["discretionary_dividends"]])
     return used
+
+
+def _cash_interest(
+    row: Mapping[str, Any],
+    sector_cfg: Mapping[str, Any],
+    fields: Mapping[str, str],
+) -> Dict[str, Any]:
+    """Choose original or calculated cash interest for debt service."""
+    original = _value(row, fields["interest"])
+    if not sector_cfg.get("use_calculated_cash_paid_for_interest", False):
+        return {
+            "value": original,
+            "source": fields["interest"],
+            "fallback_reason": "",
+        }
+
+    interest_expense = row.get(fields["interest_expense"])
+    non_cash_interest = row.get(fields["non_cash_interest_expense"])
+    if is_missing(interest_expense) and is_missing(non_cash_interest):
+        return {
+            "value": original,
+            "source": fields["interest"],
+            "fallback_reason": "alternative_inputs_missing",
+        }
+
+    calculated = _value(row, fields["interest_expense"]) - _value(
+        row, fields["non_cash_interest_expense"]
+    )
+    if abs(calculated) < 1e-12:
+        return {
+            "value": original,
+            "source": fields["interest"],
+            "fallback_reason": "calculated_value_zero",
+        }
+    return {
+        "value": calculated,
+        "source": "interest_expense_less_non_cash_interest_expense",
+        "fallback_reason": "",
+    }
+
+
+def _cash_interest_fields(
+    cash_interest: Mapping[str, Any], fields: Mapping[str, str]
+) -> List[str]:
+    """Return only cash-interest inputs that actually drove the calculation."""
+    if cash_interest["source"] == fields["interest"]:
+        return [fields["interest"]]
+    return [fields["interest_expense"], fields["non_cash_interest_expense"]]
 
 
 def _value(row: Mapping[str, Any], field: str) -> float:
