@@ -48,16 +48,22 @@ def record_exception(
     for key, value in context.items():
         if key in row:
             row[key] = "" if _is_scalar_missing(value) else value
+        elif key in {"loan_id", "scenario_variant"}:
+            row[key] = "" if _is_scalar_missing(value) else value
         else:
             row["details"] = f"{row['details']}; {key}={value}".strip("; ")
     exceptions.append(row)
 
 
-def exception_frame(exceptions: List[Dict[str, Any]]) -> pd.DataFrame:
+def exception_frame(
+    exceptions: List[Dict[str, Any]],
+    extra_columns: List[str] | None = None,
+) -> pd.DataFrame:
     """Convert collected exception rows to a consistently shaped DataFrame."""
+    columns = [*EXCEPTION_COLUMNS, *(extra_columns or [])]
     if not exceptions:
-        return pd.DataFrame(columns=EXCEPTION_COLUMNS)
-    return pd.DataFrame(exceptions, columns=EXCEPTION_COLUMNS)
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(exceptions, columns=columns)
 
 
 def _is_scalar_missing(value: Any) -> bool:

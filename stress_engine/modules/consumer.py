@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from .base import append_module, module_population, record_out_of_scope
+from .base import append_module, module_population, record_out_of_scope, targeted_parameter
 from ..exceptions import record_exception
 from ..utils import get_levels, is_missing, lookup_parameter_with_source, to_number
 
@@ -41,6 +41,18 @@ def run_consumer(
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
     qualitative_floor = to_number(config.get("qualitative_reserve_floor"), np.nan)
     reserve_field_available = reserve_field in out.columns
+    rushed_sale_discount = to_number(config.get("rushed_sale_discount"), np.nan)
+    closing_costs = to_number(config.get("closing_costs"), np.nan)
+    liquidation_assumption_errors = []
+    if is_missing(rushed_sale_discount) or not 0 <= rushed_sale_discount <= 1:
+        liquidation_assumption_errors.append("rushed_sale_discount")
+    if is_missing(closing_costs) or not 0 <= closing_costs <= 1:
+        liquidation_assumption_errors.append("closing_costs")
+    liquidation_factor = (
+        (1 - rushed_sale_discount) * (1 - closing_costs)
+        if not liquidation_assumption_errors
+        else np.nan
+    )
     fallback_events: set[tuple[str, str, str]] = set()
 
     for idx, row in out.loc[mask].iterrows():
@@ -70,16 +82,31 @@ def run_consumer(
                 record_out_of_scope(out_scope, row, scenario, "Consumer", level, "PD", ["fico_pd_lookup"], "missing_pd_lookup")
             continue
 
-        unstressed_lgd = max(balance - to_number(appraisal), 0.0)
+        unstressed_collateral_value = to_number(appraisal) * liquidation_factor
+        unstressed_lgd = (
+            max(balance - unstressed_collateral_value, 0.0)
+            if not is_missing(unstressed_collateral_value)
+            else np.nan
+        )
+        unstressed_el = (
+            base_pd * unstressed_lgd
+            if not is_missing(unstressed_lgd)
+            else np.nan
+        )
         out.at[idx, "consumer_fico"] = to_number(fico)
         out.at[idx, "consumer_appraised_value"] = to_number(appraisal)
+        out.at[idx, "consumer_collateral_value_unstressed"] = unstressed_collateral_value
         out.at[idx, "consumer_pd_unstressed"] = base_pd
         out.at[idx, "consumer_lgd_unstressed"] = unstressed_lgd
         out.at[idx, "consumer_lgd_ratio_unstressed"] = unstressed_lgd / balance if balance else np.nan
-        out.at[idx, "consumer_el_unstressed"] = base_pd * unstressed_lgd
+        out.at[idx, "consumer_el_unstressed"] = unstressed_el
         base_reserve = to_number(row.get(reserve_field), 0.0) if reserve_field_available else np.nan
-        qualitative_reserve = base_reserve - (base_pd * unstressed_lgd)
-        if not is_missing(qualitative_floor):
+        qualitative_reserve = (
+            base_reserve - unstressed_el
+            if not is_missing(base_reserve) and not is_missing(unstressed_el)
+            else np.nan
+        )
+        if not is_missing(qualitative_reserve) and not is_missing(qualitative_floor):
             qualitative_reserve = max(qualitative_reserve, qualitative_floor)
         out.at[idx, "consumer_cecl_reserve_base"] = base_reserve
         out.at[idx, "consumer_qualitative_reserve"] = qualitative_reserve
@@ -94,23 +121,43 @@ def run_consumer(
             )
             factor = to_number(factor_raw, np.nan)
             collateral_factor = to_number(collateral_raw, np.nan)
+            factor = targeted_parameter(
+                row, scenario, "Consumer", "pd_increase_factor", level, factor
+            )
+            collateral_factor = targeted_parameter(
+                row,
+                scenario,
+                "Consumer",
+                "collateral_value_factor",
+                level,
+                collateral_factor,
+            )
+            level_rushed_sale_discount = targeted_parameter(
+                row,
+                scenario,
+                "Consumer",
+                "rushed_sale_discount",
+                level,
+                rushed_sale_discount,
+            )
+            level_closing_costs = targeted_parameter(
+                row, scenario, "Consumer", "closing_costs", level, closing_costs
+            )
             _log_consumer_default(
                 exceptions, fallback_events, "pd_increase_factor", segment, level, factor_source
             )
             _log_consumer_default(
                 exceptions, fallback_events, "collateral_value_factor", segment, level, collateral_source
             )
-            rushed_sale_discount = to_number(config.get("rushed_sale_discount"), np.nan)
-            closing_costs = to_number(config.get("closing_costs"), np.nan)
             invalid_assumptions = []
+            if is_missing(level_rushed_sale_discount) or not 0 <= level_rushed_sale_discount <= 1:
+                invalid_assumptions.append("rushed_sale_discount")
+            if is_missing(level_closing_costs) or not 0 <= level_closing_costs <= 1:
+                invalid_assumptions.append("closing_costs")
             if is_missing(factor) or factor < 0:
                 invalid_assumptions.append("pd_increase_factor")
             if is_missing(collateral_factor) or collateral_factor < 0:
                 invalid_assumptions.append("collateral_value_factor")
-            if is_missing(rushed_sale_discount) or not 0 <= rushed_sale_discount <= 1:
-                invalid_assumptions.append("rushed_sale_discount")
-            if is_missing(closing_costs) or not 0 <= closing_costs <= 1:
-                invalid_assumptions.append("closing_costs")
             if invalid_assumptions:
                 out.at[idx, f"out_of_scope_{level}"] = True
                 record_out_of_scope(
@@ -139,7 +186,12 @@ def run_consumer(
             pd_value = max(0.0, min(base_pd * factor, float(config.get("pd_cap", 1.0))))
             # Stressed collateral value applies the scenario collateral factor
             # and global liquidation impacts before LGD is capped at zero.
-            stressed_value = to_number(appraisal) * collateral_factor * (1 - rushed_sale_discount) * (1 - closing_costs)
+            level_liquidation_factor = (
+                (1 - level_rushed_sale_discount) * (1 - level_closing_costs)
+            )
+            stressed_value = (
+                to_number(appraisal) * collateral_factor * level_liquidation_factor
+            )
             lgd = max(balance - stressed_value, 0.0)
             out.at[idx, f"consumer_pd_{level}"] = pd_value
             out.at[idx, f"consumer_stressed_collateral_value_{level}"] = stressed_value

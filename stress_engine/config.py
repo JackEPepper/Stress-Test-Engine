@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 import pandas as pd
 
-from .utils import deep_merge, hash_json, resolve_path
+from .utils import deep_merge, get_metric_cutoffs, hash_json, resolve_path, to_number
 
 
 _INCLUDE_KEY = "$include"
+_SUPPORTED_MODULES = ("CRE", "C&I", "Consumer")
+_DEFAULT_MODULE_ORDER = list(_SUPPORTED_MODULES)
 
 
 def load_scenario(paths: str | Path | Iterable[str | Path]) -> Tuple[Dict[str, Any], Path]:
@@ -105,11 +108,168 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         raise ValueError("Scenario stress_levels must contain unique, nonblank levels.")
     if any(not level.strip() for level in levels):
         raise ValueError("Scenario stress_levels cannot contain blank names.")
-    cre = scenario.get("modules", {}).get("CRE", {})
+    modules = scenario.get("modules", {})
+    _validate_module_order(scenario, modules)
+    _validate_overlays(scenario.get("overlays", {}))
+    cre = modules.get("CRE", {})
+    ci = modules.get("C&I", {})
+    nested_cutoff_paths = []
+    cre_tests = cre.get("tests", {}) if isinstance(cre, dict) else {}
+    if isinstance(cre_tests, dict):
+        nested_cutoff_paths.extend(
+            f"modules.CRE.tests.{test_name}.cutoffs"
+            for test_name, test_config in cre_tests.items()
+            if isinstance(test_config, dict) and "cutoffs" in test_config
+        )
+    if isinstance(ci, dict) and "cutoffs" in ci:
+        nested_cutoff_paths.append("modules.C&I.cutoffs")
+    if nested_cutoff_paths:
+        raise ValueError(
+            "Migration cutoffs must be defined only in the master scenario's "
+            f"top-level 'cutoffs' object; remove: {', '.join(nested_cutoff_paths)}."
+        )
     if cre and cre.get("enabled", True):
         cutoff = scenario.get("run", {}).get("cutoff_date")
         if cutoff is None or pd.isna(pd.to_datetime(cutoff, errors="coerce")):
             raise ValueError("An enabled CRE module requires a valid run.cutoff_date.")
+        get_metric_cutoffs(scenario, "dscr")
+        get_metric_cutoffs(scenario, "ltv")
+    if ci and ci.get("enabled", True):
+        get_metric_cutoffs(scenario, "fccr")
+    if scenario.get("targeted_stress"):
+        from .targeted import validate_targeted_config
+
+        validate_targeted_config(scenario)
+
+
+def _validate_module_order(
+    scenario: Dict[str, Any],
+    modules: Mapping[str, Any],
+) -> None:
+    """Require an executable order that cannot omit an enabled module."""
+    if not isinstance(modules, Mapping):
+        raise ValueError("Scenario modules must be a JSON object.")
+
+    unsupported_configs = [module for module in modules if module not in _SUPPORTED_MODULES]
+    if unsupported_configs:
+        names = ", ".join(repr(module) for module in unsupported_configs)
+        raise ValueError(f"Scenario modules contains unsupported module configurations: {names}.")
+
+    malformed_configs = [
+        module for module, config in modules.items() if not isinstance(config, Mapping)
+    ]
+    if malformed_configs:
+        raise ValueError(
+            "Every configured module must be a JSON object; invalid: "
+            f"{', '.join(str(module) for module in malformed_configs)}."
+        )
+
+    empty_configs = [module for module, config in modules.items() if not config]
+    if empty_configs:
+        raise ValueError(
+            "Every configured module must be a nonempty JSON object; invalid: "
+            f"{', '.join(str(module) for module in empty_configs)}."
+        )
+
+    invalid_enabled = [
+        module
+        for module, config in modules.items()
+        if "enabled" in config and not isinstance(config["enabled"], bool)
+    ]
+    if invalid_enabled:
+        raise ValueError(
+            "Configured module 'enabled' values must be JSON booleans; invalid: "
+            f"{', '.join(str(module) for module in invalid_enabled)}."
+        )
+
+    module_order = scenario.get("module_order", _DEFAULT_MODULE_ORDER)
+    if not isinstance(module_order, list) or not module_order:
+        raise ValueError("Scenario module_order must be a nonempty JSON list.")
+
+    unsupported = [
+        module
+        for module in module_order
+        if not isinstance(module, str) or module not in _SUPPORTED_MODULES
+    ]
+    if unsupported:
+        names = ", ".join(repr(module) for module in unsupported)
+        supported = ", ".join(_SUPPORTED_MODULES)
+        raise ValueError(
+            f"Scenario module_order contains unsupported modules: {names}. "
+            f"Supported modules: {supported}."
+        )
+
+    duplicates = list(
+        dict.fromkeys(
+            module
+            for module in module_order
+            if module_order.count(module) > 1
+        )
+    )
+    if duplicates:
+        raise ValueError(
+            "Scenario module_order must contain unique module names; duplicates: "
+            f"{', '.join(duplicates)}."
+        )
+
+    enabled_modules = [
+        module
+        for module in _SUPPORTED_MODULES
+        if modules.get(module) and modules[module].get("enabled", True)
+    ]
+    missing = [module for module in enabled_modules if module not in module_order]
+    if missing:
+        raise ValueError(
+            "Scenario module_order must include every enabled configured module "
+            f"exactly once; missing: {', '.join(missing)}."
+        )
+
+
+def _validate_overlays(overlays: Any) -> None:
+    """Require every enabled overlay to have executable source definitions."""
+    if not overlays:
+        return
+    if not isinstance(overlays, Mapping):
+        raise ValueError("Scenario overlays must be a JSON object keyed by portfolio name.")
+    for portfolio, config in overlays.items():
+        if not isinstance(config, Mapping) or not config:
+            raise ValueError(
+                f"Overlay '{portfolio}' must be a nonempty JSON object."
+            )
+        enabled = config.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"Overlay '{portfolio}' enabled must be a JSON boolean.")
+        if not enabled:
+            continue
+        sources = config.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError(
+                f"Enabled overlay '{portfolio}' must define a nonempty sources list."
+            )
+        total_weight = 0.0
+        for index, source in enumerate(sources):
+            if not isinstance(source, Mapping) or not str(source.get("name", "")).strip():
+                raise ValueError(
+                    f"Overlay '{portfolio}' sources[{index}] must be an object "
+                    "with a nonblank name."
+                )
+            raw_weight = source.get("weight", 1.0)
+            weight = to_number(raw_weight)
+            if (
+                isinstance(raw_weight, bool)
+                or not math.isfinite(weight)
+                or weight < 0
+            ):
+                raise ValueError(
+                    f"Overlay '{portfolio}' sources[{index}].weight must be "
+                    "a nonnegative finite number."
+                )
+            total_weight += weight
+        if total_weight <= 0:
+            raise ValueError(
+                f"Enabled overlay '{portfolio}' must have at least one "
+                "positive source weight."
+            )
 
 
 def output_dir_for(scenario: Dict[str, Any], base_dir: Path, override: str | Path | None = None) -> Path:

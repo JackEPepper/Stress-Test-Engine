@@ -85,6 +85,32 @@ def to_number(value: Any, default: float = np.nan) -> float:
         return default
 
 
+def get_metric_cutoffs(
+    scenario: Mapping[str, Any], metric: str
+) -> Mapping[str, Any]:
+    """Return a required master-scenario cutoff table for one metric."""
+    cutoff_tables = scenario.get("cutoffs")
+    if not isinstance(cutoff_tables, Mapping):
+        raise ValueError("Master scenario must define a 'cutoffs' JSON object.")
+    table = cutoff_tables.get(metric)
+    if not isinstance(table, Mapping):
+        raise ValueError(
+            f"Master scenario cutoffs.{metric} must be a JSON object."
+        )
+    required = ("special_mention", "substandard")
+    invalid = [
+        field
+        for field in required
+        if not math.isfinite(to_number(table.get(field), np.nan))
+    ]
+    if invalid:
+        raise ValueError(
+            f"Master scenario cutoffs.{metric} must define numeric values for: "
+            f"{', '.join(invalid)}."
+        )
+    return table
+
+
 def coerce_numeric_frame(df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFrame:
     """Coerce configured numeric columns after stripping common formatting."""
     out = df.copy()

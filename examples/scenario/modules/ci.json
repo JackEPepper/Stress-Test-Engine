@@ -9,11 +9,35 @@
       "cecl_portfolio_field": "ci_sector",
       "ebitda_reduction": {
         "default": {
-          "Pass": {
+          "1": {
             "S1": 0.1,
             "S2": 0.2
           },
-          "Special Mention": {
+          "2": {
+            "S1": 0.1,
+            "S2": 0.2
+          },
+          "3": {
+            "S1": 0.1,
+            "S2": 0.2
+          },
+          "4": {
+            "S1": 0.1,
+            "S2": 0.2
+          },
+          "5": {
+            "S1": 0.1,
+            "S2": 0.2
+          },
+          "6": {
+            "S1": 0.1,
+            "S2": 0.2
+          },
+          "7": {
+            "S1": 0.12,
+            "S2": 0.25
+          },
+          "8": {
             "S1": 0.12,
             "S2": 0.25
           }
@@ -22,10 +46,6 @@
       "interest_rate_stress": {
         "S1": 0.01,
         "S2": 0.02
-      },
-      "cutoffs": {
-        "special_mention": 1.15,
-        "substandard": 1.0
       },
       "sectors": {
         "Sponsor and Specialty": {

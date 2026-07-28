@@ -9,9 +9,9 @@ from types import SimpleNamespace
 import pandas as pd
 
 from stress_engine.borrower import build_borrowers, build_source_reconciliation, enrich_borrowers
-from stress_engine.config import load_scenario
-from stress_engine.config_tool import batch_config_from_csv
+from stress_engine.config import load_scenario, validate_scenario
 from stress_engine.io import load_inputs, read_table
+from stress_engine.tagging import assign_primary_modules
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +19,18 @@ SCENARIO = ROOT / "examples" / "scenario.json"
 
 
 class ScenarioConfigTest(unittest.TestCase):
+    @staticmethod
+    def _minimal_scenario() -> dict:
+        return {
+            "inputs": {"identity": {}},
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "balance_field": "balance",
+            },
+            "tags": {},
+            "modules": {},
+        }
+
     def test_example_manifest_loads_all_fragments(self):
         scenario, base_dir = load_scenario(SCENARIO)
 
@@ -27,7 +39,284 @@ class ScenarioConfigTest(unittest.TestCase):
         self.assertEqual(set(scenario["modules"]), {"CRE", "C&I", "Consumer"})
         self.assertEqual(len(scenario["tags"]), 17)
         self.assertNotIn("$include", scenario)
-        self.assertEqual(len(scenario["_metadata"]["scenario_files"]), 11)
+        self.assertEqual(len(scenario["_metadata"]["scenario_files"]), 9)
+
+    def test_borrower_and_cecl_config_are_consolidated(self):
+        manifest = json.loads(SCENARIO.read_text(encoding="utf-8"))
+        inputs_fragment = json.loads(
+            (SCENARIO.parent / "scenario" / "inputs.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertIn("borrower", inputs_fragment)
+        self.assertIn("cecl", manifest)
+        self.assertNotIn("scenario/borrower.json", manifest["$include"])
+        self.assertNotIn("scenario/cecl.json", manifest["$include"])
+        self.assertFalse((SCENARIO.parent / "scenario" / "borrower.json").exists())
+        self.assertFalse((SCENARIO.parent / "scenario" / "cecl.json").exists())
+
+        scenario, _ = load_scenario(SCENARIO)
+        self.assertEqual(scenario["borrower"], inputs_fragment["borrower"])
+        self.assertEqual(scenario["cecl"], manifest["cecl"])
+
+    def test_migration_cutoffs_live_only_in_master_manifest(self):
+        manifest = json.loads(SCENARIO.read_text(encoding="utf-8"))
+        cre_fragment = json.loads(
+            (SCENARIO.parent / "scenario" / "modules" / "cre.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        ci_fragment = json.loads(
+            (SCENARIO.parent / "scenario" / "modules" / "ci.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        expected = {
+            "dscr": {"special_mention": 1.15, "substandard": 1.0},
+            "fccr": {"special_mention": 1.15, "substandard": 1.0},
+            "ltv": {"special_mention": 0.75, "substandard": 0.9},
+        }
+
+        self.assertEqual(manifest["cutoffs"], expected)
+        self.assertNotIn("cutoffs", ci_fragment["modules"]["C&I"])
+        for test_config in cre_fragment["modules"]["CRE"]["tests"].values():
+            self.assertNotIn("cutoffs", test_config)
+
+        scenario, _ = load_scenario(SCENARIO)
+        self.assertEqual(scenario["cutoffs"], expected)
+
+    def test_nested_commercial_cutoffs_are_rejected(self):
+        scenario = {
+            "inputs": {"identity": {}},
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "balance_field": "balance",
+            },
+            "tags": {},
+            "cutoffs": {
+                "fccr": {"special_mention": 1.15, "substandard": 1.0}
+            },
+            "modules": {
+                "C&I": {
+                    "cutoffs": {
+                        "special_mention": 1.15,
+                        "substandard": 1.0,
+                    }
+                }
+            },
+        }
+
+        with self.assertRaisesRegex(
+            ValueError, r"remove: modules\.C&I\.cutoffs"
+        ):
+            validate_scenario(scenario)
+
+    def test_omitted_module_order_retains_default_behavior(self):
+        scenario = self._minimal_scenario()
+        scenario["modules"] = {
+            "Consumer": {"enabled": True, "eligible_tags": ["Consumer Eligible"]},
+            "CRE": {"enabled": True, "eligible_tags": ["CRE Eligible"]},
+        }
+        scenario["run"] = {"cutoff_date": "2026-01-01"}
+        scenario["cutoffs"] = {
+            "dscr": {"special_mention": 1.15, "substandard": 1.0},
+            "ltv": {"special_mention": 0.75, "substandard": 0.9},
+        }
+
+        validate_scenario(scenario)
+        assigned = assign_primary_modules(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "tag_consumer_eligible": True,
+                        "tag_cre_eligible": True,
+                    }
+                ]
+            ),
+            scenario,
+        )
+
+        self.assertEqual(assigned.at[0, "primary_module"], "CRE")
+
+    def test_disabled_module_cannot_take_primary_priority(self):
+        scenario = self._minimal_scenario()
+        scenario["modules"] = {
+            "CRE": {"enabled": False, "eligible_tags": ["Shared Eligible"]},
+            "Consumer": {"enabled": True, "eligible_tags": ["Shared Eligible"]},
+        }
+
+        validate_scenario(scenario)
+        assigned = assign_primary_modules(
+            pd.DataFrame(
+                [{"borrower_id": "B1", "tag_shared_eligible": True}]
+            ),
+            scenario,
+        )
+
+        self.assertEqual(assigned.at[0, "primary_module"], "Consumer")
+        self.assertEqual(assigned.at[0, "eligible_modules"], "Consumer")
+
+    def test_module_order_must_be_a_nonempty_list(self):
+        for module_order in (None, [], "Consumer"):
+            with self.subTest(module_order=module_order):
+                scenario = self._minimal_scenario()
+                scenario["module_order"] = module_order
+
+                with self.assertRaisesRegex(
+                    ValueError, "module_order must be a nonempty JSON list"
+                ):
+                    validate_scenario(scenario)
+
+    def test_module_order_rejects_unsupported_and_duplicate_names(self):
+        invalid_orders = [
+            (["Consumer", "Unknown"], "contains unsupported modules"),
+            (["Consumer", "Consumer"], "must contain unique module names"),
+        ]
+        for module_order, message in invalid_orders:
+            with self.subTest(module_order=module_order):
+                scenario = self._minimal_scenario()
+                scenario["module_order"] = module_order
+
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_scenario(scenario)
+
+    def test_module_order_cannot_skip_an_enabled_configured_module(self):
+        scenario = self._minimal_scenario()
+        scenario["modules"]["Consumer"] = {"enabled": True}
+        scenario["module_order"] = ["CRE"]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "include every enabled configured module exactly once; missing: Consumer",
+        ):
+            validate_scenario(scenario)
+
+    def test_module_order_may_omit_a_disabled_configured_module(self):
+        scenario = self._minimal_scenario()
+        scenario["modules"]["Consumer"] = {"enabled": False}
+        scenario["module_order"] = ["CRE"]
+
+        validate_scenario(scenario)
+
+    def test_module_configuration_rejects_unknown_and_malformed_modules(self):
+        cases = [
+            (
+                {"TypoModule": {"enabled": True}},
+                "unsupported module configurations",
+            ),
+            ({"Consumer": True}, "configured module must be a JSON object"),
+            ({"Consumer": {}}, "configured module must be a nonempty JSON object"),
+            (
+                {"Consumer": {"enabled": "false"}},
+                "'enabled' values must be JSON booleans",
+            ),
+        ]
+        for modules, message in cases:
+            with self.subTest(modules=modules):
+                scenario = self._minimal_scenario()
+                scenario["modules"] = modules
+
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_scenario(scenario)
+
+        scenario = self._minimal_scenario()
+        scenario["modules"] = []
+        with self.assertRaisesRegex(ValueError, "modules must be a JSON object"):
+            validate_scenario(scenario)
+
+    def test_input_module_fallback_requires_an_enabled_configured_module(self):
+        scenario = self._minimal_scenario()
+        scenario["modules"] = {"Consumer": {"enabled": False}}
+        validate_scenario(scenario)
+
+        for module_name in ("Consumer", "Consmer"):
+            with self.subTest(module_name=module_name):
+                with self.assertRaisesRegex(
+                    ValueError, "not enabled and configured"
+                ):
+                    assign_primary_modules(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "borrower_id": "B1",
+                                    "model_module": module_name,
+                                }
+                            ]
+                        ),
+                        scenario,
+                    )
+
+    def test_preexisting_primary_module_is_recomputed(self):
+        scenario = self._minimal_scenario()
+        assigned = assign_primary_modules(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "primary_module": "Consmer",
+                        "model_module": pd.NA,
+                    }
+                ]
+            ),
+            scenario,
+        )
+
+        self.assertTrue(pd.isna(assigned.at[0, "primary_module"]))
+
+    def test_overlay_routing_requires_an_enabled_executable_portfolio(self):
+        scenario = self._minimal_scenario()
+        scenario["overlays"] = {
+            "EF": {
+                "enabled": True,
+                "sources": [{"name": "C&I", "weight": 1.0}],
+            }
+        }
+        validate_scenario(scenario)
+
+        valid = assign_primary_modules(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "model_module": "Overlay",
+                        "model_portfolio": "EF",
+                    }
+                ]
+            ),
+            scenario,
+        )
+        self.assertEqual(valid.at[0, "primary_module"], "Overlay")
+
+        with self.assertRaisesRegex(ValueError, "not enabled and configured"):
+            assign_primary_modules(
+                pd.DataFrame(
+                    [
+                        {
+                            "borrower_id": "B2",
+                            "model_module": "Overlay",
+                            "model_portfolio": "EFTypo",
+                        }
+                    ]
+                ),
+                scenario,
+            )
+
+        invalid = self._minimal_scenario()
+        invalid["overlays"] = {"EF": {"enabled": True}}
+        with self.assertRaisesRegex(ValueError, "nonempty sources list"):
+            validate_scenario(invalid)
+
+        invalid = self._minimal_scenario()
+        invalid["overlays"] = {
+            "EF": {
+                "enabled": True,
+                "sources": [{"name": "C&I", "weight": 0}],
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "at least one positive"):
+            validate_scenario(invalid)
 
     def test_example_aliases_import_the_intended_columns(self):
         scenario, base_dir = load_scenario(SCENARIO)
@@ -76,29 +365,6 @@ class ScenarioConfigTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "include cycle"):
                 load_scenario(directory / "a.json")
-
-    def test_batch_variable_csv_converts_to_engine_shape(self):
-        payload = batch_config_from_csv(
-            ROOT / "examples" / "scenario_variables.csv",
-            output_directory="outputs/example_batch",
-            max_scenarios=20,
-        )
-
-        batch = payload["scenario_batch"]
-        self.assertEqual(batch["mode"], "grid")
-        self.assertEqual(batch["max_scenarios"], 20)
-        self.assertEqual(batch["variables"][0]["range"], {"start": 0.03, "stop": 0.07, "step": 0.02})
-        self.assertEqual(batch["variables"][1]["values"], [1.25, 1.75])
-
-    def test_committed_batch_json_matches_the_variable_csv(self):
-        generated = batch_config_from_csv(
-            ROOT / "examples" / "scenario_variables.csv",
-            output_directory="outputs/example_batch",
-            max_scenarios=20,
-        )
-        committed = json.loads((ROOT / "examples" / "scenario_batch.json").read_text(encoding="utf-8"))
-
-        self.assertEqual(committed, generated)
 
     def test_source_column_aliases_preserve_canonical_engine_names(self):
         with tempfile.TemporaryDirectory() as tmp:

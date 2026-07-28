@@ -15,7 +15,6 @@ dependencies = [
 
 [project.scripts]
 credit-stress = "stress_engine.cli:main"
-credit-stress-config = "stress_engine.config_tool:main"
 
 [tool.setuptools.packages.find]
 include = ["stress_engine*"]

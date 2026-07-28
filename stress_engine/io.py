@@ -318,10 +318,34 @@ def metadata_for_inputs(loaded: Mapping[str, LoadedTable]) -> List[Dict[str, Any
 def write_csv(df: pd.DataFrame, path: Path, sort_by: List[str] | None = None) -> None:
     """Write one CSV output with optional stable sorting."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    frame = sort_frame(df, sort_by or [])
+    frame = _spreadsheet_safe_frame(sort_frame(df, sort_by or []))
     temporary = path.with_name(f".{path.name}.tmp")
     frame.to_csv(temporary, index=False)
     temporary.replace(path)
+
+
+def _spreadsheet_safe_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return an export-only copy with spreadsheet formulas neutralized."""
+    columns: List[pd.Series] = []
+    for position in range(df.shape[1]):
+        series = df.iloc[:, position].copy()
+        if (
+            pd.api.types.is_object_dtype(series.dtype)
+            or pd.api.types.is_string_dtype(series.dtype)
+            or isinstance(series.dtype, pd.CategoricalDtype)
+        ):
+            series = series.map(_neutralize_spreadsheet_formula)
+        columns.append(series)
+    frame = pd.concat(columns, axis=1) if columns else df.copy()
+    frame.columns = [_neutralize_spreadsheet_formula(column) for column in df.columns]
+    return frame
+
+
+def _neutralize_spreadsheet_formula(value: Any) -> Any:
+    """Prefix formula-like strings so spreadsheet programs treat them as text."""
+    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+        return f"'{value}"
+    return value
 
 
 def write_json(data: Mapping[str, Any], path: Path) -> None:

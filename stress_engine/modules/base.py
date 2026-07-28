@@ -9,7 +9,7 @@ import pandas as pd
 
 from ..exceptions import record_exception
 from ..tagging import model_eligible_tag_names
-from ..utils import as_list, risk_bucket_from_rating, stable_name
+from ..utils import as_list, is_missing, risk_bucket_from_rating, stable_name, to_number
 
 
 def initialize_results(
@@ -78,7 +78,30 @@ def module_population(df: pd.DataFrame, scenario: Mapping[str, Any], module_conf
     module_name = module_config.get("_module_name")
     if module_name and "primary_module" in df.columns:
         mask &= df["primary_module"].astype(str) == str(module_name)
+    if scenario.get("_targeted_mode") and "_targeted_active" in df.columns:
+        mask &= df["_targeted_active"].fillna(False).astype(bool)
     return mask.fillna(False)
+
+
+def targeted_override_column(module: str, parameter: str, level: str) -> str:
+    """Return the internal loan-level effective-assumption column name."""
+    return f"_targeted_{stable_name(module)}_{stable_name(parameter)}_{stable_name(level)}"
+
+
+def targeted_parameter(
+    row: Mapping[str, Any],
+    scenario: Mapping[str, Any],
+    module: str,
+    parameter: str,
+    level: str,
+    baseline: Any,
+) -> float:
+    """Use a resolved targeted assumption when present, otherwise the baseline."""
+    if not scenario.get("_targeted_mode"):
+        return to_number(baseline)
+    column = targeted_override_column(module, parameter, level)
+    value = row.get(column)
+    return to_number(baseline) if is_missing(value) else to_number(value)
 
 
 def record_out_of_scope(
@@ -96,8 +119,7 @@ def record_out_of_scope(
     borrower_id = borrower_config.get("borrower_id_field", "borrower_id")
     portfolio_field = borrower_config.get("portfolio_field", "portfolio")
     for field in fields:
-        rows.append(
-            {
+        detail = {
                 "borrower_id": borrower.get(borrower_id, np.nan),
                 "portfolio": borrower.get(portfolio_field, np.nan),
                 "module": module_name,
@@ -106,7 +128,11 @@ def record_out_of_scope(
                 "field": field,
                 "reason": reason,
             }
-        )
+        if scenario.get("_targeted_mode"):
+            loan_id = borrower_config.get("loan_id_field", "loan_id")
+            detail["loan_id"] = borrower.get(loan_id, np.nan)
+            detail["scenario_variant"] = scenario.get("_scenario_variant", "")
+        rows.append(detail)
 
 
 def missing_fields(row: Mapping[str, Any], fields: Iterable[str]) -> List[str]:

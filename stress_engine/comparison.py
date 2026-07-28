@@ -213,9 +213,18 @@ def _cecl_impact_rows(
     """Calculate CECL reserve/ratio deltas by portfolio and stress level."""
     if previous_cecl.empty or changed_cecl.empty:
         return []
-    prev = previous_cecl[previous_cecl["bucket"] == "Total"]
-    curr = changed_cecl[changed_cecl["bucket"] == "Total"]
-    merged = prev.merge(curr, on=["portfolio", "stress_level", "bucket"], how="outer", suffixes=("_previous", "_changed"))
+    prev = previous_cecl[previous_cecl["bucket"] == "Total"].copy()
+    curr = changed_cecl[changed_cecl["bucket"] == "Total"].copy()
+    variant_aware = "scenario_variant" in prev.columns or "scenario_variant" in curr.columns
+    if variant_aware:
+        if "scenario_variant" not in prev.columns:
+            prev["scenario_variant"] = "baseline"
+        if "scenario_variant" not in curr.columns:
+            curr["scenario_variant"] = "baseline"
+    keys = ["portfolio", "stress_level", "bucket"]
+    if variant_aware:
+        keys.insert(0, "scenario_variant")
+    merged = prev.merge(curr, on=keys, how="outer", suffixes=("_previous", "_changed"))
     rows = []
     for _, row in merged.iterrows():
         previous_status = row.get("cecl_reserve_status_previous", "")
@@ -229,6 +238,11 @@ def _cecl_impact_rows(
                     "old_value": _stringify(old_value),
                     "new_value": _stringify(new_value),
                     "portfolio": row.get("portfolio"),
+                    **(
+                        {"scenario_variant": row.get("scenario_variant")}
+                        if variant_aware
+                        else {}
+                    ),
                     "stress_level": row.get("stress_level"),
                     "metric": "cecl_reserve_status",
                     "previous_value": previous_status,
@@ -262,6 +276,11 @@ def _cecl_impact_rows(
                     "old_value": _stringify(old_value),
                     "new_value": _stringify(new_value),
                     "portfolio": row.get("portfolio"),
+                    **(
+                        {"scenario_variant": row.get("scenario_variant")}
+                        if variant_aware
+                        else {}
+                    ),
                     "stress_level": row.get("stress_level"),
                     "metric": metric,
                     "previous_value": old_metric,

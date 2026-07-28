@@ -9,7 +9,7 @@ import pandas as pd
 
 from .exceptions import record_exception
 from .io import LoadedTable
-from .utils import as_list, compare_values, condition_fields, stable_name, to_number
+from .utils import as_list, compare_values, condition_fields, is_missing, stable_name, to_number
 
 
 def apply_tags(
@@ -395,10 +395,15 @@ def assign_primary_modules(
     exceptions = exceptions if exceptions is not None else []
     result = df.copy()
     modules = scenario.get("modules", {})
-    priority = [str(item) for item in scenario.get("module_order", list(modules))]
+    priority = [
+        str(item)
+        for item in scenario.get("module_order", ["CRE", "C&I", "Consumer"])
+    ]
     priority_rank = {name: idx for idx, name in enumerate(priority)}
     module_specs = []
     for module_name, config in modules.items():
+        if not config.get("enabled", True):
+            continue
         module_specs.append(
             {
                 "name": str(module_name),
@@ -407,13 +412,17 @@ def assign_primary_modules(
             }
         )
     module_specs.sort(key=lambda item: (item["rank"], item["name"]))
+    enabled_modules = {spec["name"] for spec in module_specs}
+    routable_modules = set(enabled_modules)
+    if scenario.get("overlays"):
+        routable_modules.add("Overlay")
     result["eligible_modules"] = ""
-    if "primary_module" not in result.columns:
-        result["primary_module"] = pd.Series(pd.NA, index=result.index, dtype=object)
-    else:
-        result["primary_module"] = result["primary_module"].astype(object)
+    # ``primary_module`` is an engine-derived routing decision. Never trust a
+    # same-named input column from a prior run or source file.
+    result["primary_module"] = pd.Series(pd.NA, index=result.index, dtype=object)
 
     borrower_cfg = scenario.get("borrower", {})
+    borrower_id_field = borrower_cfg.get("borrower_id_field", "borrower_id")
     module_field = borrower_cfg.get("module_field", "model_module")
     portfolio_field = borrower_cfg.get("portfolio_field", "model_portfolio")
     cecl = scenario.get("cecl", {})
@@ -438,8 +447,33 @@ def assign_primary_modules(
                 active.append(spec)
         if not active:
             existing_module = row.get(module_field)
-            if pd.notna(existing_module):
-                result.at[idx, "primary_module"] = existing_module
+            if not is_missing(existing_module) and str(existing_module).strip():
+                existing_name = str(existing_module).strip()
+                if existing_name not in routable_modules:
+                    raise ValueError(
+                        f"Input module field '{module_field}' references module "
+                        f"'{existing_name}' that is not enabled and configured "
+                        f"(borrower_id={row.get(borrower_id_field)})."
+                    )
+                if existing_name == "Overlay":
+                    overlay_portfolios = {
+                        str(portfolio)
+                        for portfolio, config in scenario.get("overlays", {}).items()
+                        if config.get("enabled", True)
+                    }
+                    existing_portfolio = row.get(portfolio_field)
+                    portfolio_name = (
+                        ""
+                        if is_missing(existing_portfolio)
+                        else str(existing_portfolio).strip()
+                    )
+                    if portfolio_name not in overlay_portfolios:
+                        raise ValueError(
+                            f"Input module field '{module_field}' routes borrower "
+                            f"'{row.get(borrower_id_field)}' to Overlay portfolio "
+                            f"'{portfolio_name}', which is not enabled and configured."
+                        )
+                result.at[idx, "primary_module"] = existing_name
             existing_portfolio = row.get(portfolio_field)
             if pd.notna(existing_portfolio):
                 result.at[idx, cecl_portfolio_field] = existing_portfolio

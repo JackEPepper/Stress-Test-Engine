@@ -94,6 +94,10 @@ class SampleScenarioRunTest(unittest.TestCase):
                     "use_calculated_cash_paid_for_interest"
                 ]
             )
+            self.assertEqual(
+                set(scenario["modules"]["C&I"]["ebitda_reduction"]["default"]),
+                {str(brg) for brg in range(1, 9)},
+            )
 
             borrowers = result["borrowers"]
             self.assertEqual(len(borrowers), 15)
@@ -192,6 +196,15 @@ class SampleScenarioRunTest(unittest.TestCase):
             )
             self.assertEqual(float(abl_result["ci_debt_service_S1"]), 63500.0)
 
+            for borrower_id in ("B014", "B015"):
+                grade_eight = result["results"].loc[
+                    result["results"]["borrower_id"] == borrower_id
+                ].iloc[0]
+                self.assertFalse(pd.isna(grade_eight["ci_fccr_S1"]))
+                self.assertFalse(pd.isna(grade_eight["ci_fccr_S2"]))
+                self.assertEqual(grade_eight["stressed_bucket_S1"], "Substandard")
+                self.assertEqual(grade_eight["stressed_bucket_S2"], "Substandard")
+
             consumer = result["reports"]["consumer_summary"]
             s1 = float(consumer.loc[consumer["stress_level"] == "S1", "expected_loss"].iloc[0])
             s2 = float(consumer.loc[consumer["stress_level"] == "S2", "expected_loss"].iloc[0])
@@ -269,6 +282,55 @@ class SampleScenarioRunTest(unittest.TestCase):
         self.assertIn("Retail", set(cecl["portfolio"]))
         retail_rows = cecl[(cecl["portfolio"] == "Retail") & (cecl["bucket"] == "Total")]
         self.assertFalse(retail_rows.empty)
+
+    def test_consumer_expected_loss_components_roll_into_cecl_totals(self):
+        scenario, base_dir = load_scenario(SCENARIO)
+        scenario["modules"]["Consumer"]["cecl_portfolio_rollup"] = "Retail Consumer"
+        scenario["cecl"]["portfolios"] = {}
+        result = StressEngine(scenario, base_dir).run(
+            write_outputs=False,
+            run_comparison=False,
+        )
+
+        consumer_summary = result["reports"]["consumer_summary"].set_index(
+            "stress_level"
+        )
+        cecl = result["reports"]["cecl_summary"]
+        consumer_cecl = cecl[
+            (cecl["portfolio"] == "Retail Consumer")
+            & (cecl["bucket"] == "Total")
+        ].set_index("stress_level")
+
+        self.assertEqual(set(consumer_cecl["method"]), {"expected_loss"})
+        for level in ("Base", "S1", "S2"):
+            quantitative = float(consumer_summary.at[level, "expected_loss"])
+            qualitative = float(
+                consumer_summary.at[level, "qualitative_reserve"]
+            )
+            self.assertAlmostEqual(
+                float(consumer_cecl.at[level, "proforma_cecl_reserve"]),
+                quantitative + qualitative,
+            )
+
+            portfolio_totals = cecl[
+                (cecl["stress_level"] == level)
+                & (cecl["bucket"] == "Total")
+                & (cecl["portfolio"] != "Aggregate")
+            ]
+            aggregate = cecl[
+                (cecl["portfolio"] == "Aggregate")
+                & (cecl["stress_level"] == level)
+                & (cecl["bucket"] == "Total")
+            ].iloc[0]
+            self.assertAlmostEqual(
+                float(aggregate["proforma_cecl_reserve"]),
+                float(
+                    pd.to_numeric(
+                        portfolio_totals["proforma_cecl_reserve"],
+                        errors="raise",
+                    ).sum()
+                ),
+            )
 
     def test_overlay_source_weights_change_tagged_source_ratios(self):
         scenario, base_dir = load_scenario(SCENARIO)

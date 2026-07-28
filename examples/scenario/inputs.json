@@ -11,6 +11,7 @@
         "subsector": "subsector",
         "tag_hint": "tag_hint",
         "tag_hint_2": "tag_hint_2",
+        "naics_code": "naics_code",
         "risk_rating": "risk_rating",
         "maturity_date": "maturity_date",
         "outstanding_balance": "outstanding_balance",
@@ -274,5 +275,18 @@
         ]
       }
     }
+  },
+  "borrower": {
+    "borrower_id_field": "borrower_id",
+    "loan_id_field": "loan_id",
+    "portfolio_field": "model_portfolio",
+    "module_field": "model_module",
+    "balance_field": "outstanding_balance",
+    "sum_fields": [
+      "outstanding_balance",
+      "cecl_reserve"
+    ],
+    "risk_rating_field": "risk_rating",
+    "maturity_date_field": "maturity_date"
   }
 }

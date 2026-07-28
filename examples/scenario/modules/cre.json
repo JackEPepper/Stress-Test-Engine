@@ -50,10 +50,6 @@
               "S2": 0.15
             }
           },
-          "cutoffs": {
-            "special_mention": 1.15,
-            "substandard": 1.0
-          },
           "acceptable_range": [
             0.2,
             5.0
@@ -73,10 +69,6 @@
               "S1": 25,
               "S2": 25
             }
-          },
-          "cutoffs": {
-            "special_mention": 1.15,
-            "substandard": 1.0
           }
         },
         "ltv": {
@@ -86,10 +78,6 @@
               "S1": 0.075,
               "S2": 0.085
             }
-          },
-          "cutoffs": {
-            "special_mention": 0.75,
-            "substandard": 0.9
           }
         }
       }

@@ -72,7 +72,14 @@ def main(argv: list[str] | None = None) -> int:
         run_comparison=not args.no_comparison,
     )
     outputs = scenario.get("outputs", {}).get("directory", "outputs/latest") if not args.output_dir else args.output_dir
-    print(f"Completed stress run with {len(result['results'])} borrowers.")
+    if "variant_results" in result:
+        variant_count = result["variant_results"]["scenario_variant"].nunique()
+        print(
+            f"Completed targeted stress run with {len(result['results'])} loans "
+            f"in primary variant and {variant_count} variants."
+        )
+    else:
+        print(f"Completed stress run with {len(result['results'])} borrowers.")
     if not args.no_write:
         print(f"Outputs written to: {Path(outputs).resolve() if Path(outputs).is_absolute() else (base_dir / outputs).resolve()}")
     return 0

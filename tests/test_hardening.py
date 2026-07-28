@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,9 +12,11 @@ import pandas as pd
 from stress_engine.borrower import build_borrowers
 from stress_engine.comparison import _cecl_impact_rows
 from stress_engine.config import load_scenario
-from stress_engine.engine import StressEngine
+from stress_engine.engine import OUTPUT_MANIFEST_KIND, StressEngine
+from stress_engine.io import write_csv
 from stress_engine.modules.ci import run_ci
 from stress_engine.modules.consumer import run_consumer
+from stress_engine.reporting import build_consumer_summary
 from stress_engine.tagging import evaluate_conditions
 from stress_engine.utils import to_number
 
@@ -94,16 +97,19 @@ class HardeningRegressionTest(unittest.TestCase):
     def test_unconfigured_ci_sector_uses_logged_canonical_fallback(self):
         scenario = {
             "stress_levels": ["S1"],
+            "cutoffs": {
+                "fccr": {"special_mention": 1.15, "substandard": 1.0}
+            },
             "borrower": {
                 "borrower_id_field": "borrower_id",
                 "portfolio_field": "portfolio",
+                "risk_rating_field": "risk_rating",
             },
             "modules": {
                 "C&I": {
                     "sector_field": "ci_sector",
-                    "ebitda_reduction": {"default": {"Pass": {"S1": 0.1}}},
+                    "ebitda_reduction": {"default": {"6": {"S1": 0.1}}},
                     "interest_rate_stress": {"S1": 0.01},
-                    "cutoffs": {"special_mention": 1.15, "substandard": 1.0},
                     "sectors": {},
                 }
             },
@@ -115,6 +121,7 @@ class HardeningRegressionTest(unittest.TestCase):
                     "portfolio": "C&I",
                     "primary_module": "C&I",
                     "module_applied": "",
+                    "risk_rating": 6,
                     "base_bucket": "Pass",
                     "stressed_bucket_S1": "Pass",
                     "out_of_scope_S1": False,
@@ -139,19 +146,209 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertTrue(out_of_scope.empty)
         self.assertIn("CI_SECTOR_DEFAULT_USED", {row["code"] for row in exceptions})
 
-    def test_abl_calculated_cash_interest_and_fallbacks(self):
+    def test_ci_brg_reductions_cover_one_through_eight_and_cap_higher_grades(self):
+        reductions = {
+            str(brg): {"S1": brg / 100.0}
+            for brg in range(1, 9)
+        }
         scenario = {
             "stress_levels": ["S1"],
+            "cutoffs": {
+                "fccr": {"special_mention": 1.15, "substandard": 1.0}
+            },
             "borrower": {
                 "borrower_id_field": "borrower_id",
                 "portfolio_field": "portfolio",
+                "risk_rating_field": "brg",
             },
             "modules": {
                 "C&I": {
                     "sector_field": "ci_sector",
-                    "ebitda_reduction": {"default": {"Pass": {"S1": 0.0}}},
+                    "ebitda_reduction": {"default": reductions},
                     "interest_rate_stress": {"S1": 0.0},
-                    "cutoffs": {"special_mention": 1.15, "substandard": 1.0},
+                    "sectors": {
+                        "Test Sector": {
+                            "principal_field": "principal_repayments_paid",
+                        }
+                    },
+                }
+            },
+        }
+        rows = []
+        for brg in [*range(1, 9), 12]:
+            base_bucket = (
+                "Pass"
+                if brg < 7
+                else "Special Mention"
+                if brg == 7
+                else "Substandard"
+            )
+            rows.append(
+                {
+                    "borrower_id": f"CI-{brg}",
+                    "portfolio": "C&I",
+                    "primary_module": "C&I",
+                    "module_applied": "",
+                    "brg": brg,
+                    "base_bucket": base_bucket,
+                    "stressed_bucket_S1": base_bucket,
+                    "out_of_scope_S1": False,
+                    "ci_sector": "Test Sector",
+                    "ebitda": 100.0,
+                    "cash_taxes": 0.0,
+                    "cash_distribution": 0.0,
+                    "cash_management_fees": 0.0,
+                    "unfinanced_capex": 0.0,
+                    "global_total_outstanding": 0.0,
+                    "cash_paid_for_interest": 10.0,
+                    "principal_repayments_paid": 0.0,
+                }
+            )
+
+        stressed, out_of_scope = run_ci(pd.DataFrame(rows), scenario, [])
+        stressed = stressed.set_index("borrower_id")
+
+        self.assertTrue(out_of_scope.empty)
+        for brg in range(1, 9):
+            self.assertAlmostEqual(
+                float(stressed.at[f"CI-{brg}", "ci_available_cash_flow_S1"]),
+                100.0 - brg,
+            )
+        self.assertEqual(
+            float(stressed.at["CI-12", "ci_available_cash_flow_S1"]),
+            float(stressed.at["CI-8", "ci_available_cash_flow_S1"]),
+        )
+        for borrower_id in ("CI-8", "CI-12"):
+            self.assertFalse(pd.isna(stressed.at[borrower_id, "ci_fccr_S1"]))
+            self.assertEqual(
+                stressed.at[borrower_id, "stressed_bucket_S1"],
+                "Substandard",
+            )
+
+    def test_ci_invalid_brgs_are_data_errors_not_assumption_errors(self):
+        scenario = {
+            "stress_levels": ["S1"],
+            "cutoffs": {
+                "fccr": {"special_mention": 1.15, "substandard": 1.0}
+            },
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "portfolio_field": "portfolio",
+                "risk_rating_field": "brg",
+            },
+            "modules": {
+                "C&I": {
+                    "sector_field": "ci_sector",
+                    "ebitda_reduction": {
+                        "default": {
+                            "1": {"S1": 0.1},
+                            "8": {"S1": 0.2},
+                            # A valid BRG without its own key must not fall
+                            # back to a bucket-named assumption.
+                            "Pass": {"S1": 0.3},
+                        }
+                    },
+                    "interest_rate_stress": {"S1": 0.0},
+                    "sectors": {
+                        "Test Sector": {
+                            "principal_field": "principal_repayments_paid",
+                        }
+                    },
+                }
+            },
+        }
+        base_row = {
+            "portfolio": "C&I",
+            "primary_module": "C&I",
+            "module_applied": "",
+            "stressed_bucket_S1": "Pass",
+            "out_of_scope_S1": False,
+            "ci_sector": "Test Sector",
+            "ebitda": 100.0,
+            "cash_taxes": 0.0,
+            "cash_distribution": 0.0,
+            "cash_management_fees": 0.0,
+            "unfinanced_capex": 0.0,
+            "global_total_outstanding": 0.0,
+            "cash_paid_for_interest": 10.0,
+            "principal_repayments_paid": 0.0,
+        }
+        invalid_brgs = [
+            ("CI-BRG-MISSING", np.nan, "Unknown"),
+            ("CI-BRG-ZERO", 0, "Pass"),
+            ("CI-BRG-FRACTIONAL", 7.5, "Substandard"),
+            ("CI-BRG-INFINITE", np.inf, "Substandard"),
+        ]
+        rows = [
+            {
+                **base_row,
+                "borrower_id": borrower_id,
+                "brg": brg,
+                "base_bucket": base_bucket,
+            }
+            for borrower_id, brg, base_bucket in invalid_brgs
+        ]
+        rows.append(
+            {
+                **base_row,
+                "borrower_id": "CI-BRG-2-NOT-CONFIGURED",
+                "brg": 2,
+                "base_bucket": "Pass",
+            }
+        )
+        exceptions = []
+
+        stressed, out_of_scope = run_ci(pd.DataFrame(rows), scenario, exceptions)
+
+        self.assertTrue(stressed["out_of_scope_S1"].astype(bool).all())
+        invalid_ids = {borrower_id for borrower_id, _, _ in invalid_brgs}
+        invalid_detail = out_of_scope[
+            out_of_scope["borrower_id"].isin(invalid_ids)
+        ]
+        self.assertEqual(set(invalid_detail["field"]), {"brg"})
+        self.assertEqual(set(invalid_detail["reason"]), {"missing_or_invalid_brg"})
+        invalid_exceptions = [
+            row for row in exceptions if row["code"] == "CI_BRG_INVALID"
+        ]
+        self.assertEqual(
+            {row["borrower_id"] for row in invalid_exceptions},
+            invalid_ids,
+        )
+
+        missing_assumption = out_of_scope[
+            out_of_scope["borrower_id"] == "CI-BRG-2-NOT-CONFIGURED"
+        ]
+        self.assertEqual(set(missing_assumption["field"]), {"ebitda_reduction"})
+        self.assertEqual(
+            set(missing_assumption["reason"]),
+            {"missing_or_invalid_scenario_assumption"},
+        )
+        assumption_errors = [
+            row
+            for row in exceptions
+            if row["code"] == "CI_SCENARIO_ASSUMPTION_INVALID"
+        ]
+        self.assertEqual(
+            {row["borrower_id"] for row in assumption_errors},
+            {"CI-BRG-2-NOT-CONFIGURED"},
+        )
+
+    def test_abl_calculated_cash_interest_and_fallbacks(self):
+        scenario = {
+            "stress_levels": ["S1"],
+            "cutoffs": {
+                "fccr": {"special_mention": 1.15, "substandard": 1.0}
+            },
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "portfolio_field": "portfolio",
+                "risk_rating_field": "risk_rating",
+            },
+            "modules": {
+                "C&I": {
+                    "sector_field": "ci_sector",
+                    "ebitda_reduction": {"default": {"6": {"S1": 0.0}}},
+                    "interest_rate_stress": {"S1": 0.0},
                     "sectors": {
                         "Asset-Based Lending": {
                             "principal_field": "required_principal_paid_period",
@@ -170,6 +367,7 @@ class HardeningRegressionTest(unittest.TestCase):
             "portfolio": "C&I",
             "primary_module": "C&I",
             "module_applied": "",
+            "risk_rating": 6,
             "base_bucket": "Pass",
             "stressed_bucket_S1": "Pass",
             "out_of_scope_S1": False,
@@ -328,6 +526,115 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertEqual(set(out_of_scope["reason"]), {"missing_pd_lookup"})
         self.assertIn("CONSUMER_PD_LOOKUP_COLUMNS_INVALID", {row["code"] for row in exceptions})
 
+    def test_consumer_baseline_el_uses_liquidation_adjustments(self):
+        scenario = {
+            "stress_levels": ["S1"],
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "portfolio_field": "portfolio",
+                "balance_field": "outstanding_balance",
+            },
+            "cecl": {"reserve_field": "cecl_reserve"},
+            "modules": {
+                "Consumer": {
+                    "pd_lookup_source": "fico_pd_lookup",
+                    "fico_field": "fico_score",
+                    "appraisal_field": "current_appraised_value",
+                    "pd_increase_factor": {"S1": 1.25},
+                    "collateral_value_factor": {"S1": 0.9},
+                    "rushed_sale_discount": 0.05,
+                    "closing_costs": 0.02,
+                    "pd_cap": 1.0,
+                }
+            },
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "CON-BASE",
+                    "portfolio": "Consumer",
+                    "primary_module": "Consumer",
+                    "module_applied": "",
+                    "out_of_scope_S1": False,
+                    "fico_score": 700,
+                    "current_appraised_value": 100.0,
+                    "outstanding_balance": 120.0,
+                    "cecl_reserve": 5.0,
+                }
+            ]
+        )
+        inputs = {
+            "fico_pd_lookup": SimpleNamespace(
+                frame=pd.DataFrame(
+                    {
+                        "min_score": [600],
+                        "max_score": [800],
+                        "pd": [0.02],
+                    }
+                )
+            )
+        }
+
+        stressed, out_of_scope = run_consumer(results, scenario, inputs, [])
+        summary = build_consumer_summary(stressed, scenario).set_index(
+            "stress_level"
+        )
+
+        self.assertTrue(out_of_scope.empty)
+        self.assertAlmostEqual(
+            float(stressed.at[0, "consumer_collateral_value_unstressed"]),
+            93.1,
+        )
+        self.assertAlmostEqual(
+            float(stressed.at[0, "consumer_lgd_unstressed"]),
+            26.9,
+        )
+        self.assertAlmostEqual(
+            float(stressed.at[0, "consumer_el_unstressed"]),
+            0.538,
+        )
+        self.assertAlmostEqual(
+            float(stressed.at[0, "consumer_qualitative_reserve"]),
+            4.462,
+        )
+        self.assertAlmostEqual(
+            float(summary.at["Base", "expected_loss"])
+            + float(summary.at["Base", "qualitative_reserve"]),
+            float(summary.at["Base", "proforma_cecl_reserve"]),
+        )
+        self.assertAlmostEqual(
+            float(stressed.at[0, "consumer_stressed_collateral_value_S1"]),
+            83.79,
+        )
+        self.assertAlmostEqual(
+            float(stressed.at[0, "consumer_el_S1"]),
+            0.90525,
+        )
+        self.assertAlmostEqual(
+            float(summary.at["S1", "proforma_cecl_reserve"]),
+            5.36725,
+        )
+
+        scenario["modules"]["Consumer"]["closing_costs"] = 1.1
+        exceptions = []
+        invalid, invalid_out_of_scope = run_consumer(
+            results,
+            scenario,
+            inputs,
+            exceptions,
+        )
+        self.assertTrue(pd.isna(invalid.at[0, "consumer_el_unstressed"]))
+        self.assertTrue(pd.isna(invalid.at[0, "consumer_qualitative_reserve"]))
+        self.assertTrue(bool(invalid.at[0, "out_of_scope_S1"]))
+        self.assertEqual(
+            set(invalid_out_of_scope["reason"]),
+            {"missing_or_invalid_scenario_assumption"},
+        )
+        self.assertIn(
+            ("CONSUMER_SCENARIO_ASSUMPTION_INVALID", "closing_costs"),
+            {(row["code"], row["field"]) for row in exceptions},
+        )
+
     def test_tieout_difference_is_logged_without_stopping_run(self):
         scenario, base_dir = load_scenario(SCENARIO)
         scenario["tags"]["CRE_Subsector_Retail"]["tie_out"]["expected"] = 1.0
@@ -350,6 +657,72 @@ class HardeningRegressionTest(unittest.TestCase):
             scenario["comparison"] = {}
             StressEngine(scenario, base_dir).run(output_dir=tmp, write_outputs=True, run_comparison=False)
             self.assertFalse(comparison.exists())
+            manifest = json.loads((Path(tmp) / "output_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["kind"], OUTPUT_MANIFEST_KIND)
+
+    def test_unmarked_output_manifest_cannot_authorize_deletion(self):
+        scenario, base_dir = load_scenario(SCENARIO)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            foreign_file = output_dir / "foreign_report.csv"
+            foreign_file.write_text("must remain\n", encoding="utf-8")
+            (output_dir / "output_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "engine_version": "legacy",
+                        "files": ["foreign_report.csv", "output_manifest.json"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            StressEngine(scenario, base_dir).run(
+                output_dir=output_dir,
+                write_outputs=True,
+                run_comparison=False,
+            )
+
+            self.assertEqual(foreign_file.read_text(encoding="utf-8"), "must remain\n")
+            manifest = json.loads(
+                (output_dir / "output_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["kind"], OUTPUT_MANIFEST_KIND)
+
+    def test_csv_export_neutralizes_formulas_without_mutating_frame(self):
+        frame = pd.DataFrame(
+            {
+                "=formula_header": [
+                    "=1+1",
+                    "  +SUM(1,1)",
+                    "\t-2+3",
+                    " @SUM(1,1)",
+                    "-42",
+                    "safe",
+                ],
+                "numeric": [-6, -5, -4, -3, -2, -1],
+            }
+        )
+        original = frame.copy(deep=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "safe.csv"
+            write_csv(frame, output)
+            exported = pd.read_csv(output, keep_default_na=False)
+
+        self.assertIn("'=formula_header", exported.columns)
+        self.assertEqual(
+            exported["'=formula_header"].tolist(),
+            [
+                "'=1+1",
+                "'  +SUM(1,1)",
+                "'\t-2+3",
+                "' @SUM(1,1)",
+                "'-42",
+                "safe",
+            ],
+        )
+        self.assertEqual(exported["numeric"].tolist(), [-6, -5, -4, -3, -2, -1])
+        pd.testing.assert_frame_equal(frame, original)
 
     def test_comparison_reports_available_to_unavailable_transition(self):
         previous = pd.DataFrame(

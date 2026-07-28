@@ -5,15 +5,16 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+from decimal import Decimal, InvalidOperation
 from math import prod
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from .config import output_dir_for
-from .engine import StressEngine
+from .engine import OUTPUT_MANIFEST_KIND, StressEngine
 from .io import write_csv, write_json
 from .utils import get_json_path, hash_json, json_safe, resolve_path, set_json_path_in_place, stable_name, to_number
 from .version import VERSION
@@ -126,8 +127,8 @@ def expand_batch_scenarios(
     mode = str(mode_override or config.get("mode", "grid")).lower()
     if mode not in {"grid", "paired"}:
         raise ValueError(f"Unsupported scenario_batch mode: {mode}")
-    variables = _variable_specs(base, config)
-    limit = max_scenarios if max_scenarios is not None else int(config.get("max_scenarios", 500))
+    limit = _max_scenario_limit(config, max_scenarios)
+    variables = _variable_specs(base, config, mode=mode, max_values=limit)
     scenario_count = _expansion_count(mode, variables)
     if scenario_count > limit:
         raise ValueError(f"Batch expansion produced {scenario_count} scenarios, above max_scenarios={limit}.")
@@ -137,6 +138,34 @@ def expand_batch_scenarios(
     else:
         records = _paired_records(base, variables)
     return records
+
+
+def _max_scenario_limit(config: Mapping[str, Any], override: int | None) -> int:
+    """Return a validated positive scenario-generation limit."""
+    raw_limit = override if override is not None else config.get("max_scenarios", 500)
+    return _positive_integer(raw_limit, "scenario_batch max_scenarios")
+
+
+def _positive_integer(
+    value: Any,
+    path: str,
+    maximum: int | None = None,
+) -> int:
+    """Parse a positive integer without lossy float conversion."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{path} must be a positive integer.")
+    text = str(value).strip()
+    if "e" in text.casefold():
+        raise ValueError(f"{path} must be a positive integer without exponent notation.")
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError(f"{path} must be a positive integer.") from None
+    if not number.is_finite() or number != number.to_integral_value() or number <= 0:
+        raise ValueError(f"{path} must be a positive integer.")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{path} exceeds max_scenarios={maximum}.")
+    return int(number)
 
 
 def _expansion_count(mode: str, variables: Sequence[Mapping[str, Any]]) -> int:
@@ -154,9 +183,16 @@ def _batch_config(scenario: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(scenario.get("scenario_batch", {}))
 
 
-def _variable_specs(scenario: Mapping[str, Any], config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def _variable_specs(
+    scenario: Mapping[str, Any],
+    config: Mapping[str, Any],
+    mode: str,
+    max_values: int,
+) -> List[Dict[str, Any]]:
     """Normalize variable specs and materialize their value lists."""
     variables = []
+    grid_count = 1
+    paired_count: int | None = None
     raw_variables = config.get("variables", [])
     if not raw_variables:
         raise ValueError("Grid and paired batch modes require at least one variable.")
@@ -166,68 +202,183 @@ def _variable_specs(scenario: Mapping[str, Any], config: Mapping[str, Any]) -> L
             raise ValueError("Every scenario_batch variable must define a JSON path.")
         spec.setdefault("name", spec["path"])
         spec["_index"] = index
-        spec["_values"] = _variable_values(scenario, spec)
-        if not spec["_values"]:
-            raise ValueError(f"Batch variable '{spec['name']}' produced no values.")
         if not spec.get("allow_create", False):
             get_json_path(scenario, spec["path"])
+        spec["_values"] = _variable_values(scenario, spec, max_values=max_values)
+        if not spec["_values"]:
+            raise ValueError(f"Batch variable '{spec['name']}' produced no values.")
+        value_count = len(spec["_values"])
+        if mode == "grid":
+            grid_count *= value_count
+            if grid_count > max_values:
+                raise ValueError(
+                    f"Batch expansion exceeds max_scenarios={max_values}."
+                )
+        elif paired_count is None:
+            paired_count = value_count
+        elif value_count != paired_count:
+            raise ValueError(
+                "Paired batch mode requires every variable to have the same number of values."
+            )
         variables.append(spec)
     return variables
 
 
-def _variable_values(scenario: Mapping[str, Any], spec: Mapping[str, Any]) -> List[Any]:
+def _variable_values(
+    scenario: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    max_values: int,
+) -> List[Any]:
     """Return explicit or generated values for one variable spec."""
     if "values" in spec:
-        return list(spec["values"])
+        return _bounded_values(spec["values"], spec, max_values, "explicit")
     if "range" in spec:
-        return _range_values(spec["range"], spec)
+        return _range_values(spec["range"], spec, max_values=max_values)
     if "linspace" in spec:
-        return _linspace_values(spec["linspace"], spec)
+        return _linspace_values(spec["linspace"], spec, max_values=max_values)
     base_value = get_json_path(scenario, spec["path"])
     if "multipliers" in spec:
         base_number = to_number(base_value)
-        return [_clean_numeric(base_number * to_number(multiplier), spec) for multiplier in spec["multipliers"]]
+        multipliers = _bounded_values(
+            spec["multipliers"], spec, max_values, "multiplier"
+        )
+        return [
+            _clean_numeric(base_number * to_number(multiplier), spec)
+            for multiplier in multipliers
+        ]
     if "deltas" in spec:
         base_number = to_number(base_value)
-        return [_clean_numeric(base_number + to_number(delta), spec) for delta in spec["deltas"]]
+        deltas = _bounded_values(
+            spec["deltas"], spec, max_values, "delta"
+        )
+        return [
+            _clean_numeric(base_number + to_number(delta), spec)
+            for delta in deltas
+        ]
     raise ValueError(f"Batch variable '{spec.get('name', spec.get('path'))}' must define values, range, linspace, multipliers, or deltas.")
 
 
-def _range_values(range_spec: Mapping[str, Any], variable_spec: Mapping[str, Any]) -> List[Any]:
+def _bounded_values(
+    values: Iterable[Any],
+    variable_spec: Mapping[str, Any],
+    max_values: int,
+    source: str,
+) -> List[Any]:
+    """Collect at most ``max_values`` items from one batch value source."""
+    if isinstance(values, (str, bytes, Mapping)):
+        name = variable_spec.get("name", variable_spec.get("path"))
+        raise ValueError(f"Batch variable '{name}' {source} values must be a list.")
+    try:
+        iterator = iter(values)
+    except TypeError:
+        name = variable_spec.get("name", variable_spec.get("path"))
+        raise ValueError(f"Batch variable '{name}' {source} values must be iterable.") from None
+    collected: List[Any] = []
+    for value in iterator:
+        if len(collected) >= max_values:
+            name = variable_spec.get("name", variable_spec.get("path"))
+            raise ValueError(
+                f"Batch variable '{name}' exceeds max_scenarios={max_values} "
+                f"while collecting {source} values."
+            )
+        collected.append(value)
+    return collected
+
+
+def _range_values(
+    range_spec: Mapping[str, Any],
+    variable_spec: Mapping[str, Any],
+    max_values: int,
+) -> List[Any]:
     """Generate inclusive numeric range values with deterministic rounding."""
     start = to_number(range_spec.get("start"))
     stop = to_number(range_spec.get("stop"))
     step = to_number(range_spec.get("step"))
-    if step == 0 or np.isnan(step):
+    if not all(np.isfinite(value) for value in (start, stop, step)):
+        raise ValueError("Batch range start, stop, and step must be finite numbers.")
+    if step == 0:
         raise ValueError("Batch range step must be nonzero.")
     inclusive = bool(range_spec.get("inclusive", True))
     values: List[Any] = []
     current = start
     tolerance = abs(step) / 1_000_000
-    while current <= stop + tolerance if step > 0 else current >= stop - tolerance:
+    while _range_value_in_bounds(current, stop, step, tolerance):
         if inclusive or (current < stop if step > 0 else current > stop):
             values.append(_clean_numeric(current, variable_spec))
-        current += step
+            if len(values) > max_values:
+                name = variable_spec.get("name", variable_spec.get("path"))
+                raise ValueError(
+                    f"Batch variable '{name}' exceeds max_scenarios={max_values} while generating range values."
+                )
+        if current == stop:
+            break
+        next_value = current + step
+        if not np.isfinite(next_value):
+            raise ValueError("Batch range arithmetic produced a non-finite value.")
+        if next_value == current:
+            raise ValueError("Batch range step is too small to advance from the current value.")
+        current = next_value
     return values
 
 
-def _linspace_values(linspace_spec: Mapping[str, Any], variable_spec: Mapping[str, Any]) -> List[Any]:
+def _range_value_in_bounds(
+    current: float,
+    stop: float,
+    step: float,
+    tolerance: float,
+) -> bool:
+    """Test a range boundary without overflow-prone adjusted endpoints."""
+    if step > 0:
+        return current <= stop or current - stop <= tolerance
+    return current >= stop or stop - current <= tolerance
+
+
+def _linspace_values(
+    linspace_spec: Mapping[str, Any],
+    variable_spec: Mapping[str, Any],
+    max_values: int,
+) -> List[Any]:
     """Generate evenly spaced numeric values."""
     start = to_number(linspace_spec.get("start"))
     stop = to_number(linspace_spec.get("stop"))
-    count = int(linspace_spec.get("count", 0))
-    if count <= 0:
-        raise ValueError("Batch linspace count must be positive.")
+    if not all(np.isfinite(value) for value in (start, stop)):
+        raise ValueError("Batch linspace start and stop must be finite numbers.")
+    count = _positive_integer(
+        linspace_spec.get("count", 0),
+        "Batch linspace count",
+        maximum=max_values,
+    )
     if count == 1:
         return [_clean_numeric(start, variable_spec)]
-    step = (stop - start) / (count - 1)
-    return [_clean_numeric(start + step * index, variable_spec) for index in range(count)]
+    values = []
+    for index in range(count):
+        if index == 0:
+            value = start
+        elif index == count - 1:
+            value = stop
+        else:
+            fraction = index / (count - 1)
+            value = start * (1.0 - fraction) + stop * fraction
+        if not np.isfinite(value):
+            raise ValueError("Batch linspace interpolation produced a non-finite value.")
+        values.append(_clean_numeric(value, variable_spec))
+    return values
 
 
 def _clean_numeric(value: float, spec: Mapping[str, Any]) -> Any:
     """Round generated numeric values for stable JSON and CSV output."""
     precision = int(spec.get("precision", 12))
-    rounded = round(float(value), precision)
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(
+            f"Batch variable '{spec.get('name', spec.get('path'))}' generated a non-finite value."
+        ) from None
+    if not np.isfinite(numeric):
+        raise ValueError(
+            f"Batch variable '{spec.get('name', spec.get('path'))}' generated a non-finite value."
+        )
+    rounded = round(numeric, precision)
     return int(rounded) if rounded.is_integer() else rounded
 
 
@@ -350,13 +501,19 @@ def _batch_reports(records: Sequence[Mapping[str, Any]], base_result: Mapping[st
 
         aggregate = cecl[(cecl.get("portfolio") == "Aggregate") & (cecl.get("bucket") == "Total")] if not cecl.empty else pd.DataFrame()
         for row in aggregate.to_dict(orient="records"):
-            base_values = base_lookup.get(row.get("stress_level"), {})
+            variant = row.get("scenario_variant", "baseline")
+            base_values = base_lookup.get((variant, row.get("stress_level")), {})
             reserve = to_number(row.get("proforma_cecl_reserve"))
             ratio = to_number(row.get("proforma_cecl_ratio"))
             summary_rows.append(
                 {
                     **_run_columns(record),
                     **variable_columns,
+                    **(
+                        {"scenario_variant": variant}
+                        if "scenario_variant" in row
+                        else {}
+                    ),
                     "stress_level": row.get("stress_level"),
                     "balance": row.get("balance"),
                     "proforma_cecl_reserve": row.get("proforma_cecl_reserve"),
@@ -389,7 +546,10 @@ def _base_cecl_lookup(base_result: Mapping[str, Any] | None) -> Dict[Any, Dict[s
     if cecl.empty:
         return {}
     aggregate = cecl[(cecl["portfolio"] == "Aggregate") & (cecl["bucket"] == "Total")]
-    return {row["stress_level"]: row for row in aggregate.to_dict(orient="records")}
+    return {
+        (row.get("scenario_variant", "baseline"), row["stress_level"]): row
+        for row in aggregate.to_dict(orient="records")
+    }
 
 
 def _run_columns(record: Mapping[str, Any]) -> Dict[str, Any]:
@@ -466,7 +626,7 @@ def _write_batch_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     prior_manifest = _read_batch_manifest(output_dir)
     sort_columns = {
-        "batch_summary": ["run_id", "stress_level"],
+        "batch_summary": ["run_id", "scenario_variant", "stress_level"],
         "batch_variables": ["run_id", "path"],
         "batch_cecl_summary": ["run_id", "portfolio", "stress_level", "bucket"],
         "batch_exceptions": ["run_id", "severity", "stage", "code"],
@@ -571,7 +731,11 @@ def _remove_engine_child_outputs(child: Path) -> None:
         try:
             with manifest.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            if isinstance(data, dict) and isinstance(data.get("files"), list):
+            if (
+                isinstance(data, dict)
+                and data.get("kind") == OUTPUT_MANIFEST_KIND
+                and isinstance(data.get("files"), list)
+            ):
                 owned_files = data["files"]
         except (OSError, ValueError, TypeError):
             pass

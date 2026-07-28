@@ -74,7 +74,7 @@ def build_bucket_summary(
                     "stress_level": level,
                     "bucket": bucket,
                     "balance": float(pd.to_numeric(group[balance_field], errors="coerce").sum()),
-                    "borrower_count": int(len(group)),
+                    **_population_counts(group, scenario),
                     "source": "model",
                 }
             )
@@ -259,7 +259,7 @@ def build_cre_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
         row = {
             "portfolio": keys[0],
             "subsector": keys[1],
-            "borrower_count": int(len(group)),
+            **_population_counts(group, scenario),
             "balance": float(pd.to_numeric(group[balance_field], errors="coerce").sum()),
             "unstressed_dscr": weighted_average(group[dscr_field], group[balance_field]) if dscr_field in group.columns else np.nan,
         }
@@ -288,7 +288,7 @@ def build_ci_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.D
         row = {
             "portfolio": keys[0],
             "sector": keys[1],
-            "borrower_count": int(len(group)),
+            **_population_counts(group, scenario),
             "balance": float(pd.to_numeric(group[balance_field], errors="coerce").sum()),
         }
         for level in levels:
@@ -337,7 +337,7 @@ def build_consumer_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -
                 {
                     "portfolio": portfolio,
                     "stress_level": "Base" if level == "unstressed" else level,
-                    "borrower_count": int(len(group)),
+                    **_population_counts(group, scenario),
                     "balance": balance,
                     "in_scope_borrower_count": int(scope_mask.sum()),
                     "in_scope_balance": in_scope_balance,
@@ -373,15 +373,20 @@ def _cecl_methods(results: pd.DataFrame, scenario: Mapping[str, Any]) -> Dict[An
     """Resolve CECL method by portfolio.
 
     Called by `build_cecl_summary`. Commercial portfolios use bucket reserve
-    ratios; consumer portfolios default to expected loss.
+    ratios; consumer portfolios use quantitative plus qualitative expected
+    loss. Method detection uses the same portfolio field as CECL reporting so
+    renamed and rolled-up Consumer portfolios retain that treatment.
     """
     cecl = scenario.get("cecl", {})
-    portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
+    portfolio_field = cecl.get(
+        "portfolio_field",
+        scenario["borrower"].get("portfolio_field", "portfolio"),
+    )
     methods: Dict[Any, str] = {}
     configured = cecl.get("portfolios", {})
     for portfolio, spec in configured.items():
         methods[portfolio] = spec.get("method", "bucket_reserve_ratio")
-    if "module_applied" in results.columns:
+    if "module_applied" in results.columns and portfolio_field in results.columns:
         for portfolio, group in results.groupby(portfolio_field, dropna=False):
             if group["module_applied"].astype(str).str.contains("Consumer", na=False).any():
                 methods.setdefault(portfolio, "expected_loss")
@@ -523,3 +528,16 @@ def _consumer_cecl_rows(
 def _empty_series(group: pd.DataFrame) -> pd.Series:
     """Return an aligned empty numeric series for optional report fields."""
     return pd.Series(index=group.index, dtype=float)
+
+
+def _population_counts(group: pd.DataFrame, scenario: Mapping[str, Any]) -> Dict[str, int]:
+    """Return legacy borrower counts or targeted distinct borrower/loan counts."""
+    if not scenario.get("_targeted_mode"):
+        return {"borrower_count": int(len(group))}
+    borrower_id = scenario["borrower"]["borrower_id_field"]
+    return {
+        "borrower_count": int(group[borrower_id].nunique(dropna=True))
+        if borrower_id in group.columns
+        else int(len(group)),
+        "loan_count": int(len(group)),
+    }

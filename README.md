@@ -21,7 +21,7 @@ The engine:
 - calculates stressed risk migration and pro forma CECL results;
 - performs source reconciliation, tag tie-outs, and missing-data checks;
 - writes detailed audit files and management summaries;
-- runs sensitivity grids built from a spreadsheet-friendly CSV; and
+- runs sensitivity grids and paired scenarios defined in JSON; and
 - compares a current run with a preserved prior scenario.
 
 The engine does not approve a scenario or replace management review. A command
@@ -107,10 +107,9 @@ examples/
 │   ├── consumer_scores_2.csv
 │   ├── fico_pd_lookup.csv
 │   └── tag_tieouts.csv
-├── scenario.json                 Small manifest that includes the fragments
+├── scenario.json                 Manifest, migration cutoffs, CECL, and includes
 ├── scenario/
-│   ├── inputs.json               File locations, aliases, types, aggregation
-│   ├── borrower.json             Borrower identity and balance fields
+│   ├── inputs.json               Inputs and borrower construction settings
 │   ├── modules/
 │   │   ├── cre.json              CRE assumptions
 │   │   ├── ci.json               C&I assumptions
@@ -119,10 +118,8 @@ examples/
 │   │   ├── model_and_overlay.json
 │   │   ├── cre_subsectors.json
 │   │   └── ci_sectors.json
-│   ├── overlays.json             EF and BCC overlay definitions
-│   └── cecl.json                 CECL field and method settings
-├── scenario_variables.csv        Editable batch-sensitivity variables
-└── scenario_batch.json           Generated batch configuration
+│   └── overlays.json             EF and BCC overlay definitions
+└── scenario_batch.json           Editable batch-sensitivity configuration
 ```
 
 The `stress_engine/` folder contains application code. A normal scenario
@@ -137,18 +134,28 @@ smaller JSON files:
 {
   "$include": [
     "scenario/inputs.json",
-    "scenario/borrower.json",
     "scenario/tags/model_and_overlay.json",
     "scenario/tags/cre_subsectors.json",
     "scenario/tags/ci_sectors.json",
     "scenario/modules/cre.json",
     "scenario/modules/ci.json",
     "scenario/modules/consumer.json",
-    "scenario/overlays.json",
-    "scenario/cecl.json"
+    "scenario/overlays.json"
   ],
   "scenario_id": "example_2026q2",
   "stress_levels": ["S1", "S2"],
+  "cutoffs": {
+    "dscr": {"special_mention": 1.15, "substandard": 1.0},
+    "fccr": {"special_mention": 1.15, "substandard": 1.0},
+    "ltv": {"special_mention": 0.75, "substandard": 0.9}
+  },
+  "cecl": {
+    "reserve_field": "cecl_reserve",
+    "portfolio_field": "cecl_portfolio",
+    "portfolios": {
+      "Consumer": {"method": "expected_loss"}
+    }
+  },
   "run": {"cutoff_date": "2026-06-30"},
   "outputs": {"directory": "outputs/example_2026q2"},
   "module_order": ["CRE", "C&I", "Consumer"]
@@ -158,6 +165,15 @@ smaller JSON files:
 Included files are merged in the order listed. Values written directly in the
 manifest override included values. If more than one top-level JSON file is
 passed on the command line, later files override earlier files.
+
+`scenario/inputs.json` contains both the top-level `inputs` definitions and the
+top-level `borrower` construction settings. Global CECL field, portfolio, and
+method settings live directly in the master manifest.
+
+The master manifest is the single source for migration cutoffs. `cutoffs.dscr`
+applies to both standard and refinance CRE DSCR, `cutoffs.fccr` applies to C&I,
+and `cutoffs.ltv` applies to CRE LTV. Module fragments do not define their own
+cutoff tables.
 
 All relative input and output paths are anchored to the folder containing the
 first top-level scenario file. In the example, `data/loans.csv` means
@@ -492,7 +508,7 @@ rates: a decline of `0.08` means 8%.
 
 C&I calculates stressed FCCR rather than importing it:
 
-1. EBITDA is reduced according to sector, base bucket, and stress level.
+1. EBITDA is reduced according to sector, BRG, and stress level.
 2. Taxes and distributions are re-scaled using their original ratios to
    EBITDA.
 3. Sector rules determine whether non-discretionary dividends are subtracted.
@@ -502,9 +518,17 @@ C&I calculates stressed FCCR rather than importing it:
 6. FCCR equals stressed available cash flow divided by debt service.
 7. FCCR cutoffs determine migration.
 
+The BRG comes from the configured `borrower.risk_rating_field`. Integral grades
+1 through 7 select the matching string key in `ebitda_reduction`; every finite
+numeric grade of 8 or higher selects key `"8"`. Missing, nonnumeric, below-1,
+and fractional grades below 8 do not select an assumption. Every effective
+sector table must be keyed by BRG and supply the applicable grade; bucket-keyed
+EBITDA reduction tables are not supported.
+
 Missing C&I components are treated as zero and logged. A row becomes out of
 scope when available cash flow is zero or missing, or debt service is
-nonpositive. Borrowers already rated Substandard remain Substandard.
+nonpositive. Borrowers already rated Substandard still receive an FCCR
+calculation, but their migration bucket remains Substandard.
 
 Each configured sector can choose its principal field, whether to subtract
 non-discretionary dividends, and whether to calculate cash interest from its
@@ -537,13 +561,19 @@ Consumer uses the aggregated FICO score and `consumer_appraised_value` from the
 same logical multi-file source:
 
 1. FICO maps to an unstressed PD through the lookup table.
-2. Unstressed loss given default dollars equal balance less collateral, floored
-   at zero.
-3. Stressed PD equals base PD times the scenario factor, capped at the
+2. Baseline collateral equals appraisal after the rushed-sale and closing-cost
+   adjustments.
+3. Baseline loss given default dollars equal balance less adjusted baseline
+   collateral, floored at zero.
+4. Stressed PD equals base PD times the scenario factor, capped at the
    configured maximum.
-4. Stressed collateral equals appraisal times the collateral factor, rushed
-   sale adjustment, and closing-cost adjustment.
-5. Stressed expected loss equals stressed PD times stressed loss given default.
+5. Stressed collateral applies the scenario collateral factor to appraisal in
+   addition to the same rushed-sale and closing-cost adjustments.
+6. Stressed expected loss equals stressed PD times stressed loss given default.
+
+The stressed borrower output retains the gross appraisal in
+`consumer_appraised_value` and exposes the adjusted baseline collateral in
+`consumer_collateral_value_unstressed`.
 
 ### Overlays
 
@@ -562,6 +592,80 @@ Source weights are normalized across sources that have usable populations.
 Tag-based source populations also respect `primary_module`, so an overlap
 resolved to CRE does not accidentally enter the C&I source population.
 
+### Targeted external shocks
+
+`targeted_stress` is an opt-in loan-grain execution mode for sector or
+externally supplied shocks. When it is absent, the engine retains the ordinary
+borrower-grain behavior and output schemas.
+
+The complete oil-and-tariff example is
+`examples/targeted_stress.json`. It produces an implicit `baseline` plus named
+variants:
+
+- `unmatched_behavior: "baseline_stress"` layers a shock into the ordinary
+  portfolio stress;
+- `unmatched_behavior: "base"` leaves unmatched loans in their base buckets,
+  isolating the targeted shock; and
+- `primary_variant` selects the variant returned in `result["results"]`;
+  `baseline` is the default.
+
+A shock selects loans with nested `all`/`any` expressions. Atomic selectors
+can use:
+
+- `type: "naics_prefix"` with a configured loan field and one or more 2-6
+  digit prefixes;
+- `type: "external_list"` with a loaded input source, source field, exposure
+  field, `exact` or `prefix` matching, and an optional tier field; or
+- an ordinary tag-style field condition.
+
+`exclude` uses the same selector syntax. External lists can match loan IDs,
+borrower IDs, or industry codes. Account IDs that are missing or duplicated in
+the identity input are not eligible for loan-ID list selection.
+
+Each selected loan resolves to a configured tier. A tier contains a `modules`
+object and approved assumption changes:
+
+```json
+{
+  "high": {
+    "modules": {
+      "C&I": {
+        "ebitda_reduction": {
+          "operation": "add",
+          "values": {"S1": 0.08, "S2": 0.15}
+        },
+        "interest_rate_stress": {
+          "operation": "multiply",
+          "values": {"S1": 1.5, "S2": 1.5}
+        }
+      }
+    }
+  }
+}
+```
+
+Operations are `replace`, `add`, or `multiply`. If a variant lists multiple
+shocks, the engine applies them in listed order. The assumption audit records
+the baseline value, value before each operation, shock value, and final
+effective value.
+
+Supported targeted assumptions are:
+
+| Module | Parameters |
+|---|---|
+| C&I | `ebitda_reduction`, `interest_rate_stress` |
+| CRE | `dscr_decline`, `refinance_noi_decline`, `treasury_rate`, `credit_spread`, `amortization_years`, `cap_rate` |
+| Consumer | `pd_increase_factor`, `collateral_value_factor`, `rushed_sale_discount`, `closing_costs` |
+
+Targeted runs write `stressed_loan_results.csv`. Variant-aware summaries
+contain `scenario_variant`, distinct `borrower_count`, and `loan_count`.
+Additional controls are written to:
+
+- `targeted_selection_detail.csv`;
+- `targeted_assumption_audit.csv`;
+- `targeted_stress_summary.csv`; and
+- `variant_comparison.csv`.
+
 ### CECL
 
 Commercial CECL calculates one base reserve ratio for each CECL portfolio and
@@ -579,6 +683,9 @@ stressed quantitative expected loss plus the qualitative amount implied by:
 ```text
 recorded base reserve − unstressed quantitative expected loss
 ```
+
+The unstressed quantitative expected loss in this residual uses baseline
+collateral after rushed-sale and closing-cost adjustments.
 
 If positive Consumer balance is out of scope, stressed Consumer CECL is marked
 `unavailable`; it is not reported as zero.
@@ -704,33 +811,27 @@ unchanged. `run_timestamp_utc` changes on each run.
 
 ## Batch sensitivity analysis
 
-### Edit the variable CSV
+### Edit the batch JSON
 
-`examples/scenario_variables.csv` is designed for spreadsheet editing. Each
-row needs a `path` to a JSON value and exactly one method for generating
-values.
+`examples/scenario_batch.json` is the editable source for batch sensitivity
+analysis. Each entry in `variables` needs a dotted `path` to a scenario value
+and exactly one value generator:
 
-| CSV columns | Meaning |
+| JSON member | Meaning |
 |---|---|
-| `name` | Friendly label; defaults to the path when blank |
+| `name` | Friendly label; defaults to the path when omitted |
 | `path` | Canonical dotted JSON path, such as `modules.CRE.tests.dscr.decline.default.S1` |
-| `values` | JSON array such as `[1.25, 1.75]`, or a pipe-delimited list |
-| `range_start`, `range_stop`, `range_step` | Inclusive numeric sequence |
-| `range_inclusive` | Optional true/false control for the stopping value |
-| `linspace_start`, `linspace_stop`, `linspace_count` | Evenly spaced values |
+| `values` | Explicit array of replacement values |
+| `range` | Inclusive numeric sequence with `start`, `stop`, and `step` |
+| `linspace` | Evenly spaced values with `start`, `stop`, and `count` |
 | `multipliers` | Values multiplied by the base scenario value |
 | `deltas` | Values added to the base scenario value |
-| `precision` | Decimal rounding for generated values |
-| `allow_create` | Normally blank/false; permits `values`, `range`, or `linspace` to create a missing path. `multipliers` and `deltas` still require an existing numeric value |
+| `precision` | Optional decimal rounding for generated values |
+| `allow_create` | Normally omitted or false; allows `values`, `range`, or `linspace` to create a missing path. `multipliers` and `deltas` still require an existing numeric value |
 
-### Convert CSV to JSON
-
-```powershell
-.\.venv\Scripts\python.exe -m stress_engine.config_tool batch-csv examples/scenario_variables.csv examples/scenario_batch.json --mode grid --output-directory outputs/example_batch --max-scenarios 20
-```
-
-Treat `scenario_variables.csv` as the editable source and regenerate
-`scenario_batch.json` after changes.
+The example exercises all five generators across CRE, C&I, and Consumer
+assumptions. In `grid` mode its five variables produce 48 generated scenarios,
+which is below the configured `max_scenarios` guardrail of 50.
 
 ### Choose a mode
 
@@ -826,6 +927,7 @@ when moved into an output directory.
 | Source header | Actual column heading in CSV or Excel |
 | DSCR | Debt service coverage ratio |
 | FCCR | Fixed charge coverage ratio |
+| BRG | Borrower risk grade used to select C&I EBITDA stress |
 | LTV | Loan-to-value ratio |
 | NOI | Net operating income |
 | PD | Probability of default |

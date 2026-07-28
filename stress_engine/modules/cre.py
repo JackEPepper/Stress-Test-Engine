@@ -7,10 +7,17 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from .base import append_module, missing_fields, module_population, record_out_of_scope
+from .base import (
+    append_module,
+    missing_fields,
+    module_population,
+    record_out_of_scope,
+    targeted_parameter,
+)
 from ..exceptions import record_exception
 from ..utils import (
     annual_debt_payment,
+    get_metric_cutoffs,
     get_levels,
     higher_metric_bucket,
     is_missing,
@@ -38,6 +45,8 @@ def run_cre(
         return results, pd.DataFrame()
     config = dict(config)
     config["_module_name"] = "CRE"
+    dscr_cutoffs = get_metric_cutoffs(scenario, "dscr")
+    ltv_cutoffs = get_metric_cutoffs(scenario, "ltv")
 
     out = results.copy()
     levels = get_levels(scenario)
@@ -68,7 +77,17 @@ def run_cre(
             if maturity > threshold_date:
                 # Longer-dated CRE loans are tested on DSCR only.
                 stressed_bucket = _run_dscr(
-                    out, idx, row, scenario, config, level, subsector_field, out_scope, exceptions, fallback_events
+                    out,
+                    idx,
+                    row,
+                    scenario,
+                    config,
+                    dscr_cutoffs,
+                    level,
+                    subsector_field,
+                    out_scope,
+                    exceptions,
+                    fallback_events,
                 )
             else:
                 # Near-maturity CRE loans are tested on refinance DSCR and LTV.
@@ -78,6 +97,8 @@ def run_cre(
                     row,
                     scenario,
                     config,
+                    dscr_cutoffs,
+                    ltv_cutoffs,
                     level,
                     subsector_field,
                     balance_field,
@@ -100,6 +121,7 @@ def _run_dscr(
     row: Mapping[str, Any],
     scenario: Mapping[str, Any],
     config: Mapping[str, Any],
+    dscr_cutoffs: Mapping[str, Any],
     level: str,
     subsector_field: str,
     out_scope: List[Dict[str, Any]],
@@ -132,12 +154,15 @@ def _run_dscr(
         exceptions,
         fallback_events,
     )
+    decline = targeted_parameter(
+        row, scenario, "CRE", "dscr_decline", level, decline
+    )
     if is_missing(decline) or not 0 <= decline <= 1:
         _mark_out(out, idx, level, row, scenario, out_scope, "DSCR", ["dscr_decline"], "missing_or_invalid_scenario_assumption")
         return None
     stressed_dscr = dscr * (1 - decline)
     out.at[idx, f"cre_dscr_{level}"] = stressed_dscr
-    return lower_metric_bucket(stressed_dscr, dscr_cfg.get("cutoffs", {}))
+    return lower_metric_bucket(stressed_dscr, dscr_cutoffs)
 
 
 def _run_refi_ltv(
@@ -146,6 +171,8 @@ def _run_refi_ltv(
     row: Mapping[str, Any],
     scenario: Mapping[str, Any],
     config: Mapping[str, Any],
+    dscr_cutoffs: Mapping[str, Any],
+    ltv_cutoffs: Mapping[str, Any],
     level: str,
     subsector_field: str,
     balance_field: str,
@@ -192,6 +219,18 @@ def _run_refi_ltv(
         amort_years = _resolve_assumption(
             refi_cfg.get("amortization_years"), sector, level, "amortization_years", exceptions, fallback_events
         )
+        noi_decline = targeted_parameter(
+            row, scenario, "CRE", "refinance_noi_decline", level, noi_decline
+        )
+        spread = targeted_parameter(
+            row, scenario, "CRE", "credit_spread", level, spread
+        )
+        treasury = targeted_parameter(
+            row, scenario, "CRE", "treasury_rate", level, treasury
+        )
+        amort_years = targeted_parameter(
+            row, scenario, "CRE", "amortization_years", level, amort_years
+        )
         invalid_assumptions = []
         if is_missing(noi_decline) or not 0 <= noi_decline <= 1:
             invalid_assumptions.append("refinance_noi_decline")
@@ -226,7 +265,7 @@ def _run_refi_ltv(
         stressed_dscr = stressed_noi / payment
         out.at[idx, f"cre_refi_dscr_{level}"] = stressed_dscr
         out.at[idx, f"cre_dscr_{level}"] = stressed_dscr
-        best = worse_bucket(best, lower_metric_bucket(stressed_dscr, refi_cfg.get("cutoffs", {})))
+        best = worse_bucket(best, lower_metric_bucket(stressed_dscr, dscr_cutoffs))
 
     if ltv_cfg.get("enabled", True):
         cap_rate = _resolve_assumption(
@@ -237,6 +276,9 @@ def _run_refi_ltv(
             exceptions,
             fallback_events,
         )
+        cap_rate = targeted_parameter(
+            row, scenario, "CRE", "cap_rate", level, cap_rate
+        )
         if is_missing(cap_rate) or cap_rate <= 0 or noi <= 0:
             _mark_out(out, idx, level, row, scenario, out_scope, "LTV", ["cap_rates", noi_field], "invalid_ltv_inputs")
             return None
@@ -244,7 +286,7 @@ def _run_refi_ltv(
         # divided by NOI. Higher values map to worse buckets.
         stressed_ltv = balance * cap_rate / noi
         out.at[idx, f"cre_ltv_{level}"] = stressed_ltv
-        best = worse_bucket(best, higher_metric_bucket(stressed_ltv, ltv_cfg.get("cutoffs", {})))
+        best = worse_bucket(best, higher_metric_bucket(stressed_ltv, ltv_cutoffs))
     return best
 
 

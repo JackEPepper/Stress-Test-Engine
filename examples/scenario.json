@@ -1,21 +1,42 @@
 {
   "$include": [
     "scenario/inputs.json",
-    "scenario/borrower.json",
     "scenario/tags/model_and_overlay.json",
     "scenario/tags/cre_subsectors.json",
     "scenario/tags/ci_sectors.json",
     "scenario/modules/cre.json",
     "scenario/modules/ci.json",
     "scenario/modules/consumer.json",
-    "scenario/overlays.json",
-    "scenario/cecl.json"
+    "scenario/overlays.json"
   ],
   "scenario_id": "example_2026q2",
   "stress_levels": [
     "S1",
     "S2"
   ],
+  "cutoffs": {
+    "dscr": {
+      "special_mention": 1.15,
+      "substandard": 1.0
+    },
+    "fccr": {
+      "special_mention": 1.15,
+      "substandard": 1.0
+    },
+    "ltv": {
+      "special_mention": 0.75,
+      "substandard": 0.9
+    }
+  },
+  "cecl": {
+    "reserve_field": "cecl_reserve",
+    "portfolio_field": "cecl_portfolio",
+    "portfolios": {
+      "Consumer": {
+        "method": "expected_loss"
+      }
+    }
+  },
   "run": {
     "cutoff_date": "2026-06-30"
   },

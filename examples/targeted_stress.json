@@ -1,0 +1,121 @@
+{
+  "$include": [
+    "scenario.json"
+  ],
+  "scenario_id": "example_2026q2_targeted",
+  "inputs": {
+    "sources": {
+      "tariff_partner_list": {
+        "path": "data/tariff_partner_list.csv",
+        "type": "csv",
+        "merge": false,
+        "key": "loan_id",
+        "column_aliases": {
+          "loan_id": "loan_id",
+          "impact_tier": "impact_tier"
+        }
+      }
+    }
+  },
+  "targeted_stress": {
+    "enabled": true,
+    "primary_variant": "baseline",
+    "shocks": {
+      "oil_shock": {
+        "selector": {
+          "type": "naics_prefix",
+          "field": "naics_code",
+          "prefixes": [
+            "21",
+            "3241"
+          ]
+        },
+        "default_tier": "high",
+        "tiers": {
+          "high": {
+            "modules": {
+              "C&I": {
+                "ebitda_reduction": {
+                  "operation": "add",
+                  "values": {
+                    "S1": 0.08,
+                    "S2": 0.15
+                  }
+                },
+                "interest_rate_stress": {
+                  "operation": "multiply",
+                  "values": {
+                    "S1": 1.5,
+                    "S2": 1.5
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "tariff_shock": {
+        "selector": {
+          "type": "external_list",
+          "source": "tariff_partner_list",
+          "source_field": "loan_id",
+          "exposure_field": "loan_id",
+          "match": "exact",
+          "tier_field": "impact_tier"
+        },
+        "tiers": {
+          "medium": {
+            "modules": {
+              "C&I": {
+                "ebitda_reduction": {
+                  "operation": "add",
+                  "values": {
+                    "S1": 0.04,
+                    "S2": 0.08
+                  }
+                }
+              }
+            }
+          },
+          "high": {
+            "modules": {
+              "C&I": {
+                "ebitda_reduction": {
+                  "operation": "add",
+                  "values": {
+                    "S1": 0.07,
+                    "S2": 0.12
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "variants": {
+      "oil_layered": {
+        "shocks": [
+          "oil_shock"
+        ],
+        "unmatched_behavior": "baseline_stress"
+      },
+      "tariff_isolated": {
+        "shocks": [
+          "tariff_shock"
+        ],
+        "unmatched_behavior": "base"
+      },
+      "oil_and_tariffs": {
+        "shocks": [
+          "oil_shock",
+          "tariff_shock"
+        ],
+        "unmatched_behavior": "baseline_stress"
+      }
+    }
+  },
+  "outputs": {
+    "directory": "outputs/example_2026q2_targeted"
+  }
+}

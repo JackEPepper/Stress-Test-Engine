@@ -1,7 +1,7 @@
 {
   "scenario_batch": {
     "mode": "grid",
-    "max_scenarios": 20,
+    "max_scenarios": 50,
     "variables": [
       {
         "name": "CRE DSCR S1 decline",
@@ -20,6 +20,34 @@
           1.25,
           1.75
         ]
+      },
+      {
+        "name": "C&I S1 interest rate stress",
+        "path": "modules.C&I.interest_rate_stress.S1",
+        "deltas": [
+          -0.005,
+          0.005
+        ],
+        "precision": 4
+      },
+      {
+        "name": "CRE LTV S2 cap rate",
+        "path": "modules.CRE.tests.ltv.cap_rates.default.S2",
+        "linspace": {
+          "start": 0.08,
+          "stop": 0.09,
+          "count": 2
+        },
+        "precision": 4
+      },
+      {
+        "name": "Consumer S1 collateral value factor",
+        "path": "modules.Consumer.collateral_value_factor.S1",
+        "multipliers": [
+          0.95,
+          1.05
+        ],
+        "precision": 4
       }
     ],
     "output_directory": "outputs/example_batch"

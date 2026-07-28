@@ -1,3 +1,0 @@
-name,path,values,range_start,range_stop,range_step,precision
-CRE DSCR S1 decline,modules.CRE.tests.dscr.decline.default.S1,,0.03,0.07,0.02,4
-Consumer PD S2 factor,modules.Consumer.pd_increase_factor.S2,"[1.25, 1.75]",,,,

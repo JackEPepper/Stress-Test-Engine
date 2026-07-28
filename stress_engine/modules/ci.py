@@ -7,9 +7,17 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from .base import append_module, module_population, record_out_of_scope
+from .base import append_module, module_population, record_out_of_scope, targeted_parameter
 from ..exceptions import record_exception
-from ..utils import get_levels, is_missing, lookup_parameter_with_source, lower_metric_bucket, to_number, worse_bucket
+from ..utils import (
+    get_levels,
+    get_metric_cutoffs,
+    is_missing,
+    lookup_parameter_with_source,
+    lower_metric_bucket,
+    to_number,
+    worse_bucket,
+)
 
 
 DEFAULT_SECTOR_CONFIG = {
@@ -36,6 +44,7 @@ def run_ci(
         return results, pd.DataFrame()
     config = dict(config)
     config["_module_name"] = "C&I"
+    fccr_cutoffs = get_metric_cutoffs(scenario, "fccr")
 
     out = results.copy()
     out["calculated_cash_paid_for_interest"] = np.nan
@@ -50,6 +59,10 @@ def run_ci(
     out_scope: List[Dict[str, Any]] = []
     fallback_events: set[tuple[str, str, str]] = set()
     sector_field = config.get("sector_field", "ci_sector")
+    risk_rating_field = scenario.get("borrower", {}).get(
+        "risk_rating_field", "risk_rating"
+    )
+    config["_risk_rating_field"] = risk_rating_field
     fields = {
         "ebitda": "ebitda",
         "cash_taxes": "cash_taxes",
@@ -68,11 +81,8 @@ def run_ci(
         for idx, row in out.loc[mask].iterrows():
             out.at[idx, "module_applied"] = append_module(out.at[idx, "module_applied"], "C&I")
             base_bucket = row.get("base_bucket", "Unknown")
-            if base_bucket == "Substandard":
-                # Substandard is the highest commercial bucket; keep it fixed.
-                out.at[idx, f"stressed_bucket_{level}"] = "Substandard"
-                continue
             sector = row.get(sector_field, "default")
+            brg = _brg_key(row.get(risk_rating_field))
             sector_cfg, used_sector_default = _sector_config(config, sector)
             if used_sector_default:
                 record_exception(
@@ -88,11 +98,60 @@ def run_ci(
                     field=sector_field,
                     details=f"sector={sector}",
                 )
-            reduction, reduction_source = _ebitda_reduction(config, sector, base_bucket, level)
+            if brg is None:
+                out.at[idx, f"out_of_scope_{level}"] = True
+                record_out_of_scope(
+                    out_scope,
+                    row,
+                    scenario,
+                    "C&I",
+                    level,
+                    "FCCR",
+                    [risk_rating_field],
+                    "missing_or_invalid_brg",
+                )
+                record_exception(
+                    exceptions,
+                    "ERROR",
+                    "C&I",
+                    "CI_BRG_INVALID",
+                    "C&I borrower risk grade was missing or invalid; FCCR was not calculated.",
+                    borrower_id=row.get(
+                        scenario["borrower"].get("borrower_id_field", "borrower_id")
+                    ),
+                    portfolio=row.get(
+                        scenario["borrower"].get("portfolio_field", "portfolio")
+                    ),
+                    stress_level=level,
+                    module="C&I",
+                    field=risk_rating_field,
+                    details=(
+                        f"sector={sector};risk_rating={row.get(risk_rating_field)};"
+                        "expected=integral_1_to_7_or_numeric_8_plus"
+                    ),
+                )
+                continue
+            reduction, reduction_source = _ebitda_reduction(
+                config,
+                sector,
+                brg,
+                level,
+            )
             rate_raw, rate_source = lookup_parameter_with_source(
                 config.get("interest_rate_stress"), sector, level, np.nan
             )
             interest_rate_stress = to_number(rate_raw, np.nan)
+            reduction = targeted_parameter(
+                row, scenario, "C&I", "ebitda_reduction", level, reduction
+            )
+            interest_rate_stress = targeted_parameter(
+                row,
+                scenario,
+                "C&I",
+                "interest_rate_stress",
+                level,
+                interest_rate_stress,
+            )
             _log_ci_default(
                 exceptions,
                 fallback_events,
@@ -137,7 +196,10 @@ def run_ci(
                         stress_level=level,
                         module="C&I",
                         field=field,
-                        details=f"sector={sector}",
+                        details=(
+                            f"sector={sector};brg={brg or 'invalid'};"
+                            f"risk_rating={row.get(risk_rating_field)}"
+                        ),
                     )
                 continue
             result = _calculate_fccr(
@@ -199,7 +261,7 @@ def run_ci(
             out.at[idx, f"ci_available_cash_flow_{level}"] = result["available_cash_flow"]
             out.at[idx, f"ci_debt_service_{level}"] = result["debt_service"]
             out.at[idx, f"ci_fccr_{level}"] = result["fccr"]
-            bucket = lower_metric_bucket(result["fccr"], config.get("cutoffs", {}))
+            bucket = lower_metric_bucket(result["fccr"], fccr_cutoffs)
             out.at[idx, f"stressed_bucket_{level}"] = (
                 "Unknown" if base_bucket == "Unknown" else worse_bucket(base_bucket, bucket)
             )
@@ -222,13 +284,17 @@ def _calculate_fccr(
     inputs are treated as zero by `_value`; the loan is excluded only when the
     final available cash flow is zero/missing or debt service is nonpositive.
     """
-    base_bucket = row.get("base_bucket", "Pass")
+    brg = _brg_key(row.get(config.get("_risk_rating_field", "risk_rating")))
     cash_interest = _cash_interest(row, sector_cfg, fields)
     used_fields = [*_fields_used(sector_cfg, fields), *_cash_interest_fields(cash_interest, fields)]
     missing = [field for field in used_fields if field not in row or pd.isna(row[field])]
 
     ebitda = _value(row, fields["ebitda"])
-    reduction = _ebitda_reduction(config, sector, base_bucket, level)[0] if reduction is None else reduction
+    reduction = (
+        _ebitda_reduction(config, sector, brg, level)[0]
+        if reduction is None
+        else reduction
+    )
     # EBITDA is stressed first; taxes, distributions, and certain dividends
     # are then pro-formed as their original EBITDA ratios times stressed EBITDA.
     stressed_ebitda = ebitda * (1 - reduction)
@@ -315,26 +381,45 @@ def _sector_config(config: Mapping[str, Any], sector: Any) -> tuple[Mapping[str,
     return merged, used_default
 
 
-def _ebitda_reduction(config: Mapping[str, Any], sector: Any, bucket: str, level: str) -> tuple[float, str]:
-    """Resolve the EBITDA reduction by sector, base bucket, and stress level."""
+def _ebitda_reduction(
+    config: Mapping[str, Any],
+    sector: Any,
+    brg: str | None,
+    level: str,
+) -> tuple[float, str]:
+    """Resolve EBITDA reduction by sector, normalized BRG, and stress level."""
+    sector_table, source = _ebitda_reduction_table(config, sector)
+    if not isinstance(sector_table, Mapping) or brg is None or brg not in sector_table:
+        return np.nan, "missing"
+    brg_table = sector_table[brg]
+    if isinstance(brg_table, Mapping):
+        value = brg_table.get(level)
+        return to_number(value, np.nan), source if value is not None else "missing"
+    return to_number(brg_table, np.nan), source
+
+
+def _ebitda_reduction_table(
+    config: Mapping[str, Any], sector: Any
+) -> tuple[Any, str]:
+    """Return the effective sector table and its audit source."""
     table = config.get("ebitda_reduction", {})
     if isinstance(table, Mapping) and str(sector) in table:
-        sector_table = table[str(sector)]
-        source = "sector"
-    elif isinstance(table, Mapping) and "default" in table:
-        sector_table = table["default"]
-        source = "default"
-    else:
-        sector_table = table
-        source = "scalar" if not isinstance(table, Mapping) else "missing"
-    if isinstance(sector_table, Mapping) and bucket in sector_table:
-        bucket_table = sector_table[bucket]
-        if isinstance(bucket_table, Mapping):
-            value = bucket_table.get(level)
-            return to_number(value, np.nan), source if value is not None else "missing"
-        return to_number(bucket_table, np.nan), source
-    value, nested_source = lookup_parameter_with_source(sector_table, sector, level, np.nan)
-    return to_number(value, np.nan), source if nested_source != "missing" else "missing"
+        return table[str(sector)], "sector"
+    if isinstance(table, Mapping) and "default" in table:
+        return table["default"], "default"
+    return table, "direct" if isinstance(table, Mapping) else "missing"
+
+
+def _brg_key(rating: Any) -> str | None:
+    """Normalize BRGs 1-7 exactly and cap every finite BRG >=8 at 8."""
+    numeric = to_number(rating, np.nan)
+    if not np.isfinite(numeric) or numeric < 1:
+        return None
+    if numeric >= 8:
+        return "8"
+    if not float(numeric).is_integer():
+        return None
+    return str(int(numeric))
 
 
 def _log_ci_default(

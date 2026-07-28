@@ -18,7 +18,7 @@ from .borrower import (
     record_identity_data_issues,
 )
 from .comparison import build_comparison_report
-from .config import output_dir_for
+from .config import output_dir_for, validate_scenario
 from .exceptions import exception_frame
 from .io import load_inputs, metadata_for_inputs, write_csv, write_json
 from .modules.base import initialize_results
@@ -27,8 +27,12 @@ from .modules.consumer import run_consumer
 from .modules.cre import run_cre
 from .reporting import build_reports
 from .tagging import apply_tags, assign_primary_modules
+from .targeted import run_targeted_stress, targeted_enabled
 from .utils import hash_json
 from .version import VERSION
+
+
+OUTPUT_MANIFEST_KIND = "stress_engine_outputs"
 
 
 class StressEngine:
@@ -42,6 +46,7 @@ class StressEngine:
     def __init__(self, scenario: Mapping[str, Any], base_dir: str | Path):
         self.scenario = dict(scenario)
         self.base_dir = Path(base_dir).resolve()
+        validate_scenario(self.scenario)
 
     def run(
         self,
@@ -71,6 +76,57 @@ class StressEngine:
         record_best_available_fallbacks(borrowers, self.scenario, exceptions)
         source_reconciliation = build_source_reconciliation(borrowers, loaded, self.scenario, exceptions)
         audit_borrowers = borrowers.copy()
+
+        if targeted_enabled(self.scenario):
+            targeted = run_targeted_stress(self.scenario, loaded, exceptions)
+            reports = targeted["reports"]
+            reports["input_summary"] = input_summary
+            reports["tag_summary"] = targeted["tag_summary"]
+            reports["source_reconciliation"] = source_reconciliation
+            reports["out_of_scope_detail"] = targeted["out_of_scope"]
+            reports["exception_log"] = exception_frame(
+                exceptions, ["scenario_variant", "loan_id"]
+            )
+            if run_comparison:
+                previous = _previous_scenarios(self.scenario)
+                if previous:
+                    reports["scenario_diff"] = build_comparison_report(
+                        self.scenario,
+                        reports,
+                        previous,
+                        max_variable_reruns=self.scenario.get("comparison", {}).get(
+                            "max_variable_reruns"
+                        ),
+                    )
+            metadata = self._metadata(loaded, reports)
+            metadata["targeted_stress"] = {
+                "enabled": True,
+                "primary_variant": targeted["primary_variant"],
+                "variants": targeted["variant_names"],
+                "result_grain": "loan",
+            }
+            metadata["output_hashes"]["stressed_loan_results"] = hash_json(
+                targeted["variant_results"].fillna("").to_dict(orient="records")
+            )
+            if write_outputs:
+                destination = output_dir_for(
+                    self.scenario, self.base_dir, output_dir
+                )
+                self._write_targeted_outputs(
+                    destination,
+                    audit_borrowers,
+                    targeted["variant_results"],
+                    reports,
+                    metadata,
+                )
+            return {
+                "borrowers": audit_borrowers,
+                "loan_context": targeted["context"],
+                "results": targeted["results"],
+                "variant_results": targeted["variant_results"],
+                "reports": reports,
+                "metadata": metadata,
+            }
 
         # 4. Stress modules share a results frame initialized with base buckets.
         # `module_population` inside each module enforces the resolved
@@ -183,7 +239,70 @@ class StressEngine:
         write_json(_scenario_for_audit(self.scenario), output_dir / "scenario_used.json")
         _remove_stale_outputs(output_dir, current_files)
         write_json(
-            {"engine_version": VERSION, "files": sorted(current_files | {"output_manifest.json"})},
+            {
+                "engine_version": VERSION,
+                "kind": OUTPUT_MANIFEST_KIND,
+                "files": sorted(current_files | {"output_manifest.json"}),
+            },
+            output_dir / "output_manifest.json",
+        )
+
+    def _write_targeted_outputs(
+        self,
+        output_dir: Path,
+        audit_borrowers: pd.DataFrame,
+        variant_results: pd.DataFrame,
+        reports: Mapping[str, pd.DataFrame],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Write loan-grain targeted variants without changing legacy mode files."""
+        borrower_id = self.scenario["borrower"]["borrower_id_field"]
+        loan_id = self.scenario["borrower"].get("loan_id_field", "loan_id")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        current_files = {
+            "borrower_audit_raw.csv",
+            "stressed_loan_results.csv",
+            "metadata.json",
+            "scenario_used.json",
+        }
+        write_csv(audit_borrowers, output_dir / "borrower_audit_raw.csv", [borrower_id])
+        write_csv(
+            variant_results,
+            output_dir / "stressed_loan_results.csv",
+            ["scenario_variant", borrower_id, loan_id, "_exposure_id"],
+        )
+        for name, frame in reports.items():
+            if not isinstance(frame, pd.DataFrame):
+                continue
+            filename = f"{name}.csv"
+            current_files.add(filename)
+            sort_cols = [
+                column
+                for column in [
+                    "scenario_variant",
+                    "shock_order",
+                    "operation_sequence",
+                    "shock",
+                    "tier",
+                    "portfolio",
+                    "stress_level",
+                    "bucket",
+                    borrower_id,
+                    loan_id,
+                    "_exposure_id",
+                ]
+                if column in frame.columns
+            ]
+            write_csv(frame, output_dir / filename, sort_cols)
+        write_json(metadata, output_dir / "metadata.json")
+        write_json(_scenario_for_audit(self.scenario), output_dir / "scenario_used.json")
+        _remove_stale_outputs(output_dir, current_files)
+        write_json(
+            {
+                "engine_version": VERSION,
+                "kind": OUTPUT_MANIFEST_KIND,
+                "files": sorted(current_files | {"output_manifest.json"}),
+            },
             output_dir / "output_manifest.json",
         )
 
@@ -228,7 +347,12 @@ def _remove_stale_outputs(output_dir: Path, current_files: set[str]) -> None:
         try:
             with manifest.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            files = payload.get("files", []) if isinstance(payload, Mapping) else []
+            files = (
+                payload.get("files", [])
+                if isinstance(payload, Mapping)
+                and payload.get("kind") == OUTPUT_MANIFEST_KIND
+                else []
+            )
             if isinstance(files, list):
                 prior_files.update(
                     filename
