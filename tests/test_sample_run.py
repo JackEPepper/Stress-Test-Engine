@@ -221,6 +221,36 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertIn("source_reconciliation.csv", output_files)
 
             cecl = result["reports"]["cecl_summary"]
+            self.assertNotIn("in_scope_balance", cecl.columns)
+            self.assertNotIn("out_of_scope_balance", cecl.columns)
+            consumer_cecl = cecl[
+                (cecl["portfolio"] == "Consumer")
+                & (cecl["bucket"] == "Total")
+            ].set_index("stress_level")
+            self.assertEqual(
+                float(
+                    consumer_cecl.at[
+                        "Base", "proforma_cecl_reserve"
+                    ]
+                ),
+                4000.0,
+            )
+            self.assertAlmostEqual(
+                float(
+                    consumer_cecl.at[
+                        "S1", "proforma_cecl_reserve"
+                    ]
+                ),
+                4377.85,
+            )
+            self.assertAlmostEqual(
+                float(
+                    consumer_cecl.at[
+                        "S2", "proforma_cecl_reserve"
+                    ]
+                ),
+                5403.04,
+            )
             unavailable = cecl[cecl["cecl_reserve_status"] == "unavailable"]
             self.assertTrue(unavailable.empty)
             cre_s2_sub = cecl[
@@ -249,6 +279,149 @@ class SampleScenarioRunTest(unittest.TestCase):
                 & (cecl["bucket"] == "Total")
             ].iloc[0]
             self.assertEqual(float(aggregate_base["proforma_cecl_reserve"]), 76000.0)
+
+    def test_arr_retains_sponsor_population_but_is_excluded_from_models(self):
+        scenario, base_dir = load_scenario(SCENARIO)
+        # Use a deterministic sample attribute to designate B006 as ARR without
+        # changing the shared example input used by the other regression tests.
+        scenario["tags"]["ARR"]["include"] = {
+            "all": [
+                {
+                    "field": "subsector",
+                    "op": "has_token",
+                    "value": "Sponsor and Specialty",
+                },
+                {
+                    "field": "naics_code",
+                    "op": "eq",
+                    "value": 213112,
+                },
+            ]
+        }
+        result = StressEngine(scenario, base_dir).run(
+            write_outputs=False, run_comparison=False
+        )
+
+        borrowers = result["borrowers"].set_index("borrower_id")
+        arr = borrowers.loc["B006"]
+        sponsor_control = borrowers.loc["B014"]
+        self.assertTrue(bool(arr["tag_arr"]))
+        self.assertTrue(bool(arr["tag_ci_sector_sponsor_and_specialty"]))
+        self.assertTrue(bool(arr["tag_ci_model"]))
+        self.assertIn("CI_Sector_Sponsor_and_Specialty", arr["all_tags"])
+        self.assertIn("ARR", arr["all_tags"])
+        self.assertEqual(arr["ci_sector"], "Sponsor and Specialty")
+        self.assertTrue(bool(arr["model_excluded"]))
+        self.assertEqual(arr["model_exclusion_tags"], "ARR")
+        self.assertEqual(arr["model_tags"], "")
+        self.assertEqual(arr["eligible_modules"], "")
+        for field in (
+            "primary_module",
+            "model_module",
+            "model_portfolio",
+            "cecl_portfolio",
+        ):
+            self.assertTrue(pd.isna(arr[field]), msg=field)
+
+        self.assertFalse(bool(sponsor_control["model_excluded"]))
+        self.assertEqual(sponsor_control["primary_module"], "C&I")
+        self.assertEqual(
+            sponsor_control["cecl_portfolio"], "Sponsor and Specialty"
+        )
+
+        stressed = result["results"].set_index("borrower_id")
+        self.assertEqual(stressed.at["B006", "module_applied"], "")
+        self.assertTrue(pd.isna(stressed.at["B006", "ci_fccr_S1"]))
+        self.assertTrue(pd.isna(stressed.at["B006", "ci_fccr_S2"]))
+        self.assertEqual(stressed.at["B014", "module_applied"], "C&I")
+
+        tag_summary = result["reports"]["tag_summary"]
+        populations = tag_summary[tag_summary["tie_out_name"].isna()].set_index(
+            "tag"
+        )
+        self.assertEqual(int(populations.at["ARR", "borrower_count"]), 1)
+        self.assertEqual(float(populations.at["ARR", "balance"]), 500000.0)
+        self.assertEqual(
+            int(
+                populations.at[
+                    "ARR", "not_model_excluded_borrower_count"
+                ]
+            ),
+            0,
+        )
+        self.assertEqual(
+            float(populations.at["ARR", "not_model_excluded_balance"]),
+            0.0,
+        )
+        self.assertEqual(
+            float(populations.at["ARR", "model_excluded_balance"]), 500000.0
+        )
+        self.assertEqual(
+            int(
+                populations.at[
+                    "CI_Sector_Sponsor_and_Specialty", "borrower_count"
+                ]
+            ),
+            2,
+        )
+        self.assertEqual(
+            float(
+                populations.at["CI_Sector_Sponsor_and_Specialty", "balance"]
+            ),
+            600000.0,
+        )
+        self.assertEqual(
+            float(
+                populations.at[
+                    "CI_Sector_Sponsor_and_Specialty",
+                    "not_model_excluded_balance",
+                ]
+            ),
+            100000.0,
+        )
+        self.assertEqual(
+            float(
+                populations.at[
+                    "CI_Sector_Sponsor_and_Specialty",
+                    "model_excluded_balance",
+                ]
+            ),
+            500000.0,
+        )
+        sponsor_tieout = tag_summary[
+            (
+                tag_summary["tag"]
+                == "CI_Sector_Sponsor_and_Specialty"
+            )
+            & tag_summary["tie_out_name"].notna()
+        ].iloc[0]
+        self.assertTrue(bool(sponsor_tieout["passed"]))
+        self.assertEqual(float(sponsor_tieout["actual"]), 600000.0)
+
+        ci_sponsor = result["reports"]["ci_summary"].loc[
+            result["reports"]["ci_summary"]["sector"]
+            == "Sponsor and Specialty"
+        ].iloc[0]
+        self.assertEqual(int(ci_sponsor["borrower_count"]), 1)
+        self.assertEqual(float(ci_sponsor["balance"]), 100000.0)
+
+        ci_base = result["reports"]["migration_summary"]
+        ci_base = ci_base[
+            (ci_base["portfolio"] == "C&I")
+            & (ci_base["stress_level"] == "Base")
+        ]
+        self.assertEqual(float(ci_base["balance"].sum()), 1450000.0)
+
+        cecl_sponsor_total = result["reports"]["cecl_summary"]
+        cecl_sponsor_total = cecl_sponsor_total[
+            (
+                cecl_sponsor_total["portfolio"]
+                == "Sponsor and Specialty"
+            )
+            & (cecl_sponsor_total["stress_level"] == "Base")
+            & (cecl_sponsor_total["bucket"] == "Total")
+        ].iloc[0]
+        self.assertEqual(float(cecl_sponsor_total["balance"]), 100000.0)
 
     def test_repeated_runs_are_deterministic_for_core_reports(self):
         first = self._run()

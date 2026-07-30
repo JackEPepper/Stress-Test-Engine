@@ -383,14 +383,39 @@ def build_loan_context(
     loans, tag_summary = apply_tags(loans, scenario, loaded, exceptions)
     if not tag_summary.empty:
         tag_summary["loan_count"] = tag_summary["borrower_count"]
+        tag_summary["not_model_excluded_loan_count"] = tag_summary[
+            "not_model_excluded_borrower_count"
+        ]
+        tag_summary["model_excluded_loan_count"] = tag_summary[
+            "model_excluded_borrower_count"
+        ]
         for idx, summary_row in tag_summary.iterrows():
             tag_column = summary_row.get("tag_column")
             if tag_column in loans.columns:
                 selected = loans[loans[tag_column].fillna(False).astype(bool)]
+                model_excluded = selected[
+                    "model_excluded"
+                ].fillna(False).astype(bool)
+                model_included_rows = selected[~model_excluded]
+                model_excluded_rows = selected[model_excluded]
                 tag_summary.at[idx, "borrower_count"] = int(
                     selected[borrower_id].nunique(dropna=True)
                 )
                 tag_summary.at[idx, "loan_count"] = int(len(selected))
+                tag_summary.at[
+                    idx, "not_model_excluded_borrower_count"
+                ] = int(
+                    model_included_rows[borrower_id].nunique(dropna=True)
+                )
+                tag_summary.at[idx, "not_model_excluded_loan_count"] = int(
+                    len(model_included_rows)
+                )
+                tag_summary.at[idx, "model_excluded_borrower_count"] = int(
+                    model_excluded_rows[borrower_id].nunique(dropna=True)
+                )
+                tag_summary.at[idx, "model_excluded_loan_count"] = int(
+                    len(model_excluded_rows)
+                )
     loans = assign_primary_modules(loans, scenario, exceptions)
     loans = _enrich_loans(loans, scenario, loaded)
     return loans.sort_values(["_exposure_id"], kind="mergesort").reset_index(drop=True), tag_summary
@@ -684,15 +709,34 @@ def _resolve_variant(
             exceptions,
             shock_name,
         )
+        selector_matched = selected.copy()
+        shock_excluded = pd.Series(False, index=context.index)
         if shock.get("exclude"):
-            excluded, _ = _evaluate_selector(
+            shock_excluded, _ = _evaluate_selector(
                 context, shock["exclude"], loaded, exceptions, shock_name
             )
-            selected &= ~excluded
+            selected &= ~shock_excluded
+        model_excluded = context.get(
+            "model_excluded", pd.Series(False, index=context.index)
+        ).fillna(False).astype(bool)
+        selected &= ~model_excluded
         tiers = _resolve_tiers(context, selected, external_tier, shock, loaded, exceptions, shock_name)
 
         for idx, row in context.iterrows():
             is_selected = bool(selected.at[idx])
+            was_selector_match = bool(selector_matched.at[idx])
+            was_shock_excluded = bool(shock_excluded.at[idx])
+            was_model_excluded = bool(model_excluded.at[idx])
+            if is_selected:
+                selection_reason = "selected"
+            elif not was_selector_match:
+                selection_reason = "selector_not_matched"
+            elif was_shock_excluded:
+                selection_reason = "shock_excluded"
+            elif was_model_excluded:
+                selection_reason = "model_excluded"
+            else:
+                selection_reason = "not_selected"
             tier_name = tiers.at[idx] if is_selected else ""
             selection_rows.append(
                 {
@@ -704,6 +748,13 @@ def _resolve_variant(
                     "borrower_id": row.get(scenario["borrower"]["borrower_id_field"]),
                     "primary_module": row.get("primary_module"),
                     "tier": tier_name,
+                    "selector_matched": was_selector_match,
+                    "shock_excluded": was_shock_excluded,
+                    "model_excluded": was_model_excluded,
+                    "model_exclusion_tags": row.get(
+                        "model_exclusion_tags", ""
+                    ),
+                    "selection_reason": selection_reason,
                     "selected": is_selected,
                     "balance": row.get(scenario["borrower"]["balance_field"]),
                 }

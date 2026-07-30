@@ -12,6 +12,26 @@ from .exceptions import record_exception
 from .utils import get_levels, pct, to_number, weighted_average
 
 REPORT_BUCKETS = [*BUCKETS, "Unknown"]
+BUCKET_SUMMARY_COLUMNS = [
+    "portfolio",
+    "stress_level",
+    "bucket",
+    "balance",
+    "borrower_count",
+    "source",
+]
+CECL_SUMMARY_COLUMNS = [
+    "portfolio",
+    "stress_level",
+    "bucket",
+    "method",
+    "balance",
+    "reserve_ratio",
+    "proforma_cecl_reserve",
+    "proforma_cecl_ratio",
+    "cecl_reserve_status",
+    "exception_code",
+]
 
 def build_reports(
     results: pd.DataFrame,
@@ -26,19 +46,26 @@ def build_reports(
     also where overlays and CECL summaries are calculated.
     """
     exceptions = exceptions if exceptions is not None else []
-    bucket_summary = build_bucket_summary(results, scenario)
-    bucket_summary, overlay_summary = apply_overlays(bucket_summary, results, scenario, exceptions)
+    modeled_results = _model_included_rows(results)
+    bucket_summary = build_bucket_summary(modeled_results, scenario)
+    bucket_summary, overlay_summary = apply_overlays(
+        bucket_summary, modeled_results, scenario, exceptions
+    )
     # CECL can group more finely than migration reporting. In the example,
     # migration reports use CRE/C&I, while CECL can use CRE rollup or subsector.
-    cecl_bucket_summary = build_cecl_bucket_summary(results, bucket_summary, scenario)
-    cecl_summary = build_cecl_summary(results, cecl_bucket_summary, scenario, exceptions)
+    cecl_bucket_summary = build_cecl_bucket_summary(
+        modeled_results, bucket_summary, scenario
+    )
+    cecl_summary = build_cecl_summary(
+        modeled_results, cecl_bucket_summary, scenario, exceptions
+    )
     reports = {
         "migration_summary": bucket_summary,
         "overlay_summary": overlay_summary,
         "cecl_summary": cecl_summary,
-        "cre_summary": build_cre_summary(results, scenario),
-        "ci_summary": build_ci_summary(results, scenario),
-        "consumer_summary": build_consumer_summary(results, scenario),
+        "cre_summary": build_cre_summary(modeled_results, scenario),
+        "ci_summary": build_ci_summary(modeled_results, scenario),
+        "consumer_summary": build_consumer_summary(modeled_results, scenario),
         "out_of_scope_summary": build_out_of_scope_summary(out_of_scope),
     }
     return reports
@@ -54,7 +81,7 @@ def build_bucket_summary(
     portfolio_field = portfolio_field or scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
     rows: List[Dict[str, Any]] = []
-    frame = results
+    frame = _model_included_rows(results)
     if not include_consumer:
         if "primary_module" in frame.columns:
             frame = frame[frame["primary_module"].astype(str).str.lower() != "consumer"]
@@ -78,7 +105,18 @@ def build_bucket_summary(
                     "source": "model",
                 }
             )
-    return pd.DataFrame(rows)
+    columns = list(BUCKET_SUMMARY_COLUMNS)
+    if scenario.get("_targeted_mode"):
+        columns.insert(columns.index("source"), "loan_count")
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _model_included_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return rows that remain eligible for modeled reports."""
+    if "model_excluded" not in frame.columns:
+        return frame
+    included = ~frame["model_excluded"].fillna(False).astype(bool)
+    return frame.loc[included]
 
 
 def build_cecl_bucket_summary(
@@ -134,7 +172,9 @@ def build_cecl_summary(
     for portfolio in sorted(bucket_summary["portfolio"].dropna().unique()):
         method = method_by_portfolio.get(portfolio, "bucket_reserve_ratio")
         if method == "expected_loss":
-            rows.extend(_consumer_cecl_rows(results, portfolio, scenario, levels, exceptions))
+            rows.extend(
+                _consumer_cecl_rows(results, portfolio, scenario, levels)
+            )
             continue
         portfolio_total_rows = []
         for level in levels:
@@ -216,12 +256,30 @@ def build_cecl_summary(
             )
         rows.extend(portfolio_total_rows)
 
-    total_df = pd.DataFrame(rows)
+    total_df = pd.DataFrame(rows, columns=CECL_SUMMARY_COLUMNS)
     aggregate_rows = []
     for level in levels:
         totals = total_df[(total_df["stress_level"] == level) & (total_df["bucket"] == "Total")]
         balance = float(pd.to_numeric(totals["balance"], errors="coerce").sum())
         aggregate_unavailable = totals.get("cecl_reserve_status", pd.Series(dtype=object)).eq("unavailable").any()
+        unavailable_codes = sorted(
+            {
+                str(code).strip()
+                for code in totals.loc[
+                    totals.get(
+                        "cecl_reserve_status",
+                        pd.Series(index=totals.index, dtype=object),
+                    ).eq("unavailable"),
+                    "exception_code",
+                ].dropna()
+                if str(code).strip()
+            }
+        )
+        aggregate_exception_code = (
+            ";".join(unavailable_codes)
+            if unavailable_codes
+            else ("CECL_COMPONENT_UNAVAILABLE" if aggregate_unavailable else "")
+        )
         reserve = np.nan if aggregate_unavailable else float(pd.to_numeric(totals["proforma_cecl_reserve"], errors="coerce").sum())
         aggregate_rows.append(
             {
@@ -234,7 +292,7 @@ def build_cecl_summary(
                 "proforma_cecl_reserve": reserve,
                 "proforma_cecl_ratio": np.nan if aggregate_unavailable else pct(reserve, balance),
                 "cecl_reserve_status": "unavailable" if aggregate_unavailable else "available",
-                "exception_code": "CECL_RESERVE_RATIO_UNAVAILABLE" if aggregate_unavailable else "",
+                "exception_code": aggregate_exception_code,
             }
         )
     return pd.concat([total_df, pd.DataFrame(aggregate_rows)], ignore_index=True)
@@ -311,6 +369,7 @@ def build_consumer_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -
     if frame.empty:
         return pd.DataFrame()
     for portfolio, group in frame.groupby(portfolio_field, dropna=False):
+        reserve_field_available = reserve_field in group.columns
         for level in levels:
             suffix = "unstressed" if level == "unstressed" else level
             pd_field = f"consumer_pd_{suffix}"
@@ -319,18 +378,29 @@ def build_consumer_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -
             balance = float(pd.to_numeric(group[balance_field], errors="coerce").sum())
             el_values = pd.to_numeric(group.get(el_field, _empty_series(group)), errors="coerce")
             scope_mask = el_values.notna()
+            in_scope_counts = _population_counts(
+                group.loc[scope_mask], scenario
+            )
             in_scope_balance = float(pd.to_numeric(group.loc[scope_mask, balance_field], errors="coerce").sum())
             out_of_scope_balance = balance - in_scope_balance
             el = float(el_values.sum(min_count=1)) if scope_mask.any() else np.nan
             if level == "unstressed":
-                proforma_reserve = float(pd.to_numeric(group.get(reserve_field, _empty_series(group)), errors="coerce").fillna(0.0).sum())
+                proforma_reserve = (
+                    float(
+                        pd.to_numeric(
+                            group[reserve_field], errors="coerce"
+                        ).fillna(0.0).sum()
+                    )
+                    if reserve_field_available
+                    else np.nan
+                )
             else:
                 proforma_values = pd.to_numeric(
                     group.get(f"consumer_proforma_cecl_{suffix}", _empty_series(group)), errors="coerce"
                 )
                 proforma_reserve = (
-                    float(proforma_values.sum(min_count=1))
-                    if out_of_scope_balance <= 1e-9 and proforma_values.notna().any()
+                    float(proforma_values.fillna(0.0).sum())
+                    if reserve_field_available
                     else np.nan
                 )
             rows.append(
@@ -339,19 +409,40 @@ def build_consumer_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -
                     "stress_level": "Base" if level == "unstressed" else level,
                     **_population_counts(group, scenario),
                     "balance": balance,
-                    "in_scope_borrower_count": int(scope_mask.sum()),
+                    "in_scope_borrower_count": in_scope_counts[
+                        "borrower_count"
+                    ],
+                    **(
+                        {
+                            "in_scope_loan_count": in_scope_counts[
+                                "loan_count"
+                            ]
+                        }
+                        if scenario.get("_targeted_mode")
+                        else {}
+                    ),
                     "in_scope_balance": in_scope_balance,
                     "out_of_scope_balance": out_of_scope_balance,
                     "weighted_average_pd": weighted_average(group.get(pd_field, _empty_series(group)), group[balance_field]),
                     "weighted_average_lgd_ratio": weighted_average(group.get(lgd_field, _empty_series(group)), group[balance_field]),
                     "expected_loss": el,
-                    "expected_loss_ratio": pct(el, balance),
+                    "expected_loss_ratio": (
+                        np.nan if pd.isna(el) else pct(el, balance)
+                    ),
                     "qualitative_reserve": float(
                         pd.to_numeric(group.get("consumer_qualitative_reserve", _empty_series(group)), errors="coerce").sum(min_count=1)
                     ),
                     "proforma_cecl_reserve": proforma_reserve,
-                    "proforma_cecl_ratio": pct(proforma_reserve, balance),
-                    "calculation_status": "available" if out_of_scope_balance <= 1e-9 else "unavailable_out_of_scope",
+                    "proforma_cecl_ratio": (
+                        np.nan
+                        if pd.isna(proforma_reserve)
+                        else pct(proforma_reserve, balance)
+                    ),
+                    "calculation_status": (
+                        "available"
+                        if reserve_field_available
+                        else "unavailable_missing_reserve_field"
+                    ),
                 }
             )
     return pd.DataFrame(rows)
@@ -455,57 +546,42 @@ def _consumer_cecl_rows(
     portfolio: Any,
     scenario: Mapping[str, Any],
     levels: List[str],
-    exceptions: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Use consumer expected loss as the CECL reserve output."""
+    """Use Consumer expected loss as the CECL reserve output.
+
+    Missing stressed values contribute zero to the reported portfolio reserve.
+    Detailed missing-input and out-of-scope records remain in their dedicated
+    reports rather than making the CECL summary unavailable.
+    """
     portfolio_field = scenario.get("cecl", {}).get(
         "portfolio_field", scenario["borrower"].get("portfolio_field", "portfolio")
     )
     balance_field = scenario["borrower"]["balance_field"]
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
     group = results[results[portfolio_field] == portfolio]
+    reserve_field_available = reserve_field in group.columns
     rows = []
     for level in levels:
         balance = float(pd.to_numeric(group[balance_field], errors="coerce").sum())
-        if level == "Base":
-            if reserve_field in group.columns:
-                reserve = float(pd.to_numeric(group[reserve_field], errors="coerce").fillna(0.0).sum())
-                status = "available"
-                exception_code = ""
-            else:
-                reserve = np.nan
-                status = "unavailable"
-                exception_code = "CECL_RESERVE_FIELD_MISSING"
-            in_scope_balance = balance
-            out_of_scope_balance = 0.0
+        if not reserve_field_available:
+            reserve = np.nan
+            status = "unavailable"
+            exception_code = "CECL_RESERVE_FIELD_MISSING"
+        elif level == "Base":
+            reserve = float(
+                pd.to_numeric(
+                    group[reserve_field], errors="coerce"
+                ).fillna(0.0).sum()
+            )
+            status = "available"
+            exception_code = ""
         else:
             reserve_values = pd.to_numeric(
                 group.get(f"consumer_proforma_cecl_{level}", _empty_series(group)), errors="coerce"
             )
-            scope_mask = reserve_values.notna() & ~group.get(
-                f"out_of_scope_{level}", pd.Series(False, index=group.index)
-            ).fillna(False).astype(bool)
-            in_scope_balance = float(pd.to_numeric(group.loc[scope_mask, balance_field], errors="coerce").sum())
-            out_of_scope_balance = balance - in_scope_balance
-            if out_of_scope_balance > 1e-9 or not scope_mask.any():
-                reserve = np.nan
-                status = "unavailable"
-                exception_code = "CONSUMER_CECL_UNAVAILABLE_OUT_OF_SCOPE"
-                record_exception(
-                    exceptions,
-                    "ERROR",
-                    "cecl",
-                    exception_code,
-                    "Consumer stressed CECL was unavailable because part or all of the portfolio was out of scope.",
-                    portfolio=portfolio,
-                    stress_level=level,
-                    field="consumer_proforma_cecl",
-                    details=f"in_scope_balance={in_scope_balance}; out_of_scope_balance={out_of_scope_balance}",
-                )
-            else:
-                reserve = float(reserve_values[scope_mask].sum(min_count=1))
-                status = "available"
-                exception_code = ""
+            reserve = float(reserve_values.fillna(0.0).sum())
+            status = "available"
+            exception_code = ""
         rows.append(
             {
                 "portfolio": portfolio,
@@ -515,11 +591,11 @@ def _consumer_cecl_rows(
                 "balance": balance,
                 "reserve_ratio": np.nan,
                 "proforma_cecl_reserve": reserve,
-                "proforma_cecl_ratio": pct(reserve, balance),
+                "proforma_cecl_ratio": (
+                    np.nan if pd.isna(reserve) else pct(reserve, balance)
+                ),
                 "cecl_reserve_status": status,
                 "exception_code": exception_code,
-                "in_scope_balance": in_scope_balance,
-                "out_of_scope_balance": out_of_scope_balance,
             }
         )
     return rows

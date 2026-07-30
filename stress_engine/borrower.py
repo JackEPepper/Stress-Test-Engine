@@ -134,6 +134,11 @@ def _record_identity_key_issues(
 def _largest_loan_fields(scenario: Mapping[str, Any], columns: Sequence[str]) -> List[str]:
     """Return loan attributes that must be inherited from the largest loan."""
     config = scenario.get("borrower", {})
+    aggregate_or_key_fields = {
+        config.get("borrower_id_field"),
+        config.get("balance_field"),
+        *as_list(config.get("sum_fields")),
+    }
     fields = {
         config.get("risk_rating_field", "risk_rating"),
         config.get("maturity_date_field", "maturity_date"),
@@ -146,7 +151,13 @@ def _largest_loan_fields(scenario: Mapping[str, Any], columns: Sequence[str]) ->
         for value_spec in tag.get("assign", {}).values():
             if isinstance(value_spec, Mapping) and value_spec.get("from_field"):
                 fields.add(value_spec["from_field"])
-    return sorted(field for field in fields if field and field in columns)
+    return sorted(
+        field
+        for field in fields
+        if field
+        and field in columns
+        and field not in aggregate_or_key_fields
+    )
 
 
 def _largest_loan_rows(

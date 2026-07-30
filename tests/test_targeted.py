@@ -79,6 +79,125 @@ class TargetedStressTest(unittest.TestCase):
         self.assertEqual(int(tariff["borrower_count"].sum()), 3)
         self.assertIn("scenario_variant", result["reports"]["migration_summary"])
         self.assertIn("loan_count", result["reports"]["migration_summary"])
+        cre_population = result["reports"]["tag_summary"]
+        cre_population = cre_population[
+            (cre_population["tag"] == "CRE_Model")
+            & cre_population["tie_out_name"].isna()
+        ].iloc[0]
+        self.assertEqual(int(cre_population["borrower_count"]), 6)
+        self.assertEqual(int(cre_population["loan_count"]), 7)
+        self.assertEqual(
+            int(cre_population["not_model_excluded_borrower_count"]),
+            6,
+        )
+        self.assertEqual(
+            int(cre_population["not_model_excluded_loan_count"]),
+            7,
+        )
+
+    def test_arr_exclusion_blocks_targeted_selection_and_assumptions(self):
+        scenario, base_dir = load_scenario(
+            ROOT / "examples" / "targeted_stress.json"
+        )
+        scenario["tags"]["ARR"]["include"] = {
+            "all": [
+                {
+                    "field": "subsector",
+                    "op": "has_token",
+                    "value": "Sponsor and Specialty",
+                },
+                {
+                    "field": "naics_code",
+                    "op": "eq",
+                    "value": 213112,
+                },
+            ]
+        }
+        result = StressEngine(scenario, base_dir).run(
+            write_outputs=False, run_comparison=False
+        )
+
+        context = result["loan_context"].set_index("loan_id")
+        arr = context.loc["L007"]
+        self.assertTrue(bool(arr["tag_arr"]))
+        self.assertTrue(bool(arr["tag_ci_sector_sponsor_and_specialty"]))
+        self.assertTrue(bool(arr["model_excluded"]))
+        self.assertEqual(arr["model_exclusion_tags"], "ARR")
+        self.assertTrue(pd.isna(arr["primary_module"]))
+
+        selection = result["reports"]["targeted_selection_detail"]
+        arr_oil = selection[
+            (selection["loan_id"] == "L007")
+            & (selection["shock"] == "oil_shock")
+        ]
+        self.assertEqual(len(arr_oil), 2)
+        self.assertTrue(arr_oil["selector_matched"].astype(bool).all())
+        self.assertTrue(arr_oil["model_excluded"].astype(bool).all())
+        self.assertTrue(arr_oil["selection_reason"].eq("model_excluded").all())
+        self.assertFalse(arr_oil["selected"].astype(bool).any())
+        control_oil = selection[
+            (selection["loan_id"] == "L006")
+            & (selection["shock"] == "oil_shock")
+        ]
+        self.assertEqual(len(control_oil), 2)
+        self.assertTrue(control_oil["selected"].astype(bool).all())
+
+        assumption_audit = result["reports"]["targeted_assumption_audit"]
+        self.assertFalse((assumption_audit["loan_id"] == "L007").any())
+        self.assertTrue((assumption_audit["loan_id"] == "L006").any())
+
+        arr_results = result["variant_results"][
+            result["variant_results"]["loan_id"] == "L007"
+        ]
+        self.assertEqual(len(arr_results), 4)
+        self.assertTrue(arr_results["model_excluded"].astype(bool).all())
+        self.assertTrue(arr_results["module_applied"].eq("").all())
+        self.assertTrue(arr_results["ci_fccr_S1"].isna().all())
+        self.assertTrue(arr_results["ci_fccr_S2"].isna().all())
+
+    def test_all_model_excluded_targeted_population_returns_empty_model_reports(
+        self,
+    ):
+        scenario, base_dir = load_scenario(
+            ROOT / "examples" / "targeted_stress.json"
+        )
+        scenario["tags"]["Exclude_All_For_Test"] = {
+            "model_eligible": False,
+            "exclude_from_model": True,
+            "include": {
+                "field": "outstanding_balance",
+                "op": "gt",
+                "value": 0,
+            },
+        }
+        result = StressEngine(scenario, base_dir).run(
+            write_outputs=False, run_comparison=False
+        )
+
+        self.assertTrue(
+            result["loan_context"]["model_excluded"].astype(bool).all()
+        )
+        migration = result["reports"]["migration_summary"]
+        self.assertTrue(migration.empty)
+        self.assertIn("scenario_variant", migration.columns)
+        self.assertIn("loan_count", migration.columns)
+        cecl = result["reports"]["cecl_summary"]
+        aggregate = cecl[
+            (cecl["portfolio"] == "Aggregate")
+            & (cecl["bucket"] == "Total")
+        ]
+        self.assertEqual(len(aggregate), 12)
+        self.assertTrue(aggregate["balance"].eq(0.0).all())
+        self.assertTrue(
+            aggregate["proforma_cecl_reserve"].eq(0.0).all()
+        )
+        selection = result["reports"]["targeted_selection_detail"]
+        self.assertFalse(selection["selected"].astype(bool).any())
+        selector_matches = selection[selection["selector_matched"]]
+        self.assertFalse(selector_matches.empty)
+        self.assertTrue(
+            selector_matches["selection_reason"].eq("model_excluded").all()
+        )
 
     def test_only_selected_loan_of_multi_loan_borrower_is_shocked(self):
         scenario, base_dir = load_scenario(ROOT / "examples" / "scenario.json")

@@ -103,6 +103,36 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     for field in ("borrower_id_field", "balance_field"):
         if field not in borrower:
             raise ValueError(f"Scenario borrower section must define '{field}'.")
+    # Import locally to keep scenario loading independent from tagging's input
+    # table types while still failing malformed tag flags before any data load.
+    from .tagging import normalize_tag_defs
+
+    tag_defs = normalize_tag_defs(scenario.get("tags", {}))
+    module_field = borrower.get("module_field", "model_module")
+    portfolio_field = borrower.get("portfolio_field", "model_portfolio")
+    cecl_portfolio_field = scenario.get("cecl", {}).get(
+        "portfolio_field", "cecl_portfolio"
+    )
+    for tag in tag_defs:
+        if tag.get("model_eligible", True):
+            continue
+        assignments = tag.get("assign", {})
+        assigned_module = assignments.get(module_field)
+        is_overlay_route = assigned_module == "Overlay"
+        disallowed_fields = [
+            field
+            for field in (
+                module_field,
+                portfolio_field,
+                cecl_portfolio_field,
+            )
+            if field in assignments and not is_overlay_route
+        ]
+        if disallowed_fields:
+            raise ValueError(
+                f"Non-model-eligible tag '{tag['name']}' cannot assign modeled "
+                f"routing fields: {', '.join(dict.fromkeys(disallowed_fields))}."
+            )
     levels = [str(level) for level in scenario.get("stress_levels", ["S1", "S2"])]
     if not levels or len(levels) != len(set(levels)):
         raise ValueError("Scenario stress_levels must contain unique, nonblank levels.")

@@ -64,6 +64,8 @@ def module_population(df: pd.DataFrame, scenario: Mapping[str, Any], module_conf
     ``primary_module`` field.
     """
     mask = pd.Series(True, index=df.index)
+    if "model_excluded" in df.columns:
+        mask &= ~df["model_excluded"].fillna(False).astype(bool)
     eligible_tags = as_list(module_config.get("eligible_tags"))
     if eligible_tags:
         allowed = model_eligible_tag_names(scenario)

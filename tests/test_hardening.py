@@ -16,7 +16,11 @@ from stress_engine.engine import OUTPUT_MANIFEST_KIND, StressEngine
 from stress_engine.io import write_csv
 from stress_engine.modules.ci import run_ci
 from stress_engine.modules.consumer import run_consumer
-from stress_engine.reporting import build_consumer_summary
+from stress_engine.reporting import (
+    build_cecl_summary,
+    build_consumer_summary,
+    build_reports,
+)
 from stress_engine.tagging import evaluate_conditions
 from stress_engine.utils import to_number
 
@@ -26,8 +30,90 @@ SCENARIO = ROOT / "examples" / "scenario.json"
 
 
 class HardeningRegressionTest(unittest.TestCase):
+    def test_all_model_excluded_population_returns_schema_stable_empty_reports(self):
+        scenario = {
+            "stress_levels": ["S1"],
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "balance_field": "balance",
+                "portfolio_field": "model_portfolio",
+            },
+            "cecl": {
+                "portfolio_field": "cecl_portfolio",
+                "reserve_field": "cecl_reserve",
+            },
+            "modules": {},
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "B-ARR",
+                    "balance": 100.0,
+                    "cecl_reserve": 5.0,
+                    "model_portfolio": pd.NA,
+                    "cecl_portfolio": pd.NA,
+                    "primary_module": pd.NA,
+                    "module_applied": "",
+                    "base_bucket": "Pass",
+                    "stressed_bucket_S1": "Pass",
+                    "model_excluded": True,
+                }
+            ]
+        )
+
+        reports = build_reports(
+            results,
+            results,
+            scenario,
+            pd.DataFrame(),
+            [],
+        )
+
+        migration = reports["migration_summary"]
+        self.assertTrue(migration.empty)
+        self.assertEqual(
+            migration.columns.tolist(),
+            [
+                "portfolio",
+                "stress_level",
+                "bucket",
+                "balance",
+                "borrower_count",
+                "source",
+            ],
+        )
+        cecl = reports["cecl_summary"]
+        self.assertEqual(
+            cecl[["portfolio", "stress_level", "bucket"]].to_dict(
+                orient="records"
+            ),
+            [
+                {
+                    "portfolio": "Aggregate",
+                    "stress_level": "Base",
+                    "bucket": "Total",
+                },
+                {
+                    "portfolio": "Aggregate",
+                    "stress_level": "S1",
+                    "bucket": "Total",
+                },
+            ],
+        )
+        self.assertTrue(cecl["balance"].eq(0.0).all())
+        self.assertTrue(cecl["proforma_cecl_reserve"].eq(0.0).all())
+
     def test_largest_loan_supplies_rating_maturity_and_tag_fields(self):
         scenario, _ = load_scenario(SCENARIO)
+        scenario["borrower"]["sum_fields"].append("secondary_exposure")
+        scenario["tags"]["Summed_Exposure_Control"] = {
+            "model_eligible": False,
+            "include": {
+                "field": "secondary_exposure",
+                "op": "gt",
+                "value": 0,
+            },
+        }
         identity = pd.DataFrame(
             [
                 {
@@ -39,6 +125,7 @@ class HardeningRegressionTest(unittest.TestCase):
                     "risk_rating": 8,
                     "maturity_date": pd.Timestamp("2026-01-01"),
                     "outstanding_balance": 100.0,
+                    "secondary_exposure": 40.0,
                     "cecl_reserve": 5.0,
                     "_source_row": 1,
                 },
@@ -51,6 +138,7 @@ class HardeningRegressionTest(unittest.TestCase):
                     "risk_rating": 6,
                     "maturity_date": pd.Timestamp("2029-01-01"),
                     "outstanding_balance": 900.0,
+                    "secondary_exposure": 60.0,
                     "cecl_reserve": 9.0,
                     "_source_row": 2,
                 },
@@ -62,6 +150,7 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertEqual(float(borrower["risk_rating"]), 6.0)
         self.assertEqual(borrower["maturity_date"], pd.Timestamp("2029-01-01"))
         self.assertEqual(float(borrower["outstanding_balance"]), 1000.0)
+        self.assertEqual(float(borrower["secondary_exposure"]), 100.0)
         self.assertIn("BORROWER_LOAN_ATTRIBUTE_CONFLICT", {row["code"] for row in exceptions})
 
     def test_missing_ratings_remain_visible_as_unknown(self):
@@ -84,15 +173,207 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertEqual(float(aggregate_base["proforma_cecl_reserve"]), 76000.0)
         self.assertIn("RISK_RATING_MISSING", set(result["reports"]["exception_log"]["code"]))
 
-    def test_out_of_scope_consumer_stress_cecl_is_unavailable_not_zero(self):
+    def test_out_of_scope_consumer_stress_cecl_reports_without_scope_exception(
+        self,
+    ):
         scenario, base_dir = load_scenario(SCENARIO)
         scenario["modules"]["Consumer"]["fico_field"] = "does_not_exist"
         result = StressEngine(scenario, base_dir).run(write_outputs=False, run_comparison=False)
         cecl = result["reports"]["cecl_summary"]
         consumer = cecl[(cecl["portfolio"] == "Consumer") & (cecl["bucket"] == "Total")].set_index("stress_level")
         self.assertEqual(float(consumer.at["Base", "proforma_cecl_reserve"]), 4000.0)
-        self.assertTrue(pd.isna(consumer.at["S1", "proforma_cecl_reserve"]))
-        self.assertEqual(consumer.at["S1", "cecl_reserve_status"], "unavailable")
+        for level in ("S1", "S2"):
+            self.assertEqual(
+                float(consumer.at[level, "proforma_cecl_reserve"]), 0.0
+            )
+            self.assertEqual(
+                consumer.at[level, "cecl_reserve_status"], "available"
+            )
+            self.assertEqual(consumer.at[level, "exception_code"], "")
+        self.assertNotIn("in_scope_balance", cecl.columns)
+        self.assertNotIn("out_of_scope_balance", cecl.columns)
+        exception_codes = set(result["reports"]["exception_log"]["code"])
+        self.assertNotIn(
+            "CONSUMER_CECL_UNAVAILABLE_OUT_OF_SCOPE", exception_codes
+        )
+        self.assertFalse(result["reports"]["out_of_scope_detail"].empty)
+        consumer_summary = result["reports"]["consumer_summary"].set_index(
+            "stress_level"
+        )
+        for level in ("S1", "S2"):
+            self.assertEqual(
+                float(
+                    consumer_summary.at[
+                        level, "proforma_cecl_reserve"
+                    ]
+                ),
+                0.0,
+            )
+            self.assertEqual(
+                consumer_summary.at[level, "calculation_status"],
+                "available",
+            )
+        self.assertGreater(
+            float(consumer_summary.at["S1", "out_of_scope_balance"]),
+            0.0,
+        )
+
+    def test_consumer_cecl_zero_fills_partial_stress_but_not_missing_field(
+        self,
+    ):
+        scenario = {
+            "stress_levels": ["S1", "S2"],
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "balance_field": "balance",
+                "portfolio_field": "model_portfolio",
+            },
+            "cecl": {
+                "portfolio_field": "cecl_portfolio",
+                "reserve_field": "cecl_reserve",
+                "portfolios": {
+                    "Consumer": {"method": "expected_loss"}
+                },
+            },
+            "modules": {},
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "C1",
+                    "balance": 100.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "cecl_reserve": 1.0,
+                    "module_applied": "Consumer",
+                    "base_bucket": "Pass",
+                    "consumer_el_unstressed": 1.0,
+                    "consumer_el_S1": 5.0,
+                    "consumer_el_S2": 6.0,
+                    "consumer_qualitative_reserve": 0.5,
+                    "consumer_proforma_cecl_S1": 10.0,
+                    "consumer_proforma_cecl_S2": 20.0,
+                },
+                {
+                    "borrower_id": "C2",
+                    "balance": 200.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "cecl_reserve": 2.0,
+                    "module_applied": "Consumer",
+                    "base_bucket": "Pass",
+                    "consumer_el_unstressed": 2.0,
+                    "consumer_el_S1": np.nan,
+                    "consumer_el_S2": 7.0,
+                    "consumer_qualitative_reserve": 1.0,
+                    "consumer_proforma_cecl_S1": np.nan,
+                    "consumer_proforma_cecl_S2": 30.0,
+                },
+            ]
+        )
+        bucket_summary = pd.DataFrame([{"portfolio": "Consumer"}])
+        exceptions = []
+
+        cecl = build_cecl_summary(
+            results, bucket_summary, scenario, exceptions
+        )
+        consumer = cecl[
+            (cecl["portfolio"] == "Consumer")
+            & (cecl["bucket"] == "Total")
+        ].set_index("stress_level")
+        self.assertEqual(
+            float(consumer.at["Base", "proforma_cecl_reserve"]), 3.0
+        )
+        self.assertEqual(
+            float(consumer.at["S1", "proforma_cecl_reserve"]), 10.0
+        )
+        self.assertEqual(
+            float(consumer.at["S2", "proforma_cecl_reserve"]), 50.0
+        )
+        self.assertAlmostEqual(
+            float(consumer.at["S1", "proforma_cecl_ratio"]),
+            10.0 / 300.0,
+        )
+        self.assertTrue(
+            consumer["cecl_reserve_status"].eq("available").all()
+        )
+        self.assertTrue(consumer["exception_code"].eq("").all())
+        self.assertNotIn("in_scope_balance", cecl.columns)
+        self.assertNotIn("out_of_scope_balance", cecl.columns)
+        self.assertEqual(exceptions, [])
+
+        consumer_report = build_consumer_summary(results, scenario).set_index(
+            "stress_level"
+        )
+        self.assertEqual(
+            float(
+                consumer_report.at["S1", "proforma_cecl_reserve"]
+            ),
+            10.0,
+        )
+        self.assertEqual(
+            float(consumer_report.at["S1", "out_of_scope_balance"]),
+            200.0,
+        )
+        self.assertEqual(
+            consumer_report.at["S1", "calculation_status"], "available"
+        )
+        targeted_scenario = dict(scenario)
+        targeted_scenario["_targeted_mode"] = True
+        targeted_results = results.copy()
+        targeted_results["borrower_id"] = "C-SHARED"
+        targeted_report = build_consumer_summary(
+            targeted_results, targeted_scenario
+        ).set_index("stress_level")
+        self.assertEqual(
+            int(targeted_report.at["S2", "borrower_count"]), 1
+        )
+        self.assertEqual(int(targeted_report.at["S2", "loan_count"]), 2)
+        self.assertEqual(
+            int(targeted_report.at["S2", "in_scope_borrower_count"]), 1
+        )
+        self.assertEqual(
+            int(targeted_report.at["S2", "in_scope_loan_count"]), 2
+        )
+
+        missing_reserve_exceptions = []
+        missing_reserve = build_cecl_summary(
+            results.drop(columns=["cecl_reserve"]),
+            bucket_summary,
+            scenario,
+            missing_reserve_exceptions,
+        )
+        missing_consumer = missing_reserve[
+            (missing_reserve["portfolio"] == "Consumer")
+            & (missing_reserve["bucket"] == "Total")
+        ]
+        self.assertTrue(
+            missing_consumer["proforma_cecl_reserve"].isna().all()
+        )
+        self.assertTrue(
+            missing_consumer["proforma_cecl_ratio"].isna().all()
+        )
+        self.assertTrue(
+            missing_consumer["cecl_reserve_status"].eq("unavailable").all()
+        )
+        self.assertTrue(
+            missing_consumer["exception_code"].eq(
+                "CECL_RESERVE_FIELD_MISSING"
+            ).all()
+        )
+        self.assertIn(
+            "CECL_RESERVE_FIELD_MISSING",
+            {row["code"] for row in missing_reserve_exceptions},
+        )
+        missing_aggregate = missing_reserve[
+            (missing_reserve["portfolio"] == "Aggregate")
+            & (missing_reserve["bucket"] == "Total")
+        ]
+        self.assertTrue(
+            missing_aggregate["exception_code"].eq(
+                "CECL_RESERVE_FIELD_MISSING"
+            ).all()
+        )
 
     def test_unconfigured_ci_sector_uses_logged_canonical_fallback(self):
         scenario = {

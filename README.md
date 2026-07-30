@@ -461,6 +461,47 @@ allows one source field to contain values such as:
 Retail;Middle Market
 ```
 
+Tags with `"model_eligible": false` are audit and classification tags: they do
+not make a borrower eligible for a module, but they do not override a separate
+model-eligible tag. Use `"exclude_from_model": true` when a matched borrower
+must be excluded from all model calculations. Model-exclusion tags are
+automatically non-model-eligible, must define a nonempty include condition, and
+stop the run if any referenced condition field is absent.
+
+The example scenario defines `ARR` as an excluded subset of Sponsor and
+Specialty:
+
+```json
+"ARR": {
+  "model_eligible": false,
+  "exclude_from_model": true,
+  "include": {
+    "all": [
+      {
+        "field": "subsector",
+        "op": "has_token",
+        "value": "Sponsor and Specialty"
+      },
+      {
+        "any": [
+          {"field": "subsector", "op": "has_token", "value": "ARR"},
+          {"field": "tag_hint", "op": "has_token", "value": "ARR"},
+          {"field": "tag_hint_2", "op": "has_token", "value": "ARR"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+An ARR row therefore remains in
+`tag_ci_sector_sponsor_and_specialty`, `ci_sector`, `all_tags`, Sponsor and
+Specialty population totals, and Sponsor and Specialty tie-outs. It also
+receives `model_excluded = true` and `model_exclusion_tags = ARR`. Its model
+routing fields are cleared and it is omitted from stress modules, migration,
+CECL, overlays, and targeted-stress selections. Because ARR is a subset, ARR
+and Sponsor and Specialty balances overlap and should not be added together.
+
 `module_order` is both the execution order and the priority order. In the
 example, CRE has priority over C&I, which has priority over Consumer. A borrower
 that matches both CRE and C&I remains visible in `eligible_modules`, but only
@@ -666,6 +707,10 @@ Additional controls are written to:
 - `targeted_stress_summary.csv`; and
 - `variant_comparison.csv`.
 
+`targeted_selection_detail.csv` distinguishes the raw selector result from the
+final selection. In particular, `selection_reason = model_excluded` shows that
+a shock selector matched an exposure but an ARR-style exclusion vetoed it.
+
 ### CECL
 
 Commercial CECL calculates one base reserve ratio for each CECL portfolio and
@@ -687,8 +732,15 @@ recorded base reserve − unstressed quantitative expected loss
 The unstressed quantitative expected loss in this residual uses baseline
 collateral after rushed-sale and closing-cost adjustments.
 
-If positive Consumer balance is out of scope, stressed Consumer CECL is marked
-`unavailable`; it is not reported as zero.
+For stressed Consumer CECL, missing or out-of-scope borrower values contribute
+zero to the portfolio reserve while the full Consumer balance remains in the
+reported denominator. The affected records remain visible in the dedicated
+out-of-scope reports. A missing configured reserve field remains a CECL data
+error and makes Consumer CECL unavailable.
+
+`cecl_summary.csv` uses one common schema across portfolios and does not add
+Consumer-only in-scope or out-of-scope balance columns. Those diagnostics
+remain in `consumer_summary.csv` and the out-of-scope reports.
 
 ## Out-of-scope treatment
 
@@ -697,8 +749,9 @@ Commercial and Consumer treatment differs:
 - A CRE or C&I borrower that cannot be stressed generally remains in its base
   commercial bucket. Its balance stays visible in migration and CECL reports,
   and the reason appears in out-of-scope reports.
-- Consumer stressed CECL becomes unavailable when positive Consumer balance is
-  out of scope.
+- Consumer missing or out-of-scope stressed values contribute zero to CECL;
+  review `consumer_summary.csv` scope columns and out-of-scope detail for the
+  affected balance.
 
 This is why out-of-scope files must be reviewed alongside headline results.
 
@@ -770,6 +823,13 @@ are intentionally blank for those files.
 `tag_summary.csv` contains both population rows and tie-out rows. Filter to
 rows where `tie_out_name` is populated, then review `expected`, `actual`,
 `difference`, `tolerance`, and `passed`.
+
+Raw `borrower_count`, `balance`, and tie-out `actual` remain inclusive so a
+subset such as ARR stays in its Sponsor and Specialty parent control. The
+`not_model_excluded_*` and `model_excluded_*` count and balance columns
+reconcile that raw population to the global model veto. These columns describe
+the veto split, not final module scope. Targeted runs additionally provide
+corresponding loan counts.
 
 ### 4. Out-of-scope reports
 
@@ -912,7 +972,7 @@ when moved into an output directory.
 | Ambiguous account mapping | Ensure each master account number belongs to exactly one borrower |
 | Cardinality warning | Duplicate borrower keys in a source expected to have one row per borrower |
 | Failed tag tie-out | Tag logic, expected amount, source key, and tolerance |
-| Consumer CECL unavailable | Missing FICO/appraisal/lookup values or invalid Consumer assumptions |
+| Consumer value contributes zero to stressed CECL | Review missing FICO/appraisal/lookup values, invalid assumptions, and Consumer out-of-scope detail |
 | CRE/C&I out of scope | Review borrower, field, test, and reason in out-of-scope detail |
 | Batch exceeds maximum | Reduce values, use paired mode, or deliberately raise `max_scenarios` |
 | Excel read error | Confirm XLSX/XLSM format, sheet name, and that the file is not corrupt |

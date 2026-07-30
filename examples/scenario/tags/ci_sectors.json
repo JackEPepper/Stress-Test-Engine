@@ -20,6 +20,38 @@
         "tolerance": 0.01
       }
     },
+    "ARR": {
+      "model_eligible": false,
+      "exclude_from_model": true,
+      "include": {
+        "all": [
+          {
+            "field": "subsector",
+            "op": "has_token",
+            "value": "Sponsor and Specialty"
+          },
+          {
+            "any": [
+              {
+                "field": "subsector",
+                "op": "has_token",
+                "value": "ARR"
+              },
+              {
+                "field": "tag_hint",
+                "op": "has_token",
+                "value": "ARR"
+              },
+              {
+                "field": "tag_hint_2",
+                "op": "has_token",
+                "value": "ARR"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "CI_Sector_Middle_Market": {
       "model_eligible": false,
       "include": {

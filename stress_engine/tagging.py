@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Mapping
 
 import numpy as np
@@ -10,6 +11,28 @@ import pandas as pd
 from .exceptions import record_exception
 from .io import LoadedTable
 from .utils import as_list, compare_values, condition_fields, is_missing, stable_name, to_number
+
+
+TAG_CONDITION_OPERATORS = {
+    "eq",
+    "ne",
+    "in",
+    "not_in",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "between",
+    "contains",
+    "has_token",
+    "has_any_token",
+    "has_all_tokens",
+    "startswith",
+    "endswith",
+    "is_null",
+    "not_null",
+    "regex",
+}
 
 
 def apply_tags(
@@ -48,6 +71,11 @@ def apply_tags(
                 field=field,
                 source=name,
             )
+        if missing_condition_fields and tag.get("exclude_from_model", False):
+            raise ValueError(
+                f"Model-exclusion tag '{name}' references missing condition "
+                f"fields: {', '.join(missing_condition_fields)}."
+            )
         mask = evaluate_conditions(result, include)
         if exclude:
             mask &= ~evaluate_conditions(result, exclude)
@@ -67,6 +95,7 @@ def apply_tags(
             "tag": name,
             "tag_column": tag_col,
             "model_eligible": bool(tag.get("model_eligible", True)),
+            "exclude_from_model": bool(tag.get("exclude_from_model", False)),
             "borrower_count": int(len(tagged)),
             "balance_field": balance_field,
             "balance": float(pd.to_numeric(tagged.get(balance_field, pd.Series(dtype=float)), errors="coerce").sum()),
@@ -119,8 +148,26 @@ def apply_tags(
                 )
 
     tag_summary = pd.DataFrame(tag_rows)
+    exclusion_defs = [
+        tag for tag in tag_defs if tag.get("exclude_from_model", False)
+    ]
+    exclusion_columns = [
+        f"tag_{stable_name(tag['name'])}" for tag in exclusion_defs
+    ]
+    if exclusion_columns:
+        result["model_excluded"] = (
+            result[exclusion_columns].fillna(False).astype(bool).any(axis=1)
+        )
+        result["model_exclusion_tags"] = _tag_list(
+            result, exclusion_defs, include_internal=True
+        )
+    else:
+        result["model_excluded"] = False
+        result["model_exclusion_tags"] = ""
+    tag_summary = _add_model_exclusion_breakdown(tag_summary, result)
     result["all_tags"] = _tag_list(result, tag_defs, include_internal=True)
     result["model_tags"] = _tag_list(result, tag_defs, include_internal=False)
+    result.loc[result["model_excluded"], "model_tags"] = ""
     return result, tag_summary
 
 
@@ -136,8 +183,128 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
             raise ValueError(f"Tag '{name}' must use its object key as the name; remove the nested name field.")
         item = dict(spec)
         item["name"] = str(name)
+        if "assign" in item and not isinstance(item["assign"], Mapping):
+            raise ValueError(f"Tag '{name}' assign must be a JSON object.")
+        for flag in ("model_eligible", "exclude_from_model"):
+            if flag in item and not isinstance(item[flag], bool):
+                raise ValueError(f"Tag '{name}' {flag} must be a JSON boolean.")
+        include_has_conditions = _validate_condition_block(
+            item.get("include", []), f"Tag '{name}' include"
+        )
+        _validate_condition_block(
+            item.get("exclude", []), f"Tag '{name}' exclude"
+        )
+        if item.get("exclude_from_model", False):
+            if item.get("model_eligible", False):
+                raise ValueError(
+                    f"Tag '{name}' cannot be both model_eligible and exclude_from_model."
+                )
+            if not include_has_conditions:
+                raise ValueError(
+                    f"Tag '{name}' with exclude_from_model must define a "
+                    "nonempty include condition."
+                )
+            item["model_eligible"] = False
         out.append(item)
     return out
+
+
+def _validate_condition_block(conditions: Any, path: str) -> bool:
+    """Validate tag-condition structure and report whether it has an atom."""
+    if conditions is None or conditions == [] or conditions == {}:
+        return False
+    if isinstance(conditions, Mapping):
+        logical_keys = [key for key in ("all", "any") if key in conditions]
+        if logical_keys:
+            if len(logical_keys) != 1 or set(conditions) != {logical_keys[0]}:
+                raise ValueError(
+                    f"{path} logical conditions must contain exactly one of "
+                    "'all' or 'any' and no atomic fields."
+                )
+            logical_key = logical_keys[0]
+            children = conditions[logical_key]
+            if not isinstance(children, (list, tuple)) or not children:
+                raise ValueError(
+                    f"{path}.{logical_key} must be a nonempty JSON list."
+                )
+            for index, child in enumerate(children):
+                if not _validate_condition_block(
+                    child, f"{path}.{logical_key}[{index}]"
+                ):
+                    raise ValueError(
+                        f"{path}.{logical_key}[{index}] must contain a "
+                        "condition."
+                    )
+            return True
+        field = conditions.get("field")
+        if not isinstance(field, str) or not field.strip():
+            raise ValueError(f"{path} atomic condition requires a nonblank field.")
+        op = str(conditions.get("op", "eq")).lower()
+        if op not in TAG_CONDITION_OPERATORS:
+            raise ValueError(f"{path} uses unsupported operator '{op}'.")
+        if op not in {"is_null", "not_null"} and "value" not in conditions:
+            raise ValueError(f"{path} operator '{op}' requires a value.")
+        value = conditions.get("value")
+        if op in {"in", "not_in"}:
+            values = as_list(value)
+            if not values:
+                raise ValueError(
+                    f"{path} operator '{op}' requires nonempty values."
+                )
+            try:
+                set(values)
+            except TypeError as exc:
+                raise ValueError(
+                    f"{path} operator '{op}' requires scalar values."
+                ) from exc
+        if op in {"has_token", "has_any_token", "has_all_tokens"}:
+            token_values = [
+                item
+                for item in as_list(value)
+                if not is_missing(item) and str(item).strip()
+            ]
+            if not token_values:
+                raise ValueError(
+                    f"{path} operator '{op}' requires nonempty token values."
+                )
+        if op in {"gt", "gte", "lt", "lte"}:
+            number = to_number(value)
+            if isinstance(value, (bool, np.bool_)) or not np.isfinite(number):
+                raise ValueError(
+                    f"{path} operator '{op}' requires a finite numeric value."
+                )
+        if op == "between":
+            values = as_list(value)
+            if len(values) != 2:
+                raise ValueError(
+                    f"{path} operator 'between' requires two values."
+                )
+            if any(
+                isinstance(item, (bool, np.bool_))
+                or not np.isfinite(to_number(item))
+                for item in values
+            ):
+                raise ValueError(
+                    f"{path} operator 'between' requires finite numeric values."
+                )
+        if op in {"contains", "startswith", "endswith", "regex"} and (
+            is_missing(value) or not str(value)
+        ):
+            raise ValueError(f"{path} operator '{op}' requires a nonempty value.")
+        if op == "regex":
+            try:
+                re.compile(str(value))
+            except re.error as exc:
+                raise ValueError(f"{path} contains an invalid regex: {exc}.") from exc
+        return True
+    if isinstance(conditions, (list, tuple)):
+        if not conditions:
+            return False
+        for index, child in enumerate(conditions):
+            if not _validate_condition_block(child, f"{path}[{index}]"):
+                raise ValueError(f"{path}[{index}] must contain a condition.")
+        return True
+    raise ValueError(f"{path} must be a JSON object or list.")
 
 
 def evaluate_conditions(df: pd.DataFrame, conditions: Any) -> pd.Series:
@@ -152,18 +319,20 @@ def evaluate_conditions(df: pd.DataFrame, conditions: Any) -> pd.Series:
         if "all" in conditions:
             mask = pd.Series(True, index=df.index)
             for item in conditions["all"]:
-                mask &= evaluate_conditions(df, [item])
-            return mask
+                mask &= evaluate_conditions(df, item)
+            return mask.fillna(False)
         if "any" in conditions:
             mask = pd.Series(False, index=df.index)
             for item in conditions["any"]:
-                mask |= evaluate_conditions(df, [item])
-            return mask
-        conditions = [conditions]
+                mask |= evaluate_conditions(df, item)
+            return mask.fillna(False)
+        return _evaluate_condition(df, conditions).fillna(False)
 
+    if not isinstance(conditions, (list, tuple)):
+        raise ValueError("Tag conditions must be an object or list.")
     mask = pd.Series(True, index=df.index)
     for condition in conditions:
-        mask &= _evaluate_condition(df, condition)
+        mask &= evaluate_conditions(df, condition)
     return mask.fillna(False)
 
 
@@ -347,6 +516,7 @@ def _evaluate_tieout(
         "tag": tag_name,
         "tag_column": tag_col,
         "model_eligible": np.nan,
+        "exclude_from_model": np.nan,
         "borrower_count": int(borrowers[tag_col].sum()),
         "balance_field": actual_field,
         "balance": actual,
@@ -375,6 +545,43 @@ def _tag_list(df: pd.DataFrame, tag_defs: List[Mapping[str, Any]], include_inter
     return pd.Series(values, index=df.index)
 
 
+def _add_model_exclusion_breakdown(
+    tag_summary: pd.DataFrame,
+    borrowers: pd.DataFrame,
+) -> pd.DataFrame:
+    """Split each raw tag population into model-included and excluded amounts."""
+    summary = tag_summary.copy()
+    included_counts: List[int] = []
+    included_balances: List[float] = []
+    excluded_counts: List[int] = []
+    excluded_balances: List[float] = []
+    excluded_rows = borrowers["model_excluded"].fillna(False).astype(bool)
+    for _, row in summary.iterrows():
+        tag_column = row.get("tag_column")
+        if tag_column not in borrowers.columns:
+            tag_mask = pd.Series(False, index=borrowers.index)
+        else:
+            tag_mask = borrowers[tag_column].fillna(False).astype(bool)
+        included = tag_mask & ~excluded_rows
+        excluded = tag_mask & excluded_rows
+        balance_field = row.get("balance_field")
+        if balance_field in borrowers.columns:
+            balances = pd.to_numeric(
+                borrowers[balance_field], errors="coerce"
+            )
+        else:
+            balances = pd.Series(np.nan, index=borrowers.index)
+        included_counts.append(int(included.sum()))
+        included_balances.append(float(balances.loc[included].sum()))
+        excluded_counts.append(int(excluded.sum()))
+        excluded_balances.append(float(balances.loc[excluded].sum()))
+    summary["not_model_excluded_borrower_count"] = included_counts
+    summary["not_model_excluded_balance"] = included_balances
+    summary["model_excluded_borrower_count"] = excluded_counts
+    summary["model_excluded_balance"] = excluded_balances
+    return summary
+
+
 def model_eligible_tag_names(scenario: Mapping[str, Any]) -> set[str]:
     """Return tags allowed to control module populations."""
     tags = normalize_tag_defs(scenario.get("tags", {}))
@@ -388,9 +595,10 @@ def assign_primary_modules(
 ) -> pd.DataFrame:
     """Assign one primary stress module from active model tags.
 
-    The active model tags remain visible in ``model_tags`` for auditability, but
-    downstream stress modules use ``primary_module`` to avoid double-stressing
-    borrowers that satisfy more than one model tag.
+    Raw tag flags and ``all_tags`` remain visible for auditability. Active
+    non-excluded model tags remain in ``model_tags``; excluded rows receive no
+    model tags or routing. Downstream stress modules use ``primary_module`` to
+    avoid double-stressing borrowers that satisfy more than one model tag.
     """
     exceptions = exceptions if exceptions is not None else []
     result = df.copy()
@@ -400,6 +608,7 @@ def assign_primary_modules(
         for item in scenario.get("module_order", ["CRE", "C&I", "Consumer"])
     ]
     priority_rank = {name: idx for idx, name in enumerate(priority)}
+    allowed_tags = model_eligible_tag_names(scenario)
     module_specs = []
     for module_name, config in modules.items():
         if not config.get("enabled", True):
@@ -408,7 +617,11 @@ def assign_primary_modules(
             {
                 "name": str(module_name),
                 "rank": priority_rank.get(str(module_name), len(priority_rank) + len(module_specs)),
-                "eligible_tags": [str(tag) for tag in as_list(config.get("eligible_tags"))],
+                "eligible_tags": [
+                    str(tag)
+                    for tag in as_list(config.get("eligible_tags"))
+                    if str(tag) in allowed_tags
+                ],
             }
         )
     module_specs.sort(key=lambda item: (item["rank"], item["name"]))
@@ -441,6 +654,14 @@ def assign_primary_modules(
         result[cecl_portfolio_field] = result[cecl_portfolio_field].astype(object)
 
     for idx, row in result.iterrows():
+        model_excluded = row.get("model_excluded", False)
+        if not is_missing(model_excluded) and bool(model_excluded):
+            result.at[idx, "eligible_modules"] = ""
+            result.at[idx, "primary_module"] = pd.NA
+            result.at[idx, module_field] = pd.NA
+            result.at[idx, portfolio_field] = pd.NA
+            result.at[idx, cecl_portfolio_field] = pd.NA
+            continue
         active = []
         for spec in module_specs:
             if any(bool(row.get(f"tag_{stable_name(tag)}", False)) for tag in spec["eligible_tags"]):

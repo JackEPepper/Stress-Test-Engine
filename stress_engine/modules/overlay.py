@@ -34,6 +34,10 @@ def apply_overlays(
         return bucket_summary, pd.DataFrame()
     if not isinstance(overlays, Mapping):
         raise ValueError("Scenario overlays must be a JSON object keyed by portfolio name.")
+    if "model_excluded" in borrowers.columns:
+        borrowers = borrowers[
+            ~borrowers["model_excluded"].fillna(False).astype(bool)
+        ]
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
     levels = get_levels(scenario)
