@@ -732,11 +732,36 @@ recorded base reserve − unstressed quantitative expected loss
 The unstressed quantitative expected loss in this residual uses baseline
 collateral after rushed-sale and closing-cost adjustments.
 
-For stressed Consumer CECL, missing or out-of-scope borrower values contribute
-zero to the portfolio reserve while the full Consumer balance remains in the
-reported denominator. The affected records remain visible in the dedicated
-out-of-scope reports. A missing configured reserve field remains a CECL data
-error and makes Consumer CECL unavailable.
+Consumer reporting applies a borrower-level carry-forward waterfall in the
+declared stress-level order. Base quantitative expected loss is the calculated
+amount, or zero when the Base calculation is unavailable; Base qualitative
+reserve is the residual needed to equal the recorded reserve. For each stressed
+level, quantitative expected loss is the greater of the prior effective amount
+and the current calculated amount. If the current level is missing or out of
+scope, the prior effective amount carries forward. Qualitative reserve is also
+prevented from declining, including when a configured qualitative floor first
+applies under stress. Pro forma CECL is then rebuilt as:
+
+```text
+effective quantitative expected loss + effective qualitative reserve
+```
+
+This guarantees `Base <= S1 <= S2` for Consumer CECL when the scenario declares
+levels in increasing severity order, regardless of changes in the calculated
+population. Raw borrower-level modeled values and scope flags remain unchanged
+for audit, the full Consumer balance remains in the reported denominator, and
+affected records remain visible in the dedicated out-of-scope reports. A
+missing configured reserve field remains a CECL data error and makes Consumer
+CECL unavailable.
+
+The Aggregate row also remains monotonic when the commercial CECL portfolio
+totals are non-decreasing. Commercial portfolios continue to use their separate
+bucket-reserve-ratio method; Consumer carry-forward does not override that
+method. A CECL portfolio must not mix Consumer and commercial rows because one
+portfolio cannot use both expected-loss and bucket-reserve-ratio methods; the
+run stops with a configuration error if such a mix is detected. Consumer CECL
+portfolios must use `expected_loss`, and non-Consumer portfolios cannot use
+that method.
 
 `cecl_summary.csv` uses one common schema across portfolios and does not add
 Consumer-only in-scope or out-of-scope balance columns. Those diagnostics
@@ -749,9 +774,10 @@ Commercial and Consumer treatment differs:
 - A CRE or C&I borrower that cannot be stressed generally remains in its base
   commercial bucket. Its balance stays visible in migration and CECL reports,
   and the reason appears in out-of-scope reports.
-- Consumer missing or out-of-scope stressed values contribute zero to CECL;
-  review `consumer_summary.csv` scope columns and out-of-scope detail for the
-  affected balance.
+- A Consumer borrower with a missing, out-of-scope, or lower stressed
+  contribution carries forward its prior effective CECL components. Review
+  `consumer_summary.csv` scope columns and out-of-scope detail for the affected
+  balance.
 
 This is why out-of-scope files must be reviewed alongside headline results.
 
@@ -972,7 +998,7 @@ when moved into an output directory.
 | Ambiguous account mapping | Ensure each master account number belongs to exactly one borrower |
 | Cardinality warning | Duplicate borrower keys in a source expected to have one row per borrower |
 | Failed tag tie-out | Tag logic, expected amount, source key, and tolerance |
-| Consumer value contributes zero to stressed CECL | Review missing FICO/appraisal/lookup values, invalid assumptions, and Consumer out-of-scope detail |
+| Consumer value carries forward in stressed CECL | Review missing FICO/appraisal/lookup values, invalid assumptions, and Consumer out-of-scope detail |
 | CRE/C&I out of scope | Review borrower, field, test, and reason in out-of-scope detail |
 | Batch exceeds maximum | Reduce values, use paired mode, or deliberately raise `max_scenarios` |
 | Excel read error | Confirm XLSX/XLSM format, sheet name, and that the file is not corrupt |

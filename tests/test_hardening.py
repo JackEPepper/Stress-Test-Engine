@@ -173,7 +173,7 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertEqual(float(aggregate_base["proforma_cecl_reserve"]), 76000.0)
         self.assertIn("RISK_RATING_MISSING", set(result["reports"]["exception_log"]["code"]))
 
-    def test_out_of_scope_consumer_stress_cecl_reports_without_scope_exception(
+    def test_out_of_scope_consumer_stress_cecl_carries_base_without_scope_exception(
         self,
     ):
         scenario, base_dir = load_scenario(SCENARIO)
@@ -184,7 +184,7 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertEqual(float(consumer.at["Base", "proforma_cecl_reserve"]), 4000.0)
         for level in ("S1", "S2"):
             self.assertEqual(
-                float(consumer.at[level, "proforma_cecl_reserve"]), 0.0
+                float(consumer.at[level, "proforma_cecl_reserve"]), 4000.0
             )
             self.assertEqual(
                 consumer.at[level, "cecl_reserve_status"], "available"
@@ -200,25 +200,162 @@ class HardeningRegressionTest(unittest.TestCase):
         consumer_summary = result["reports"]["consumer_summary"].set_index(
             "stress_level"
         )
-        for level in ("S1", "S2"):
+        for level in ("Base", "S1", "S2"):
+            self.assertEqual(
+                float(consumer_summary.at[level, "expected_loss"]), 0.0
+            )
+            self.assertEqual(
+                float(
+                    consumer_summary.at[level, "qualitative_reserve"]
+                ),
+                4000.0,
+            )
             self.assertEqual(
                 float(
                     consumer_summary.at[
                         level, "proforma_cecl_reserve"
                     ]
                 ),
-                0.0,
+                4000.0,
             )
             self.assertEqual(
                 consumer_summary.at[level, "calculation_status"],
                 "available",
             )
-        self.assertGreater(
-            float(consumer_summary.at["S1", "out_of_scope_balance"]),
-            0.0,
+            self.assertEqual(
+                float(
+                    consumer_summary.at[level, "in_scope_balance"]
+                ),
+                0.0,
+            )
+            self.assertEqual(
+                float(
+                    consumer_summary.at[level, "out_of_scope_balance"]
+                ),
+                300000.0,
+            )
+            self.assertAlmostEqual(
+                float(consumer_summary.at[level, "expected_loss"])
+                + float(
+                    consumer_summary.at[level, "qualitative_reserve"]
+                ),
+                float(
+                    consumer_summary.at[
+                        level, "proforma_cecl_reserve"
+                    ]
+                ),
+            )
+        self.assertEqual(
+            list(consumer["proforma_cecl_reserve"]),
+            sorted(consumer["proforma_cecl_reserve"]),
+        )
+        aggregate = cecl[
+            (cecl["portfolio"] == "Aggregate")
+            & (cecl["bucket"] == "Total")
+        ].set_index("stress_level")
+        self.assertEqual(
+            list(aggregate["proforma_cecl_reserve"]),
+            sorted(aggregate["proforma_cecl_reserve"]),
         )
 
-    def test_consumer_cecl_zero_fills_partial_stress_but_not_missing_field(
+    def test_consumer_qualitative_floor_preserves_base_and_monotonic_stress(
+        self,
+    ):
+        scenario, base_dir = load_scenario(SCENARIO)
+        scenario["modules"]["Consumer"][
+            "qualitative_reserve_floor"
+        ] = 5000.0
+        result = StressEngine(scenario, base_dir).run(
+            write_outputs=False,
+            run_comparison=False,
+        )
+        summary = result["reports"]["consumer_summary"].set_index(
+            "stress_level"
+        )
+        cecl = result["reports"]["cecl_summary"]
+        consumer_cecl = cecl[
+            (cecl["portfolio"] == "Consumer")
+            & (cecl["bucket"] == "Total")
+        ].set_index("stress_level")
+        expected = {
+            "Base": (0.0, 4000.0, 4000.0),
+            "S1": (377.85, 5000.0, 5377.85),
+            "S2": (1403.04, 5000.0, 6403.04),
+        }
+        for level, (
+            quantitative,
+            qualitative,
+            proforma,
+        ) in expected.items():
+            self.assertAlmostEqual(
+                float(summary.at[level, "expected_loss"]),
+                quantitative,
+            )
+            self.assertAlmostEqual(
+                float(summary.at[level, "qualitative_reserve"]),
+                qualitative,
+            )
+            self.assertAlmostEqual(
+                float(summary.at[level, "proforma_cecl_reserve"]),
+                proforma,
+            )
+            self.assertAlmostEqual(
+                float(
+                    consumer_cecl.at[
+                        level, "proforma_cecl_reserve"
+                    ]
+                ),
+                proforma,
+            )
+        self.assertEqual(
+            list(summary["proforma_cecl_reserve"]),
+            sorted(summary["proforma_cecl_reserve"]),
+        )
+
+        scenario["modules"]["Consumer"][
+            "fico_field"
+        ] = "does_not_exist"
+        out_of_scope_result = StressEngine(scenario, base_dir).run(
+            write_outputs=False,
+            run_comparison=False,
+        )
+        out_of_scope_summary = out_of_scope_result["reports"][
+            "consumer_summary"
+        ].set_index("stress_level")
+        expected_out_of_scope = {
+            "Base": (0.0, 4000.0, 4000.0),
+            "S1": (0.0, 5000.0, 5000.0),
+            "S2": (0.0, 5000.0, 5000.0),
+        }
+        for level, (
+            quantitative,
+            qualitative,
+            proforma,
+        ) in expected_out_of_scope.items():
+            self.assertAlmostEqual(
+                float(
+                    out_of_scope_summary.at[level, "expected_loss"]
+                ),
+                quantitative,
+            )
+            self.assertAlmostEqual(
+                float(
+                    out_of_scope_summary.at[
+                        level, "qualitative_reserve"
+                    ]
+                ),
+                qualitative,
+            )
+            self.assertAlmostEqual(
+                float(
+                    out_of_scope_summary.at[
+                        level, "proforma_cecl_reserve"
+                    ]
+                ),
+                proforma,
+            )
+
+    def test_consumer_cecl_carries_partial_stress_but_not_missing_field(
         self,
     ):
         scenario = {
@@ -244,30 +381,45 @@ class HardeningRegressionTest(unittest.TestCase):
                     "balance": 100.0,
                     "model_portfolio": "Consumer",
                     "cecl_portfolio": "Consumer",
-                    "cecl_reserve": 1.0,
+                    "cecl_reserve": 10.0,
                     "module_applied": "Consumer",
                     "base_bucket": "Pass",
-                    "consumer_el_unstressed": 1.0,
-                    "consumer_el_S1": 5.0,
-                    "consumer_el_S2": 6.0,
-                    "consumer_qualitative_reserve": 0.5,
-                    "consumer_proforma_cecl_S1": 10.0,
-                    "consumer_proforma_cecl_S2": 20.0,
+                    "consumer_el_unstressed": 8.0,
+                    "consumer_el_S1": 10.0,
+                    "consumer_el_S2": 13.0,
+                    "consumer_qualitative_reserve": 2.0,
+                    "consumer_proforma_cecl_S1": 12.0,
+                    "consumer_proforma_cecl_S2": 15.0,
                 },
                 {
                     "borrower_id": "C2",
                     "balance": 200.0,
                     "model_portfolio": "Consumer",
                     "cecl_portfolio": "Consumer",
-                    "cecl_reserve": 2.0,
+                    "cecl_reserve": 20.0,
                     "module_applied": "Consumer",
                     "base_bucket": "Pass",
-                    "consumer_el_unstressed": 2.0,
+                    "consumer_el_unstressed": 15.0,
                     "consumer_el_S1": np.nan,
-                    "consumer_el_S2": 7.0,
-                    "consumer_qualitative_reserve": 1.0,
+                    "consumer_el_S2": 18.0,
+                    "consumer_qualitative_reserve": 5.0,
                     "consumer_proforma_cecl_S1": np.nan,
-                    "consumer_proforma_cecl_S2": 30.0,
+                    "consumer_proforma_cecl_S2": 23.0,
+                },
+                {
+                    "borrower_id": "C3",
+                    "balance": 300.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "cecl_reserve": 30.0,
+                    "module_applied": "Consumer",
+                    "base_bucket": "Pass",
+                    "consumer_el_unstressed": 20.0,
+                    "consumer_el_S1": 25.0,
+                    "consumer_el_S2": np.nan,
+                    "consumer_qualitative_reserve": 10.0,
+                    "consumer_proforma_cecl_S1": 35.0,
+                    "consumer_proforma_cecl_S2": np.nan,
                 },
             ]
         )
@@ -282,17 +434,21 @@ class HardeningRegressionTest(unittest.TestCase):
             & (cecl["bucket"] == "Total")
         ].set_index("stress_level")
         self.assertEqual(
-            float(consumer.at["Base", "proforma_cecl_reserve"]), 3.0
+            float(consumer.at["Base", "proforma_cecl_reserve"]), 60.0
         )
         self.assertEqual(
-            float(consumer.at["S1", "proforma_cecl_reserve"]), 10.0
+            float(consumer.at["S1", "proforma_cecl_reserve"]), 67.0
         )
         self.assertEqual(
-            float(consumer.at["S2", "proforma_cecl_reserve"]), 50.0
+            float(consumer.at["S2", "proforma_cecl_reserve"]), 73.0
         )
         self.assertAlmostEqual(
             float(consumer.at["S1", "proforma_cecl_ratio"]),
-            10.0 / 300.0,
+            67.0 / 600.0,
+        )
+        self.assertEqual(
+            list(consumer["proforma_cecl_reserve"]),
+            sorted(consumer["proforma_cecl_reserve"]),
         )
         self.assertTrue(
             consumer["cecl_reserve_status"].eq("available").all()
@@ -305,15 +461,45 @@ class HardeningRegressionTest(unittest.TestCase):
         consumer_report = build_consumer_summary(results, scenario).set_index(
             "stress_level"
         )
+        expected_components = {
+            "Base": (43.0, 17.0, 60.0),
+            "S1": (50.0, 17.0, 67.0),
+            "S2": (56.0, 17.0, 73.0),
+        }
+        for level, (expected_loss, qualitative, proforma) in expected_components.items():
+            self.assertEqual(
+                float(consumer_report.at[level, "expected_loss"]),
+                expected_loss,
+            )
+            self.assertEqual(
+                float(
+                    consumer_report.at[level, "qualitative_reserve"]
+                ),
+                qualitative,
+            )
+            self.assertEqual(
+                float(
+                    consumer_report.at[
+                        level, "proforma_cecl_reserve"
+                    ]
+                ),
+                proforma,
+            )
+            self.assertAlmostEqual(
+                expected_loss + qualitative,
+                proforma,
+            )
         self.assertEqual(
-            float(
-                consumer_report.at["S1", "proforma_cecl_reserve"]
-            ),
-            10.0,
+            float(consumer_report.at["Base", "in_scope_balance"]),
+            600.0,
         )
         self.assertEqual(
             float(consumer_report.at["S1", "out_of_scope_balance"]),
             200.0,
+        )
+        self.assertEqual(
+            float(consumer_report.at["S2", "out_of_scope_balance"]),
+            300.0,
         )
         self.assertEqual(
             consumer_report.at["S1", "calculation_status"], "available"
@@ -328,7 +514,7 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertEqual(
             int(targeted_report.at["S2", "borrower_count"]), 1
         )
-        self.assertEqual(int(targeted_report.at["S2", "loan_count"]), 2)
+        self.assertEqual(int(targeted_report.at["S2", "loan_count"]), 3)
         self.assertEqual(
             int(targeted_report.at["S2", "in_scope_borrower_count"]), 1
         )
@@ -374,6 +560,165 @@ class HardeningRegressionTest(unittest.TestCase):
                 "CECL_RESERVE_FIELD_MISSING"
             ).all()
         )
+
+    def test_consumer_cecl_carries_prior_level_when_raw_el_declines(self):
+        scenario = {
+            "stress_levels": ["S1", "S2"],
+            "borrower": {
+                "borrower_id_field": "borrower_id",
+                "balance_field": "balance",
+                "portfolio_field": "model_portfolio",
+            },
+            "cecl": {
+                "portfolio_field": "cecl_portfolio",
+                "reserve_field": "cecl_reserve",
+                "portfolios": {
+                    "Consumer": {"method": "expected_loss"}
+                },
+            },
+            "modules": {},
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "C1",
+                    "balance": 100.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "cecl_reserve": 10.0,
+                    "module_applied": "Consumer",
+                    "base_bucket": "Pass",
+                    "out_of_scope_S1": False,
+                    "out_of_scope_S2": False,
+                    "consumer_el_unstressed": 8.0,
+                    "consumer_el_S1": 20.0,
+                    "consumer_el_S2": 15.0,
+                    "consumer_qualitative_reserve": 2.0,
+                    "consumer_proforma_cecl_S1": 22.0,
+                    "consumer_proforma_cecl_S2": 17.0,
+                }
+            ]
+        )
+
+        report = build_consumer_summary(results, scenario).set_index(
+            "stress_level"
+        )
+        self.assertEqual(
+            list(report["proforma_cecl_reserve"]),
+            [10.0, 22.0, 22.0],
+        )
+        self.assertEqual(
+            list(report["expected_loss"]),
+            [8.0, 20.0, 20.0],
+        )
+        self.assertEqual(
+            list(report["qualitative_reserve"]),
+            [2.0, 2.0, 2.0],
+        )
+        for level in ("Base", "S1", "S2"):
+            self.assertAlmostEqual(
+                float(report.at[level, "expected_loss"])
+                + float(report.at[level, "qualitative_reserve"]),
+                float(report.at[level, "proforma_cecl_reserve"]),
+            )
+
+        cecl = build_cecl_summary(
+            results,
+            pd.DataFrame([{"portfolio": "Consumer"}]),
+            scenario,
+            [],
+        )
+        consumer = cecl[
+            (cecl["portfolio"] == "Consumer")
+            & (cecl["bucket"] == "Total")
+        ].set_index("stress_level")
+        self.assertEqual(
+            list(consumer["proforma_cecl_reserve"]),
+            [10.0, 22.0, 22.0],
+        )
+        self.assertEqual(float(results.at[0, "consumer_el_S2"]), 15.0)
+        self.assertEqual(
+            float(results.at[0, "consumer_proforma_cecl_S2"]), 17.0
+        )
+
+        flagged_out_of_scope = results.copy()
+        flagged_out_of_scope["out_of_scope_S1"] = True
+        flagged_report = build_consumer_summary(
+            flagged_out_of_scope, scenario
+        ).set_index("stress_level")
+        self.assertEqual(
+            list(flagged_report["proforma_cecl_reserve"]),
+            [10.0, 10.0, 17.0],
+        )
+        self.assertEqual(
+            list(flagged_report["expected_loss"]),
+            [8.0, 8.0, 15.0],
+        )
+        self.assertEqual(
+            float(flagged_report.at["S1", "in_scope_balance"]),
+            0.0,
+        )
+        self.assertEqual(
+            float(flagged_report.at["S1", "out_of_scope_balance"]),
+            100.0,
+        )
+
+    def test_mixed_consumer_commercial_cecl_portfolio_is_rejected(self):
+        scenario = {
+            "stress_levels": ["S1"],
+            "borrower": {
+                "balance_field": "balance",
+                "portfolio_field": "model_portfolio",
+            },
+            "cecl": {
+                "portfolio_field": "cecl_portfolio",
+                "reserve_field": "cecl_reserve",
+            },
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    "balance": 100.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Shared",
+                    "cecl_reserve": 5.0,
+                    "module_applied": "Consumer",
+                    "base_bucket": "Pass",
+                },
+                {
+                    "balance": 200.0,
+                    "model_portfolio": "CRE",
+                    "cecl_portfolio": "Shared",
+                    "cecl_reserve": 10.0,
+                    "module_applied": "CRE",
+                    "base_bucket": "Pass",
+                },
+            ]
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "mixes Consumer and non-Consumer rows",
+        ):
+            build_cecl_summary(
+                results,
+                pd.DataFrame([{"portfolio": "Shared"}]),
+                scenario,
+                [],
+            )
+
+        scenario["cecl"]["portfolios"] = {
+            "Shared": {"method": "bucket_reserve_ratio"}
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "must use the 'expected_loss' method",
+        ):
+            build_cecl_summary(
+                results.iloc[[0]].copy(),
+                pd.DataFrame([{"portfolio": "Shared"}]),
+                scenario,
+                [],
+            )
 
     def test_unconfigured_ci_sector_uses_logged_canonical_fallback(self):
         scenario = {

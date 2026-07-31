@@ -359,54 +359,78 @@ def build_ci_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.D
 
 
 def build_consumer_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.DataFrame:
-    """Build weighted consumer PD/LGD and expected-loss summary rows."""
+    """Build weighted consumer PD/LGD and effective CECL component rows.
+
+    Reported Consumer CECL components use a monotonic carry-forward ladder:
+    Base uses recorded reserve, and each stressed level retains the prior
+    level's borrower contribution when the current level is unavailable or
+    lower. This keeps the reported decomposition and CECL reserve aligned while
+    preserving raw scope diagnostics from the modeled expected-loss columns.
+    """
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
-    levels = ["unstressed"] + get_levels(scenario)
+    stress_levels = get_levels(scenario)
+    levels = ["unstressed"] + stress_levels
     frame = results[results.get("module_applied", "").astype(str).str.contains("Consumer", na=False)] if "module_applied" in results.columns else results.iloc[0:0]
     rows = []
     if frame.empty:
         return pd.DataFrame()
     for portfolio, group in frame.groupby(portfolio_field, dropna=False):
         reserve_field_available = reserve_field in group.columns
+        effective_components = (
+            _consumer_cecl_components(group, scenario, stress_levels)
+            if reserve_field_available
+            else {}
+        )
         for level in levels:
             suffix = "unstressed" if level == "unstressed" else level
+            report_level = "Base" if level == "unstressed" else level
             pd_field = f"consumer_pd_{suffix}"
             lgd_field = f"consumer_lgd_ratio_{suffix}"
             el_field = f"consumer_el_{suffix}"
             balance = float(pd.to_numeric(group[balance_field], errors="coerce").sum())
             el_values = pd.to_numeric(group.get(el_field, _empty_series(group)), errors="coerce")
             scope_mask = el_values.notna()
+            if level != "unstressed":
+                scope_mask &= ~group.get(
+                    f"out_of_scope_{level}",
+                    pd.Series(False, index=group.index),
+                ).fillna(False).astype(bool)
             in_scope_counts = _population_counts(
                 group.loc[scope_mask], scenario
             )
             in_scope_balance = float(pd.to_numeric(group.loc[scope_mask, balance_field], errors="coerce").sum())
             out_of_scope_balance = balance - in_scope_balance
-            el = float(el_values.sum(min_count=1)) if scope_mask.any() else np.nan
-            if level == "unstressed":
-                proforma_reserve = (
-                    float(
-                        pd.to_numeric(
-                            group[reserve_field], errors="coerce"
-                        ).fillna(0.0).sum()
-                    )
-                    if reserve_field_available
-                    else np.nan
+            if reserve_field_available:
+                components = effective_components[report_level]
+                el = float(components["expected_loss"].sum())
+                qualitative_reserve = float(
+                    components["qualitative_reserve"].sum()
+                )
+                proforma_reserve = float(
+                    components["proforma_cecl_reserve"].sum()
                 )
             else:
-                proforma_values = pd.to_numeric(
-                    group.get(f"consumer_proforma_cecl_{suffix}", _empty_series(group)), errors="coerce"
-                )
-                proforma_reserve = (
-                    float(proforma_values.fillna(0.0).sum())
-                    if reserve_field_available
+                el = (
+                    float(el_values.sum(min_count=1))
+                    if scope_mask.any()
                     else np.nan
                 )
+                qualitative_reserve = float(
+                    pd.to_numeric(
+                        group.get(
+                            "consumer_qualitative_reserve",
+                            _empty_series(group),
+                        ),
+                        errors="coerce",
+                    ).sum(min_count=1)
+                )
+                proforma_reserve = np.nan
             rows.append(
                 {
                     "portfolio": portfolio,
-                    "stress_level": "Base" if level == "unstressed" else level,
+                    "stress_level": report_level,
                     **_population_counts(group, scenario),
                     "balance": balance,
                     "in_scope_borrower_count": in_scope_counts[
@@ -429,9 +453,7 @@ def build_consumer_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -
                     "expected_loss_ratio": (
                         np.nan if pd.isna(el) else pct(el, balance)
                     ),
-                    "qualitative_reserve": float(
-                        pd.to_numeric(group.get("consumer_qualitative_reserve", _empty_series(group)), errors="coerce").sum(min_count=1)
-                    ),
+                    "qualitative_reserve": qualitative_reserve,
                     "proforma_cecl_reserve": proforma_reserve,
                     "proforma_cecl_ratio": (
                         np.nan
@@ -446,6 +468,110 @@ def build_consumer_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _consumer_cecl_components(
+    group: pd.DataFrame,
+    scenario: Mapping[str, Any],
+    stress_levels: List[str],
+) -> Dict[str, Dict[str, pd.Series]]:
+    """Return borrower-level effective Consumer CECL components by level.
+
+    Base reserve is authoritative. When its quantitative calculation is
+    unavailable, the recorded reserve is treated as the residual qualitative
+    contribution so the decomposition remains complete. At each later level,
+    quantitative expected loss carries forward when unavailable and is floored
+    at the prior level. Qualitative reserve is likewise prevented from falling,
+    including when a configured qualitative floor first applies under stress.
+    Proforma is always rebuilt from those two effective components.
+    """
+    reserve_field = scenario.get("cecl", {}).get(
+        "reserve_field", "cecl_reserve"
+    )
+    if reserve_field not in group.columns:
+        return {}
+
+    effective_proforma = pd.to_numeric(
+        group[reserve_field], errors="coerce"
+    ).fillna(0.0)
+    base_el = pd.to_numeric(
+        group.get("consumer_el_unstressed", _empty_series(group)),
+        errors="coerce",
+    )
+    effective_el = base_el.fillna(0.0)
+    effective_qualitative = effective_proforma - effective_el
+    stressed_qualitative = pd.to_numeric(
+        group.get(
+            "consumer_qualitative_reserve",
+            _empty_series(group),
+        ),
+        errors="coerce",
+    )
+    qualitative_floor = to_number(
+        scenario.get("modules", {})
+        .get("Consumer", {})
+        .get("qualitative_reserve_floor"),
+        np.nan,
+    )
+    qualitative_floor_values = pd.Series(
+        qualitative_floor,
+        index=group.index,
+        dtype=float,
+    )
+    components: Dict[str, Dict[str, pd.Series]] = {
+        "Base": {
+            "expected_loss": effective_el.copy(),
+            "qualitative_reserve": effective_qualitative.copy(),
+            "proforma_cecl_reserve": effective_proforma.copy(),
+        }
+    }
+
+    for level in stress_levels:
+        raw_el = pd.to_numeric(
+            group.get(f"consumer_el_{level}", _empty_series(group)),
+            errors="coerce",
+        )
+        raw_proforma = pd.to_numeric(
+            group.get(
+                f"consumer_proforma_cecl_{level}",
+                _empty_series(group),
+            ),
+            errors="coerce",
+        )
+        out_of_scope = group.get(
+            f"out_of_scope_{level}",
+            pd.Series(False, index=group.index),
+        ).fillna(False).astype(bool)
+        use_calculated_el = (
+            raw_el.notna()
+            & raw_proforma.notna()
+            & ~out_of_scope
+        )
+        raw_qualitative = (raw_proforma - raw_el).where(
+            use_calculated_el
+        )
+        candidate_el = raw_el.where(use_calculated_el, effective_el)
+        candidate_qualitative = pd.concat(
+            [
+                stressed_qualitative,
+                raw_qualitative,
+                qualitative_floor_values,
+            ],
+            axis=1,
+        ).max(axis=1)
+        effective_el = pd.concat(
+            [effective_el, candidate_el], axis=1
+        ).max(axis=1)
+        effective_qualitative = pd.concat(
+            [effective_qualitative, candidate_qualitative], axis=1
+        ).max(axis=1)
+        effective_proforma = effective_el + effective_qualitative
+        components[level] = {
+            "expected_loss": effective_el.copy(),
+            "qualitative_reserve": effective_qualitative.copy(),
+            "proforma_cecl_reserve": effective_proforma.copy(),
+        }
+    return components
 
 
 def build_out_of_scope_summary(out_of_scope: pd.DataFrame) -> pd.DataFrame:
@@ -479,8 +605,28 @@ def _cecl_methods(results: pd.DataFrame, scenario: Mapping[str, Any]) -> Dict[An
         methods[portfolio] = spec.get("method", "bucket_reserve_ratio")
     if "module_applied" in results.columns and portfolio_field in results.columns:
         for portfolio, group in results.groupby(portfolio_field, dropna=False):
-            if group["module_applied"].astype(str).str.contains("Consumer", na=False).any():
-                methods.setdefault(portfolio, "expected_loss")
+            consumer_rows = group["module_applied"].astype(str).str.contains(
+                "Consumer", na=False
+            )
+            if consumer_rows.any() and (~consumer_rows).any():
+                raise ValueError(
+                    f"CECL portfolio '{portfolio}' mixes Consumer and "
+                    "non-Consumer rows; expected-loss and bucket-reserve-ratio "
+                    "methods cannot share one CECL portfolio."
+                )
+            if consumer_rows.any():
+                configured_method = methods.get(portfolio)
+                if configured_method not in (None, "expected_loss"):
+                    raise ValueError(
+                        f"Consumer CECL portfolio '{portfolio}' must use the "
+                        "'expected_loss' method."
+                    )
+                methods[portfolio] = "expected_loss"
+            elif methods.get(portfolio) == "expected_loss":
+                raise ValueError(
+                    f"CECL portfolio '{portfolio}' uses the 'expected_loss' "
+                    "method but contains no Consumer rows."
+                )
     return methods
 
 
@@ -549,9 +695,9 @@ def _consumer_cecl_rows(
 ) -> List[Dict[str, Any]]:
     """Use Consumer expected loss as the CECL reserve output.
 
-    Missing stressed values contribute zero to the reported portfolio reserve.
+    Missing or lower stressed contributions carry the prior level forward.
     Detailed missing-input and out-of-scope records remain in their dedicated
-    reports rather than making the CECL summary unavailable.
+    reports without making the CECL summary unavailable or reducing reserve.
     """
     portfolio_field = scenario.get("cecl", {}).get(
         "portfolio_field", scenario["borrower"].get("portfolio_field", "portfolio")
@@ -560,6 +706,11 @@ def _consumer_cecl_rows(
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
     group = results[results[portfolio_field] == portfolio]
     reserve_field_available = reserve_field in group.columns
+    effective_components = (
+        _consumer_cecl_components(group, scenario, get_levels(scenario))
+        if reserve_field_available
+        else {}
+    )
     rows = []
     for level in levels:
         balance = float(pd.to_numeric(group[balance_field], errors="coerce").sum())
@@ -567,19 +718,12 @@ def _consumer_cecl_rows(
             reserve = np.nan
             status = "unavailable"
             exception_code = "CECL_RESERVE_FIELD_MISSING"
-        elif level == "Base":
-            reserve = float(
-                pd.to_numeric(
-                    group[reserve_field], errors="coerce"
-                ).fillna(0.0).sum()
-            )
-            status = "available"
-            exception_code = ""
         else:
-            reserve_values = pd.to_numeric(
-                group.get(f"consumer_proforma_cecl_{level}", _empty_series(group)), errors="coerce"
+            reserve = float(
+                effective_components[level][
+                    "proforma_cecl_reserve"
+                ].sum()
             )
-            reserve = float(reserve_values.fillna(0.0).sum())
             status = "available"
             exception_code = ""
         rows.append(

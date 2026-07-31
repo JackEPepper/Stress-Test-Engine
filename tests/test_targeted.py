@@ -323,6 +323,97 @@ class TargetedStressTest(unittest.TestCase):
             float(row["consumer_stressed_collateral_value_S1"]),
             float(row["consumer_collateral_value_unstressed"]),
         )
+        consumer_summary = result["reports"]["consumer_summary"]
+        for variant in ("baseline", "consumer_parallel"):
+            variant_summary = consumer_summary[
+                consumer_summary["scenario_variant"] == variant
+            ].set_index("stress_level")
+            self.assertEqual(
+                list(variant_summary["proforma_cecl_reserve"]),
+                sorted(variant_summary["proforma_cecl_reserve"]),
+            )
+            for level in ("Base", "S1", "S2"):
+                self.assertAlmostEqual(
+                    float(variant_summary.at[level, "expected_loss"])
+                    + float(
+                        variant_summary.at[
+                            level, "qualitative_reserve"
+                        ]
+                    ),
+                    float(
+                        variant_summary.at[
+                            level, "proforma_cecl_reserve"
+                        ]
+                    ),
+                )
+
+        invalid_s2 = copy.deepcopy(scenario)
+        invalid_s2["targeted_stress"]["shocks"]["consumer_shock"][
+            "tiers"
+        ]["high"]["modules"]["Consumer"]["pd_increase_factor"][
+            "values"
+        ]["S2"] = -1.0
+        invalid_result = StressEngine(invalid_s2, base_dir).run(
+            write_outputs=False,
+            run_comparison=False,
+        )
+        invalid_row = invalid_result["variant_results"][
+            (
+                invalid_result["variant_results"]["scenario_variant"]
+                == "consumer_parallel"
+            )
+            & (invalid_result["variant_results"]["loan_id"] == "L008")
+        ].iloc[0]
+        self.assertTrue(bool(invalid_row["out_of_scope_S2"]))
+        invalid_summary = invalid_result["reports"]["consumer_summary"]
+        invalid_summary = invalid_summary[
+            invalid_summary["scenario_variant"] == "consumer_parallel"
+        ].set_index("stress_level")
+        self.assertAlmostEqual(
+            float(invalid_summary.at["Base", "proforma_cecl_reserve"]),
+            4000.0,
+        )
+        self.assertAlmostEqual(
+            float(invalid_summary.at["S1", "proforma_cecl_reserve"]),
+            7689.04,
+        )
+        self.assertAlmostEqual(
+            float(invalid_summary.at["S2", "proforma_cecl_reserve"]),
+            7689.04,
+        )
+        self.assertAlmostEqual(
+            float(invalid_summary.at["S2", "expected_loss"]),
+            3689.04,
+        )
+        self.assertAlmostEqual(
+            float(invalid_summary.at["S2", "qualitative_reserve"]),
+            4000.0,
+        )
+        self.assertEqual(
+            float(invalid_summary.at["S2", "in_scope_balance"]),
+            0.0,
+        )
+        self.assertEqual(
+            float(invalid_summary.at["S2", "out_of_scope_balance"]),
+            300000.0,
+        )
+        invalid_cecl = invalid_result["reports"]["cecl_summary"]
+        invalid_cecl = invalid_cecl[
+            (
+                invalid_cecl["scenario_variant"]
+                == "consumer_parallel"
+            )
+            & (invalid_cecl["portfolio"] == "Consumer")
+            & (invalid_cecl["bucket"] == "Total")
+        ].set_index("stress_level")
+        self.assertEqual(
+            list(invalid_cecl["proforma_cecl_reserve"]),
+            sorted(invalid_cecl["proforma_cecl_reserve"]),
+        )
+        self.assertAlmostEqual(
+            float(invalid_cecl.at["S2", "proforma_cecl_reserve"]),
+            float(invalid_cecl.at["S1", "proforma_cecl_reserve"]),
+        )
 
     def test_cre_refinance_parameters_and_invalid_effective_value(self):
         scenario, base_dir = load_scenario(ROOT / "examples" / "scenario.json")
