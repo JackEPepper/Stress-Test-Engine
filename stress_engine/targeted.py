@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .borrower import aggregate_source
+from .cecl import attach_cecl_reserve_basis
 from .exceptions import record_exception
 from .modules.base import initialize_results, targeted_override_column
 from .modules.ci import _brg_key, _ebitda_reduction, run_ci
@@ -462,8 +463,13 @@ def run_targeted_stress(
     context, tag_summary = build_loan_context(scenario, loaded, exceptions)
     baseline_scenario = _variant_scenario(scenario, "baseline")
     exception_start = len(exceptions)
-    baseline, baseline_out_scope = _run_modules(
+    baseline_input, reserve_basis = attach_cecl_reserve_basis(
         initialize_results(context, baseline_scenario, exceptions),
+        baseline_scenario,
+        exceptions,
+    )
+    baseline, baseline_out_scope = _run_modules(
+        baseline_input,
         baseline_scenario,
         loaded,
         exceptions,
@@ -490,6 +496,7 @@ def run_targeted_stress(
         baseline_scenario,
         baseline_out_scope,
         exceptions,
+        reserve_basis,
     )
     _annotate_exceptions(
         exceptions, exception_start, "baseline", context, scenario
@@ -558,6 +565,7 @@ def run_targeted_stress(
             variant_scenario,
             out_scope,
             exceptions,
+            reserve_basis,
         )
         _annotate_exceptions(
             exceptions, exception_start, variant_name, context, scenario

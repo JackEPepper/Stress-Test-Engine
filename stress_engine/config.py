@@ -103,6 +103,9 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     for field in ("borrower_id_field", "balance_field"):
         if field not in borrower:
             raise ValueError(f"Scenario borrower section must define '{field}'.")
+    from .cecl import validate_cecl_config
+
+    validate_cecl_config(scenario)
     # Import locally to keep scenario loading independent from tagging's input
     # table types while still failing malformed tag flags before any data load.
     from .tagging import normalize_tag_defs

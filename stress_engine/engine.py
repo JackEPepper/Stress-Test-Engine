@@ -17,6 +17,7 @@ from .borrower import (
     record_best_available_fallbacks,
     record_identity_data_issues,
 )
+from .cecl import attach_cecl_reserve_basis
 from .comparison import build_comparison_report
 from .config import output_dir_for, validate_scenario
 from .exceptions import exception_frame
@@ -132,6 +133,9 @@ class StressEngine:
         # `module_population` inside each module enforces the resolved
         # `primary_module`, preventing double-stress when tags overlap.
         results = initialize_results(borrowers, self.scenario, exceptions)
+        results, reserve_basis = attach_cecl_reserve_basis(
+            results, self.scenario, exceptions
+        )
         out_of_scope_frames = []
         module_order = self.scenario.get("module_order", ["CRE", "C&I", "Consumer"])
         for module_name in module_order:
@@ -149,7 +153,14 @@ class StressEngine:
 
         # 5. Reporting consumes stressed results plus audit borrowers. CECL and
         # overlay warnings append to the shared exception list for one final log.
-        reports = build_reports(results, audit_borrowers, self.scenario, out_of_scope, exceptions)
+        reports = build_reports(
+            results,
+            audit_borrowers,
+            self.scenario,
+            out_of_scope,
+            exceptions,
+            reserve_basis,
+        )
         reports["input_summary"] = input_summary
         reports["tag_summary"] = tag_summary
         reports["source_reconciliation"] = source_reconciliation
@@ -287,6 +298,7 @@ class StressEngine:
                     "portfolio",
                     "stress_level",
                     "bucket",
+                    "period",
                     borrower_id,
                     loan_id,
                     "_exposure_id",
@@ -323,6 +335,7 @@ def _sort_columns(name: str, frame: pd.DataFrame) -> list[str]:
     candidates = {
         "migration_summary": ["portfolio", "stress_level", "bucket"],
         "cecl_summary": ["portfolio", "stress_level", "bucket"],
+        "cecl_basis_summary": ["portfolio", "bucket", "period"],
         "tag_summary": ["tag", "tie_out_name"],
         "out_of_scope_detail": ["module", "stress_level", "borrower_id", "field"],
         "out_of_scope_summary": ["module", "stress_level", "test", "field"],

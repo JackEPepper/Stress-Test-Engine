@@ -215,6 +215,7 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertIn("borrower_audit_raw.csv", output_files)
             self.assertIn("stressed_borrower_results.csv", output_files)
             self.assertIn("cecl_summary.csv", output_files)
+            self.assertIn("cecl_basis_summary.csv", output_files)
             self.assertIn("exception_log.csv", output_files)
             self.assertIn("metadata.json", output_files)
             self.assertIn("output_manifest.json", output_files)
@@ -473,8 +474,23 @@ class SampleScenarioRunTest(unittest.TestCase):
             (cecl["portfolio"] == "Retail Consumer")
             & (cecl["bucket"] == "Total")
         ].set_index("stress_level")
+        consumer_result = result["results"][
+            result["results"]["module_applied"]
+            .astype(str)
+            .str.contains("Consumer", na=False)
+        ].iloc[0]
 
         self.assertEqual(set(consumer_cecl["method"]), {"expected_loss"})
+        self.assertEqual(
+            float(consumer_result["consumer_cecl_reserve_base"]),
+            float(consumer_result["cecl_effective_reserve_base"]),
+        )
+        for level in ("S1", "S2"):
+            self.assertAlmostEqual(
+                float(consumer_result[f"consumer_proforma_cecl_{level}"]),
+                float(consumer_result[f"consumer_el_{level}"])
+                + float(consumer_result["consumer_qualitative_reserve"]),
+            )
         for level in ("Base", "S1", "S2"):
             quantitative = float(consumer_summary.at[level, "expected_loss"])
             qualitative = float(

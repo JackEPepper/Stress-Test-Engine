@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from .cecl import (
+    INVALID_BALANCE_COUNT_FIELD,
+    reserve_basis_fields,
+    reserve_missing_count_field,
+)
 from .exceptions import record_exception
 from .io import LoadedTable
 from .utils import as_list, condition_fields, ensure_columns, first_non_null, join_unique, parse_date_series
@@ -34,6 +39,31 @@ def build_borrowers(
 
     ensure_columns(identity, [borrower_id], "Identity input")
     identity = identity.copy()
+    valid_balance = pd.Series(True, index=identity.index)
+    if balance_field in identity.columns:
+        balance_values = pd.to_numeric(identity[balance_field], errors="coerce")
+        valid_balance = pd.Series(
+            np.isfinite(balance_values), index=identity.index
+        )
+        identity[balance_field] = balance_values.where(valid_balance)
+        # Keep negative balances visible in reported totals, but carry an
+        # explicit counter so CECL never treats them as a valid zero balance
+        # after borrower aggregation.
+        identity[INVALID_BALANCE_COUNT_FIELD] = (
+            (~valid_balance) | balance_values.lt(0)
+        ).astype(int)
+        balance_fields.add(INVALID_BALANCE_COUNT_FIELD)
+    for reserve_field in reserve_basis_fields(scenario):
+        if reserve_field not in identity.columns:
+            continue
+        count_field = reserve_missing_count_field(reserve_field)
+        reserve_values = pd.to_numeric(identity[reserve_field], errors="coerce")
+        finite = np.isfinite(reserve_values)
+        identity[reserve_field] = reserve_values.where(
+            finite & valid_balance
+        )
+        identity[count_field] = (~finite).astype(int)
+        balance_fields.add(count_field)
     _separate_missing_borrower_ids(identity, borrower_id, exceptions)
     _record_identity_key_issues(identity, borrower_id, loan_id_field, exceptions)
     largest_fields = _largest_loan_fields(scenario, identity.columns)
@@ -447,6 +477,7 @@ def record_identity_data_issues(
     borrower = scenario.get("borrower", {})
     balance_field = borrower.get("balance_field", "outstanding_balance")
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
+    reserve_fields = reserve_basis_fields(scenario)
     if balance_field not in identity.columns:
         record_exception(
             exceptions,
@@ -458,15 +489,16 @@ def record_identity_data_issues(
         )
     else:
         balances = pd.to_numeric(identity[balance_field], errors="coerce")
-        if balances.isna().any():
+        invalid_balances = ~np.isfinite(balances)
+        if invalid_balances.any():
             record_exception(
                 exceptions,
                 "WARNING",
                 "identity",
                 "IDENTITY_BALANCE_MISSING",
-                "Identity rows had missing or invalid balances and remain visible with unavailable dollar calculations.",
+                "Identity rows had missing, invalid, or nonfinite balances and remain visible with unavailable dollar calculations.",
                 field=balance_field,
-                details=f"missing_count={int(balances.isna().sum())}",
+                details=f"missing_count={int(invalid_balances.sum())}",
             )
         if (balances < 0).any():
             record_exception(
@@ -478,25 +510,36 @@ def record_identity_data_issues(
                 field=balance_field,
                 details=f"negative_count={int((balances < 0).sum())}",
             )
-    if reserve_field not in identity.columns:
-        record_exception(
-            exceptions,
-            "ERROR",
-            "cecl",
-            "CECL_RESERVE_FIELD_MISSING",
-            "Configured CECL reserve field was missing from identity data.",
-            field=reserve_field,
-        )
-    else:
-        missing_reserve = identity[reserve_field].isna()
+    for field in reserve_fields:
+        is_current = field == reserve_field
+        if field not in identity.columns:
+            record_exception(
+                exceptions,
+                "ERROR",
+                "cecl",
+                (
+                    "CECL_RESERVE_FIELD_MISSING"
+                    if is_current
+                    else "CECL_BASIS_FIELD_MISSING"
+                ),
+                "A configured CECL reserve-basis field was missing from identity data.",
+                field=field,
+            )
+            continue
+        reserve_values = pd.to_numeric(identity[field], errors="coerce")
+        missing_reserve = ~np.isfinite(reserve_values)
         if missing_reserve.any():
             record_exception(
                 exceptions,
                 "WARNING",
                 "cecl",
-                "CECL_LOAN_RESERVE_MISSING_TREATED_AS_ZERO",
-                "Individual loan CECL reserve values were missing and treated as zero in aggregate reserve reporting.",
-                field=reserve_field,
+                (
+                    "CECL_LOAN_RESERVE_MISSING_TREATED_AS_ZERO"
+                    if is_current
+                    else "CECL_HISTORY_RESERVE_MISSING_TREATED_AS_ZERO"
+                ),
+                "Individual loan CECL reserve values were missing and treated as zero in the selected reserve basis.",
+                field=field,
                 details=f"missing_count={int(missing_reserve.sum())}",
             )
 

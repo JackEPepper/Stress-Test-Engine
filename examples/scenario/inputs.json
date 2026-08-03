@@ -15,7 +15,9 @@
         "risk_rating": "risk_rating",
         "maturity_date": "maturity_date",
         "outstanding_balance": "outstanding_balance",
-        "cecl_reserve": "cecl_reserve"
+        "cecl_reserve": "cecl_reserve",
+        "cecl_reserve_prior_1": "cecl_reserve_prior_1",
+        "cecl_reserve_prior_2": "cecl_reserve_prior_2"
       },
       "date_columns": [
         "maturity_date"
@@ -23,13 +25,18 @@
       "numeric_columns": [
         "risk_rating",
         "outstanding_balance",
-        "cecl_reserve"
+        "cecl_reserve",
+        "cecl_reserve_prior_1",
+        "cecl_reserve_prior_2"
       ],
       "required_columns": [
         "loan_id",
         "borrower_id",
         "subsector",
-        "outstanding_balance"
+        "outstanding_balance",
+        "cecl_reserve",
+        "cecl_reserve_prior_1",
+        "cecl_reserve_prior_2"
       ]
     },
     "sources": {
@@ -284,7 +291,9 @@
     "balance_field": "outstanding_balance",
     "sum_fields": [
       "outstanding_balance",
-      "cecl_reserve"
+      "cecl_reserve",
+      "cecl_reserve_prior_1",
+      "cecl_reserve_prior_2"
     ],
     "risk_rating_field": "risk_rating",
     "maturity_date_field": "maturity_date"
