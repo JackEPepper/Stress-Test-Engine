@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from ..cecl import EFFECTIVE_RESERVE_FIELD
 from .base import append_module, module_population, record_out_of_scope, targeted_parameter
 from ..exceptions import record_exception
 from ..utils import get_levels, is_missing, lookup_parameter_with_source, to_number
@@ -40,13 +39,8 @@ def run_consumer(
     _validate_pd_lookup(pd_table, exceptions)
     out_scope: List[Dict[str, Any]] = []
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
-    reserve_source_field = (
-        EFFECTIVE_RESERVE_FIELD
-        if EFFECTIVE_RESERVE_FIELD in out.columns
-        else reserve_field
-    )
     qualitative_floor = to_number(config.get("qualitative_reserve_floor"), np.nan)
-    reserve_field_available = reserve_source_field in out.columns
+    reserve_field_available = reserve_field in out.columns
     rushed_sale_discount = to_number(config.get("rushed_sale_discount"), np.nan)
     closing_costs = to_number(config.get("closing_costs"), np.nan)
     liquidation_assumption_errors = []
@@ -106,14 +100,12 @@ def run_consumer(
         out.at[idx, "consumer_lgd_unstressed"] = unstressed_lgd
         out.at[idx, "consumer_lgd_ratio_unstressed"] = unstressed_lgd / balance if balance else np.nan
         out.at[idx, "consumer_el_unstressed"] = unstressed_el
-        base_reserve = (
-            to_number(
-                row.get(reserve_source_field),
-                0.0 if reserve_source_field == reserve_field else np.nan,
-            )
-            if reserve_field_available
-            else np.nan
-        )
+        if reserve_field_available:
+            base_reserve = to_number(row.get(reserve_field), 0.0)
+            if not np.isfinite(base_reserve):
+                base_reserve = 0.0
+        else:
+            base_reserve = np.nan
         qualitative_reserve = (
             base_reserve - unstressed_el
             if not is_missing(base_reserve) and not is_missing(unstressed_el)

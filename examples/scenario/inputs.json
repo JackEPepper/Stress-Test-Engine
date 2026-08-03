@@ -15,9 +15,7 @@
         "risk_rating": "risk_rating",
         "maturity_date": "maturity_date",
         "outstanding_balance": "outstanding_balance",
-        "cecl_reserve": "cecl_reserve",
-        "cecl_reserve_prior_1": "cecl_reserve_prior_1",
-        "cecl_reserve_prior_2": "cecl_reserve_prior_2"
+        "cecl_reserve": "cecl_reserve"
       },
       "date_columns": [
         "maturity_date"
@@ -25,21 +23,39 @@
       "numeric_columns": [
         "risk_rating",
         "outstanding_balance",
-        "cecl_reserve",
-        "cecl_reserve_prior_1",
-        "cecl_reserve_prior_2"
+        "cecl_reserve"
       ],
       "required_columns": [
         "loan_id",
         "borrower_id",
         "subsector",
         "outstanding_balance",
-        "cecl_reserve",
-        "cecl_reserve_prior_1",
-        "cecl_reserve_prior_2"
+        "cecl_reserve"
       ]
     },
     "sources": {
+      "cecl_history": {
+        "path": "data/cecl_history.csv",
+        "type": "csv",
+        "merge": false,
+        "column_aliases": {
+          "cecl_portfolio": "cecl_portfolio",
+          "period": "period",
+          "historical_cecl_reserve": "historical_cecl_reserve"
+        },
+        "string_columns": [
+          "cecl_portfolio",
+          "period"
+        ],
+        "numeric_columns": [
+          "historical_cecl_reserve"
+        ],
+        "required_columns": [
+          "cecl_portfolio",
+          "period",
+          "historical_cecl_reserve"
+        ]
+      },
       "financials": {
         "path": "data/financials.csv",
         "type": "csv",
@@ -291,9 +307,7 @@
     "balance_field": "outstanding_balance",
     "sum_fields": [
       "outstanding_balance",
-      "cecl_reserve",
-      "cecl_reserve_prior_1",
-      "cecl_reserve_prior_2"
+      "cecl_reserve"
     ],
     "risk_rating_field": "risk_rating",
     "maturity_date_field": "maturity_date"

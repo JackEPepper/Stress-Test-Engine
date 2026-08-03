@@ -17,7 +17,7 @@ from .borrower import (
     record_best_available_fallbacks,
     record_identity_data_issues,
 )
-from .cecl import attach_cecl_reserve_basis
+from .cecl import attach_cecl_reserve_basis, cecl_history_frame
 from .comparison import build_comparison_report
 from .config import output_dir_for, validate_scenario
 from .exceptions import exception_frame
@@ -134,7 +134,10 @@ class StressEngine:
         # `primary_module`, preventing double-stress when tags overlap.
         results = initialize_results(borrowers, self.scenario, exceptions)
         results, reserve_basis = attach_cecl_reserve_basis(
-            results, self.scenario, exceptions
+            results,
+            self.scenario,
+            exceptions,
+            history=cecl_history_frame(self.scenario, loaded),
         )
         out_of_scope_frames = []
         module_order = self.scenario.get("module_order", ["CRE", "C&I", "Consumer"])

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -13,6 +15,7 @@ from stress_engine.cecl import (
 )
 from stress_engine.config import validate_scenario
 from stress_engine.engine import StressEngine
+from stress_engine.io import load_inputs
 from stress_engine.modules.consumer import run_consumer
 from stress_engine.reporting import (
     build_cecl_bucket_summary,
@@ -22,11 +25,6 @@ from stress_engine.reporting import (
 
 
 def _scenario(reserve_basis: dict | None = None) -> dict:
-    reserve_fields = [
-        "cecl_reserve",
-        "cecl_reserve_prior_1",
-        "cecl_reserve_prior_2",
-    ]
     cecl = {
         "reserve_field": "cecl_reserve",
         "portfolio_field": "cecl_portfolio",
@@ -40,28 +38,79 @@ def _scenario(reserve_basis: dict | None = None) -> dict:
                     "borrower_id": "borrower_id",
                     "balance": "balance",
                     "cecl_portfolio": "cecl_portfolio",
-                    **{field: field for field in reserve_fields},
+                    "cecl_reserve": "cecl_reserve",
                 },
-                "numeric_columns": ["balance", *reserve_fields],
+                "numeric_columns": ["balance", "cecl_reserve"],
                 "required_columns": [
                     "borrower_id",
                     "balance",
                     "cecl_portfolio",
-                    *reserve_fields,
+                    "cecl_reserve",
                 ],
-            }
+            },
+            "sources": {},
         },
         "borrower": {
             "borrower_id_field": "borrower_id",
             "balance_field": "balance",
             "portfolio_field": "model_portfolio",
-            "sum_fields": ["balance", *reserve_fields],
+            "sum_fields": ["balance", "cecl_reserve"],
         },
         "tags": {},
         "modules": {},
         "stress_levels": ["S1", "S2"],
         "cecl": cecl,
     }
+
+
+def _history_source_spec() -> dict:
+    return {
+        "path": "cecl_history.csv",
+        "type": "csv",
+        "merge": False,
+        "column_aliases": {
+            "cecl_portfolio": "cecl_portfolio",
+            "period": "period",
+            "historical_cecl_reserve": "historical_cecl_reserve",
+        },
+        "string_columns": ["cecl_portfolio", "period"],
+        "numeric_columns": ["historical_cecl_reserve"],
+        "required_columns": [
+            "cecl_portfolio",
+            "period",
+            "historical_cecl_reserve",
+        ],
+    }
+
+
+def _with_history_source(scenario: dict) -> dict:
+    scenario["inputs"]["sources"]["cecl_history"] = _history_source_spec()
+    return scenario
+
+
+def _history_frame(rows: list[tuple[object, object, object]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "cecl_portfolio",
+            "period",
+            "historical_cecl_reserve",
+        ],
+    )
+
+
+def _build_basis(
+    results: pd.DataFrame,
+    scenario: dict,
+    history_rows: list[tuple[object, object, object]],
+    exceptions: list[dict] | None = None,
+):
+    return build_cecl_reserve_basis(
+        results,
+        scenario,
+        exceptions if exceptions is not None else [],
+        history=_history_frame(history_rows),
+    )
 
 
 def _commercial_frame(
@@ -90,27 +139,28 @@ def _commercial_frame(
 def _weighted_basis(
     weights: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
     *,
-    period_method: str = "in_place",
+    current_method: str = "in_place",
     z_score_threshold: float | None = None,
 ) -> dict:
     config: dict = {
-        "method": "weighted_history",
-        "weighted_history": {
-            "period_method": period_method,
+        "current_method": current_method,
+        "historical": {
+            "enabled": True,
+            "source": "cecl_history",
+            "period_field": "period",
+            "portfolio_field": "cecl_portfolio",
+            "reserve_field": "historical_cecl_reserve",
+            "current_period": {
+                "name": "2026Q2",
+                "weight": weights[0],
+            },
             "periods": [
                 {
-                    "name": "current",
-                    "reserve_field": "cecl_reserve",
-                    "weight": weights[0],
-                },
-                {
-                    "name": "prior_1",
-                    "reserve_field": "cecl_reserve_prior_1",
+                    "name": "2026Q1",
                     "weight": weights[1],
                 },
                 {
-                    "name": "prior_2",
-                    "reserve_field": "cecl_reserve_prior_2",
+                    "name": "2025Q4",
                     "weight": weights[2],
                 },
             ],
@@ -133,7 +183,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         omitted = build_cecl_reserve_basis(results, _scenario(), [])
         explicit = build_cecl_reserve_basis(
             results,
-            _scenario({"method": "in_place"}),
+            _scenario({"current_method": "in_place"}),
             [],
         )
 
@@ -159,7 +209,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         )
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 10.0},
             }
         )
@@ -186,7 +236,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         )
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 2.0},
             }
         )
@@ -229,7 +279,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         results["borrower_id"] = [f"B{index}" for index in results.index]
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 1.0},
             }
         )
@@ -252,7 +302,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         results = _commercial_frame([100.0, 100.0], [1.0, 3.0])
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 0.5},
             }
         )
@@ -292,7 +342,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         results["borrower_id"] = [f"B{index}" for index in results.index]
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 2.0},
             }
         )
@@ -304,282 +354,511 @@ class CeclReserveBasisTest(unittest.TestCase):
         self.assertAlmostEqual(float(rates[("CRE", "Substandard")]), 0.05)
         self.assertAlmostEqual(float(rates[("C&I", "Pass")]), 0.08)
 
-    def test_weighted_history_supports_equal_and_arbitrary_weights(self):
-        results = _commercial_frame([100.0, 300.0], [1.0, 9.0])
-        results["cecl_reserve_prior_1"] = [2.0, 12.0]
-        results["cecl_reserve_prior_2"] = [4.0, 18.0]
+    def test_history_blends_portfolio_ratios_and_trims_only_current_period(self):
+        pass_rows = _commercial_frame(
+            [100.0] * 6,
+            [1.0, 1.0, 1.0, 1.0, 1.0, 50.0],
+            bucket="Pass",
+        )
+        substandard = _commercial_frame(
+            [200.0], [10.0], bucket="Substandard"
+        )
+        results = pd.concat([pass_rows, substandard], ignore_index=True)
+        results["borrower_id"] = [f"B{index}" for index in results.index]
+        scenario = _with_history_source(
+            _scenario(
+                _weighted_basis(
+                    (0.5, 0.3, 0.2),
+                    current_method="central_tendency",
+                    z_score_threshold=2.0,
+                )
+            )
+        )
 
-        equal = build_cecl_reserve_basis(
+        basis = _build_basis(
             results,
-            _scenario(_weighted_basis()),
-            [],
+            scenario,
+            [
+                ("CRE", "2026Q1", 20.0),
+                ("CRE", "2025Q4", 80.0),
+            ],
         )
-        arbitrary = build_cecl_reserve_basis(
-            results,
-            _scenario(_weighted_basis((0.2, 0.3, 0.5))),
-            [],
-        )
+        rates = basis.ratios.set_index("bucket")["reserve_ratio"]
 
-        np.testing.assert_allclose(
-            equal.effective_reserve.to_numpy(),
-            np.array([7 / 3, 13.0]),
-        )
-        self.assertAlmostEqual(float(equal.effective_reserve.sum()), 46 / 3)
-        self.assertAlmostEqual(float(equal.ratios.iloc[0]["reserve_ratio"]), 23 / 600)
-        np.testing.assert_allclose(
-            arbitrary.effective_reserve.to_numpy(),
-            np.array([2.8, 14.4]),
-        )
-        self.assertAlmostEqual(float(arbitrary.effective_reserve.sum()), 17.2)
-        self.assertAlmostEqual(float(arbitrary.ratios.iloc[0]["reserve_ratio"]), 0.043)
-        self.assertEqual(set(equal.audit["period"]), {"current", "prior_1", "prior_2"})
-        self.assertAlmostEqual(float(equal.audit["weight"].sum()), 1.0)
-        self.assertTrue(equal.audit["status"].eq("available").all())
+        # Current ratios are 1% after trimming for Pass and 5% for
+        # Substandard. Historical dollars are divided by the current $800
+        # portfolio balance, producing 2.5% and 10% ratios reused across both
+        # current base buckets without their own z-score step.
+        self.assertAlmostEqual(float(rates["Pass"]), 0.0325)
+        self.assertAlmostEqual(float(rates["Substandard"]), 0.0525)
+        self.assertAlmostEqual(float(basis.effective_reserve.iloc[:6].sum()), 19.5)
+        self.assertAlmostEqual(float(basis.effective_reserve.iloc[6]), 10.5)
+        # .5 * $16 current selected reserve + .3 * $20 + .2 * $80.
+        self.assertAlmostEqual(float(basis.effective_reserve.sum()), 30.0)
 
-    def test_weighted_history_supports_an_arbitrary_period_count(self):
-        reserve_basis = _weighted_basis((0.1, 0.2, 0.3))
-        reserve_basis["weighted_history"]["periods"].append(
-            {
-                "name": "prior_3",
-                "reserve_field": "cecl_reserve_prior_3",
-                "weight": 0.4,
-            }
-        )
-        scenario = _scenario(reserve_basis)
-        identity = scenario["inputs"]["identity"]
-        identity["column_aliases"]["cecl_reserve_prior_3"] = "Prior 3"
-        identity["numeric_columns"].append("cecl_reserve_prior_3")
-        identity["required_columns"].append("cecl_reserve_prior_3")
-        scenario["borrower"]["sum_fields"].append("cecl_reserve_prior_3")
-        results = _commercial_frame([100.0], [10.0])
-        results["cecl_reserve_prior_1"] = 20.0
-        results["cecl_reserve_prior_2"] = 30.0
-        results["cecl_reserve_prior_3"] = 40.0
+        current_pass = basis.audit[
+            (basis.audit["bucket"] == "Pass")
+            & (basis.audit["period"] == "2026Q2")
+        ].iloc[0]
+        self.assertEqual(int(current_pass["observation_count"]), 6)
+        self.assertEqual(int(current_pass["included_observation_count"]), 5)
+        self.assertEqual(int(current_pass["excluded_observation_count"]), 1)
+        history = basis.audit[basis.audit["period"].isin(["2026Q1", "2025Q4"])]
+        self.assertEqual(set(history["period_reserve_ratio"]), {0.025, 0.1})
+        self.assertTrue(history["excluded_observation_count"].fillna(0).eq(0).all())
 
-        validate_scenario(scenario)
-        basis = build_cecl_reserve_basis(results, scenario, [])
-
-        self.assertEqual(len(basis.audit), 4)
-        self.assertAlmostEqual(float(basis.effective_reserve.iloc[0]), 30.0)
-        self.assertAlmostEqual(float(basis.ratios.iloc[0]["reserve_ratio"]), 0.3)
-
-    def test_weighted_history_can_trim_each_period_before_blending(self):
+    def test_history_current_method_toggle_changes_only_current_quarter(self):
         results = _commercial_frame(
             [100.0] * 6,
             [1.0, 1.0, 1.0, 1.0, 1.0, 50.0],
         )
-        results["cecl_reserve_prior_1"] = [2.0, 2.0, 2.0, 2.0, 2.0, 60.0]
-        results["cecl_reserve_prior_2"] = [3.0, 3.0, 3.0, 3.0, 3.0, 70.0]
-        scenario = _scenario(
-            _weighted_basis(
-                period_method="central_tendency",
-                z_score_threshold=2.0,
+        history = [
+            ("CRE", "2026Q1", 20.0),
+            ("CRE", "2025Q4", 80.0),
+        ]
+        central_scenario = _with_history_source(
+            _scenario(
+                _weighted_basis(
+                    (0.5, 0.3, 0.2),
+                    current_method="central_tendency",
+                    z_score_threshold=2.0,
+                )
             )
         )
-
-        basis = build_cecl_reserve_basis(results, scenario, [])
-
-        self.assertAlmostEqual(float(basis.ratios.iloc[0]["reserve_ratio"]), 0.02)
-        np.testing.assert_allclose(
-            basis.effective_reserve.to_numpy(), np.full(6, 2.0)
+        in_place_scenario = _with_history_source(
+            _scenario(_weighted_basis((0.5, 0.3, 0.2)))
         )
-        self.assertTrue(basis.audit["period_method"].eq("central_tendency").all())
-        self.assertTrue(basis.audit["excluded_observation_count"].eq(1).all())
 
-    def test_weighted_history_missing_cells_are_zero_and_audited(self):
-        results = _commercial_frame([100.0, 100.0], [10.0, 20.0])
-        results["cecl_reserve_prior_1"] = [np.inf, 30.0]
-        results["cecl_reserve_prior_2"] = [30.0, np.nan]
+        central = _build_basis(results, central_scenario, history)
+        in_place = _build_basis(results, in_place_scenario, history)
+
+        self.assertAlmostEqual(
+            float(central.ratios.iloc[0]["reserve_ratio"]), 0.04166666666666667
+        )
+        self.assertAlmostEqual(
+            float(in_place.ratios.iloc[0]["reserve_ratio"]),
+            0.0825,
+        )
+        for basis in (central, in_place):
+            historical = basis.audit[basis.audit["period"] != "2026Q2"]
+            self.assertEqual(
+                set(historical["period_reserve_ratio"]),
+                {20 / 600, 80 / 600},
+            )
+
+    def test_history_supports_arbitrary_period_count_and_weights(self):
+        reserve_basis = _weighted_basis((0.1, 0.2, 0.3))
+        reserve_basis["historical"]["periods"].append(
+            {"name": "2025Q3", "weight": 0.4}
+        )
+        scenario = _with_history_source(_scenario(reserve_basis))
+        results = _commercial_frame([100.0], [1.0])
+
+        validate_scenario(scenario)
+        basis = _build_basis(
+            results,
+            scenario,
+            [
+                ("CRE", "2026Q1", 2.0),
+                ("CRE", "2025Q4", 3.0),
+                ("CRE", "2025Q3", 4.0),
+            ],
+        )
+
+        self.assertEqual(set(basis.audit["period"]), {"2026Q2", "2026Q1", "2025Q4", "2025Q3"})
+        self.assertAlmostEqual(float(basis.ratios.iloc[0]["reserve_ratio"]), 0.03)
+        self.assertAlmostEqual(float(basis.effective_reserve.iloc[0]), 3.0)
+
+    def test_missing_commercial_history_period_is_unavailable_without_reweighting(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        results = _commercial_frame([100.0], [10.0])
         exceptions: list[dict] = []
 
-        basis = build_cecl_reserve_basis(
+        basis = _build_basis(
             results,
-            _scenario(_weighted_basis()),
-            exceptions,
-        )
-
-        np.testing.assert_allclose(
-            basis.effective_reserve.to_numpy(),
-            np.array([40 / 3, 50 / 3]),
-        )
-        self.assertAlmostEqual(float(basis.effective_reserve.sum()), 30.0)
-        self.assertAlmostEqual(float(basis.ratios.iloc[0]["reserve_ratio"]), 0.15)
-        missing = basis.audit[basis.audit["missing_reserve_count"] > 0]
-        self.assertEqual(set(missing["period"]), {"prior_1", "prior_2"})
-        self.assertEqual(int(missing["missing_reserve_count"].sum()), 2)
-        self.assertTrue(exceptions)
-
-    def test_weighted_history_missing_configured_field_is_unavailable(self):
-        results = _commercial_frame([100.0, 300.0], [1.0, 9.0])
-        results["cecl_reserve_prior_1"] = [2.0, 12.0]
-        exceptions: list[dict] = []
-
-        basis = build_cecl_reserve_basis(
-            results,
-            _scenario(_weighted_basis()),
+            scenario,
+            [("CRE", "2026Q1", 20.0)],
             exceptions,
         )
 
         self.assertTrue(basis.effective_reserve.isna().all())
         self.assertTrue(basis.ratios["reserve_ratio"].isna().all())
         self.assertTrue(basis.ratios["status"].eq("unavailable").all())
-        self.assertTrue(basis.ratios["exception_code"].astype(str).str.len().gt(0).all())
-        self.assertIn(
-            "cecl_reserve_prior_2",
-            " ".join(str(value) for row in exceptions for value in row.values()),
+        self.assertIn("CECL_HISTORY_PERIOD_MISSING", {row["code"] for row in exceptions})
+
+    def test_duplicate_portfolio_period_history_rows_are_rejected(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        results = _commercial_frame([100.0], [10.0])
+
+        with self.assertRaisesRegex(ValueError, "duplicate|unique"):
+            _build_basis(
+                results,
+                scenario,
+                [
+                    ("CRE", "2026Q1", 2.0),
+                    ("CRE", "2026Q1", 2.0),
+                    ("CRE", "2025Q4", 4.0),
+                ],
+            )
+
+    def test_invalid_history_values_make_only_affected_portfolio_unavailable(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        results = pd.concat(
+            [
+                _commercial_frame([100.0], [1.0], portfolio="CRE"),
+                _commercial_frame([100.0], [3.0], portfolio="C&I"),
+            ],
+            ignore_index=True,
         )
+        results["borrower_id"] = ["CRE-1", "CI-1"]
+        invalid_values = (-1.0, np.inf, np.nan)
+        for value in invalid_values:
+            with self.subTest(historical_cecl_reserve=value):
+                exceptions: list[dict] = []
+                basis = _build_basis(
+                    results,
+                    scenario,
+                    [
+                        ("CRE", "2026Q1", value),
+                        ("CRE", "2025Q4", 4.0),
+                        ("C&I", "2026Q1", 2.0),
+                        ("C&I", "2025Q4", 4.0),
+                    ],
+                    exceptions,
+                )
+                ratios = basis.ratios.set_index("portfolio")
+                self.assertEqual(ratios.at["CRE", "status"], "unavailable")
+                self.assertEqual(ratios.at["C&I", "status"], "available")
+                self.assertTrue(any("HISTORY" in row["code"] for row in exceptions))
 
     def test_invalid_reserve_basis_configuration_is_rejected(self):
         invalid_configs = [
-            {"method": "unknown"},
+            {"current_method": "unknown"},
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 0.0},
             },
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": np.inf},
             },
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": True},
             },
             _weighted_basis((0.2, 0.3, 0.4)),
             _weighted_basis((0.0, 0.5, 0.5)),
             _weighted_basis((0.5, 0.5, 0.0)),
             _weighted_basis((-0.1, 0.6, 0.5)),
-            _weighted_basis(period_method="unsupported"),
         ]
         for reserve_basis in invalid_configs:
             with self.subTest(reserve_basis=reserve_basis):
                 with self.assertRaises(ValueError):
-                    validate_scenario(_scenario(reserve_basis))
+                    validate_scenario(
+                        _with_history_source(_scenario(reserve_basis))
+                    )
 
         duplicate_name = _weighted_basis()
-        duplicate_name["weighted_history"]["periods"][1]["name"] = "current"
+        duplicate_name["historical"]["periods"][1]["name"] = "2026Q1"
         with self.assertRaises(ValueError):
-            validate_scenario(_scenario(duplicate_name))
+            validate_scenario(_with_history_source(_scenario(duplicate_name)))
 
-        duplicate_field = _weighted_basis()
-        duplicate_field["weighted_history"]["periods"][1][
-            "reserve_field"
-        ] = "cecl_reserve"
+        current_name = _weighted_basis()
+        current_name["historical"]["periods"][0]["name"] = "2026Q2"
         with self.assertRaises(ValueError):
-            validate_scenario(_scenario(duplicate_field))
+            validate_scenario(_with_history_source(_scenario(current_name)))
 
-    def test_weighted_history_fields_require_alias_numeric_and_sum_wiring(self):
-        for location in (
-            "column_aliases",
-            "numeric_columns",
-            "required_columns",
-            "sum_fields",
-        ):
+    def test_history_source_requires_nonmerged_alias_and_type_wiring(self):
+        mutations = (
+            ("source", lambda scenario: scenario["cecl"]["reserve_basis"]["historical"].update(source="missing")),
+            ("merge", lambda scenario: scenario["inputs"]["sources"]["cecl_history"].update(merge=True)),
+            ("column_aliases", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["column_aliases"].pop("historical_cecl_reserve")),
+            ("string_columns", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["string_columns"].remove("period")),
+            ("numeric_columns", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["numeric_columns"].remove("historical_cecl_reserve")),
+            ("required_columns", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["required_columns"].remove("cecl_portfolio")),
+        )
+        for location, mutate in mutations:
             with self.subTest(location=location):
-                scenario = _scenario(_weighted_basis())
-                if location == "sum_fields":
-                    scenario["borrower"][location].remove(
-                        "cecl_reserve_prior_2"
-                    )
-                else:
-                    identity = scenario["inputs"]["identity"]
-                    if location == "column_aliases":
-                        identity[location].pop("cecl_reserve_prior_2")
-                    else:
-                        identity[location].remove("cecl_reserve_prior_2")
+                scenario = _with_history_source(_scenario(_weighted_basis()))
+                mutate(scenario)
                 with self.assertRaises(ValueError):
                     validate_scenario(scenario)
 
-    def test_central_tendency_requires_current_reserve_aggregation_wiring(self):
-        basis = {
-            "method": "central_tendency",
-            "central_tendency": {"z_score_threshold": 2.0},
+    def test_legacy_loan_history_schema_is_rejected_with_migration_message(self):
+        legacy = {
+            "method": "weighted_history",
+            "weighted_history": {
+                "period_method": "central_tendency",
+                "periods": [
+                    {
+                        "name": "prior",
+                        "reserve_field": "cecl_reserve_prior",
+                        "weight": 1.0,
+                    }
+                ],
+            },
         }
-        for location in (
-            "column_aliases",
-            "numeric_columns",
-            "required_columns",
-            "sum_fields",
-        ):
-            with self.subTest(location=location):
-                scenario = _scenario(basis)
-                if location == "sum_fields":
-                    scenario["borrower"][location].remove("cecl_reserve")
-                elif location == "column_aliases":
-                    scenario["inputs"]["identity"][location].pop(
-                        "cecl_reserve"
-                    )
-                else:
-                    scenario["inputs"]["identity"][location].remove(
-                        "cecl_reserve"
-                    )
-                with self.assertRaises(ValueError):
-                    validate_scenario(scenario)
+        with self.assertRaisesRegex(ValueError, "histor|portfolio|CSV"):
+            validate_scenario(_scenario(legacy))
 
-    def test_borrower_aggregation_preserves_loan_missing_counts_for_audit(self):
-        scenario = _scenario(_weighted_basis())
+    def test_explicit_basis_requires_current_reserve_input_wiring(self):
+        for current_method in ("in_place", "central_tendency"):
+            basis = {
+                "current_method": current_method,
+                "central_tendency": {"z_score_threshold": 2.0},
+            }
+            for location in (
+                "column_aliases",
+                "numeric_columns",
+                "required_columns",
+            ):
+                with self.subTest(
+                    current_method=current_method, location=location
+                ):
+                    scenario = _scenario(basis)
+                    if location == "column_aliases":
+                        scenario["inputs"]["identity"][location].pop(
+                            "cecl_reserve"
+                        )
+                    else:
+                        scenario["inputs"]["identity"][location].remove(
+                            "cecl_reserve"
+                        )
+                    with self.assertRaises(ValueError):
+                        validate_scenario(scenario)
+
+    def test_current_reserve_is_always_summed_for_multi_loan_consumer(self):
+        scenario = _with_history_source(
+            _scenario(_weighted_basis(current_method="central_tendency"))
+        )
+        scenario["borrower"]["sum_fields"].remove("cecl_reserve")
+        scenario["cecl"]["portfolios"] = {
+            "Consumer": {"method": "expected_loss"}
+        }
         identity = pd.DataFrame(
             [
                 {
                     "_source_row": 1,
-                    "borrower_id": "B1",
+                    "borrower_id": "C1",
                     "balance": 100.0,
-                    "cecl_portfolio": "CRE",
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
                     "base_bucket": "Pass",
-                    "cecl_reserve": 1.0,
-                    "cecl_reserve_prior_1": np.nan,
-                    "cecl_reserve_prior_2": 3.0,
+                    "primary_module": "Consumer",
+                    "cecl_reserve": 10.0,
                 },
                 {
                     "_source_row": 2,
-                    "borrower_id": "B1",
-                    "balance": 100.0,
-                    "cecl_portfolio": "CRE",
+                    "borrower_id": "C1",
+                    "balance": 200.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
                     "base_bucket": "Pass",
-                    "cecl_reserve": 9.0,
-                    "cecl_reserve_prior_1": 4.0,
-                    "cecl_reserve_prior_2": 5.0,
+                    "primary_module": "Consumer",
+                    "cecl_reserve": 20.0,
                 },
             ]
         )
 
+        validate_scenario(scenario)
         borrowers = build_borrowers(identity, scenario, [])
-        basis = build_cecl_reserve_basis(borrowers, scenario, [])
+        basis = build_cecl_reserve_basis(
+            borrowers, scenario, [], history=None
+        )
 
-        prior_1 = basis.audit[basis.audit["period"] == "prior_1"].iloc[0]
-        self.assertEqual(int(prior_1["missing_reserve_count"]), 1)
+        self.assertEqual(float(borrowers.at[0, "balance"]), 300.0)
+        self.assertEqual(float(borrowers.at[0, "cecl_reserve"]), 30.0)
+        self.assertEqual(float(basis.effective_reserve.iloc[0]), 30.0)
+        self.assertEqual(basis.method_by_row.iloc[0], "in_place")
 
-    def test_weighted_history_accepts_vendor_headers_for_canonical_aliases(self):
-        scenario = _scenario(_weighted_basis())
-        aliases = scenario["inputs"]["identity"]["column_aliases"]
-        aliases["cecl_reserve"] = "Current CECL Reserve"
-        aliases["cecl_reserve_prior_1"] = "Prior Quarter CECL Reserve"
-        aliases["cecl_reserve_prior_2"] = "Prior Year-End CECL Reserve"
+    def test_non_sum_current_reserve_aggregation_is_rejected(self):
+        scenario = _scenario({"current_method": "in_place"})
+        scenario["borrower"]["aggregation"] = {
+            "cecl_reserve": "first"
+        }
+
+        with self.assertRaisesRegex(ValueError, "aggregation 'sum'"):
+            validate_scenario(scenario)
+
+    def test_current_cecl_fields_reject_loader_owned_names(self):
+        for setting in ("reserve_field", "portfolio_field"):
+            for field in (
+                "_source_file",
+                "_source_file_row",
+                "_source_row",
+                "_portfolio_key",
+                "_period_key",
+                "_cecl_invalid_balance_count",
+                "cecl_effective_reserve_base",
+                "cecl_reserve_basis_method",
+                "_cecl_reserve_missing_count__custom",
+                "base_bucket",
+                "module_applied",
+                "primary_module",
+                "loan_count",
+                "stressed_bucket_S1",
+                "out_of_scope_S1",
+                "tag_custom",
+                "_source_custom",
+                "_targeted_active",
+                "_scenario_variant",
+                "scenario_variant",
+                "consumer_qualitative_reserve",
+                "consumer_el_S1",
+                "cre_dscr_S1",
+                "ci_fccr_S1",
+                "calculated_cash_paid_for_interest",
+                "_exposure_id",
+                "_loan_id_ambiguous",
+            ):
+                scenario = _scenario({"current_method": "in_place"})
+                scenario["cecl"][setting] = field
+                with self.subTest(setting=setting, field=field):
+                    with self.assertRaisesRegex(
+                        ValueError, "conflicts with"
+                    ):
+                        validate_scenario(scenario)
+
+    def test_current_cecl_fields_reject_collisions_and_whitespace(self):
+        for reserve_field, portfolio_field in (
+            ("cecl_portfolio", "cecl_portfolio"),
+            ("borrower_id", "cecl_portfolio"),
+            ("balance", "cecl_portfolio"),
+            ("model_portfolio", "cecl_portfolio"),
+            ("cecl_reserve", "borrower_id"),
+            ("cecl_reserve", "balance"),
+            ("cecl_reserve", "model_module"),
+        ):
+            scenario = _scenario({"current_method": "in_place"})
+            scenario["cecl"].update(
+                {
+                    "reserve_field": reserve_field,
+                    "portfolio_field": portfolio_field,
+                }
+            )
+            with self.subTest(
+                reserve_field=reserve_field,
+                portfolio_field=portfolio_field,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "distinct|conflicts with"
+                ):
+                    validate_scenario(scenario)
+
+        for setting in ("reserve_field", "portfolio_field"):
+            scenario = _scenario({"current_method": "in_place"})
+            scenario["cecl"][setting] = " cecl_custom "
+            with self.subTest(setting=setting, whitespace=True):
+                with self.assertRaisesRegex(
+                    ValueError, "without surrounding whitespace"
+                ):
+                    validate_scenario(scenario)
+
+    def test_current_reserve_cannot_be_overwritten_by_tag_assignment(self):
+        scenario = _scenario({"current_method": "in_place"})
+        scenario["tags"] = {
+            "Bad": {"assign": {"cecl_reserve": 999.0}}
+        }
+
+        with self.assertRaisesRegex(ValueError, "tag assignment target"):
+            validate_scenario(scenario)
+
+    def test_cecl_portfolio_may_reuse_borrower_portfolio_field(self):
+        for portfolio_field in (
+            "model_portfolio",
+            "ci_portfolio",
+            "cre_subsector",
+            "consumer_segment",
+            "overlay_custom",
+            "calculated_custom",
+            "_custom_portfolio",
+        ):
+            scenario = _scenario({"current_method": "in_place"})
+            scenario["borrower"]["portfolio_field"] = portfolio_field
+            scenario["cecl"]["portfolio_field"] = portfolio_field
+            with self.subTest(portfolio_field=portfolio_field):
+                validate_scenario(scenario)
+
+    def test_consumer_only_load_skips_missing_history_file(self):
+        scenario = _with_history_source(
+            _scenario(_weighted_basis(current_method="central_tendency"))
+        )
+        scenario["cecl"]["portfolios"] = {
+            "Consumer": {"method": "expected_loss"}
+        }
+        scenario["inputs"]["identity"]["path"] = "identity.csv"
+        scenario["inputs"]["sources"]["cecl_history"]["path"] = (
+            "missing_history.csv"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "identity.csv").write_text(
+                "borrower_id,balance,cecl_portfolio,cecl_reserve\n"
+                "C1,100,Consumer,10\n",
+                encoding="utf-8",
+            )
+            validate_scenario(scenario)
+            loaded = load_inputs(scenario, directory)
+
+        self.assertIn("identity", loaded)
+        self.assertNotIn("cecl_history", loaded)
+        borrowers = build_borrowers(loaded["identity"].frame, scenario, [])
+        exceptions: list[dict] = []
+        basis = build_cecl_reserve_basis(
+            borrowers, scenario, exceptions, history=None
+        )
+        self.assertEqual(float(basis.effective_reserve.iloc[0]), 10.0)
+        self.assertEqual(basis.method_by_row.iloc[0], "in_place")
+        self.assertFalse(
+            any("HISTORY" in str(row.get("code", "")) for row in exceptions)
+        )
+
+    def test_history_source_accepts_vendor_headers_for_canonical_aliases(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        aliases = scenario["inputs"]["sources"]["cecl_history"][
+            "column_aliases"
+        ]
+        aliases.update(
+            {
+                "cecl_portfolio": "Portfolio Name",
+                "period": "Quarter",
+                "historical_cecl_reserve": "CECL Reserve",
+            }
+        )
 
         # column_aliases maps canonical engine names to vendor source headers;
-        # validation must inspect the keys rather than requiring both to match.
+        # validation must inspect the keys rather than requiring names to match.
         validate_scenario(scenario)
 
-    def test_weighted_history_normalizes_validated_strings_at_runtime(self):
+    def test_history_normalizes_validated_weights_and_join_keys_at_runtime(self):
         reserve_basis = _weighted_basis()
-        periods = reserve_basis["weighted_history"]["periods"]
-        periods[0].update(
-            {"name": " current ", "reserve_field": " cecl_reserve ", "weight": "50%"}
+        history = reserve_basis["historical"]
+        history["current_period"].update(
+            {"name": " 2026Q2 ", "weight": "50%"}
         )
-        periods[1].update({"weight": "25%"})
-        periods[2].update({"weight": "25%"})
-        scenario = _scenario(reserve_basis)
+        history["periods"][0].update({"name": " 2026Q1 ", "weight": "25%"})
+        history["periods"][1].update({"name": " 2025Q4 ", "weight": "25%"})
+        scenario = _with_history_source(_scenario(reserve_basis))
         results = _commercial_frame([100.0], [10.0])
-        results["cecl_reserve_prior_1"] = 20.0
-        results["cecl_reserve_prior_2"] = 30.0
 
         validate_scenario(scenario)
-        basis = build_cecl_reserve_basis(results, scenario, [])
+        basis = _build_basis(
+            results,
+            scenario,
+            [
+                (" CRE ", " 2026Q1 ", 20.0),
+                (" CRE ", " 2025Q4 ", 30.0),
+            ],
+        )
 
-        self.assertEqual(set(basis.audit["period"]), {"current", "prior_1", "prior_2"})
+        self.assertEqual(
+            set(basis.audit["period"]), {"2026Q2", "2026Q1", "2025Q4"}
+        )
         self.assertAlmostEqual(float(basis.effective_reserve.iloc[0]), 17.5)
 
     def test_nonfinite_loan_reserve_is_zeroed_before_borrower_sum(self):
-        scenario = _scenario({"method": "in_place"})
+        scenario = _scenario({"current_method": "in_place"})
         identity = pd.DataFrame(
             [
                 {
@@ -627,7 +906,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         self.assertIn("CECL_PORTFOLIO_MISSING", {row["code"] for row in exceptions})
 
     def test_nonfinite_loan_balance_is_excluded_before_borrower_sum(self):
-        scenario = _scenario({"method": "in_place"})
+        scenario = _scenario({"current_method": "in_place"})
         identity = pd.DataFrame(
             [
                 {
@@ -684,7 +963,7 @@ class CeclReserveBasisTest(unittest.TestCase):
         results["borrower_id"] = ["B1", "B1", "B2", "B3", "B4", "B5"]
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 2.1},
             }
         )
@@ -701,10 +980,134 @@ class CeclReserveBasisTest(unittest.TestCase):
             basis.audit.iloc[0]["observation_grain"], "borrower"
         )
 
+    def test_portfolio_history_has_standard_and_targeted_borrower_grain_parity(self):
+        scenario = _with_history_source(
+            _scenario(
+                _weighted_basis(
+                    (0.5, 0.3, 0.2),
+                    current_method="central_tendency",
+                    z_score_threshold=2.0,
+                )
+            )
+        )
+        identity = pd.DataFrame(
+            [
+                {
+                    "_source_row": index + 1,
+                    "borrower_id": borrower,
+                    "balance": balance,
+                    "cecl_portfolio": "CRE",
+                    "model_portfolio": "CRE",
+                    "base_bucket": "Pass",
+                    "cecl_reserve": reserve,
+                    "module_applied": "CRE",
+                }
+                for index, (borrower, balance, reserve) in enumerate(
+                    [
+                        ("B1", 50.0, 0.5),
+                        ("B1", 50.0, 0.5),
+                        ("B2", 100.0, 1.0),
+                        ("B3", 100.0, 1.0),
+                        ("B4", 100.0, 1.0),
+                        ("B5", 100.0, 1.0),
+                        ("B6", 100.0, 50.0),
+                    ]
+                )
+            ]
+        )
+        borrowers = build_borrowers(identity, scenario, [])
+        history = [
+            ("CRE", "2026Q1", 20.0),
+            ("CRE", "2025Q4", 80.0),
+        ]
+
+        standard = _build_basis(borrowers, scenario, history)
+        targeted_scenario = dict(scenario)
+        targeted_scenario["_targeted_mode"] = True
+        targeted = _build_basis(identity, targeted_scenario, history)
+
+        for basis in (standard, targeted):
+            self.assertAlmostEqual(
+                float(basis.ratios.iloc[0]["reserve_ratio"]),
+                0.04166666666666667,
+            )
+            self.assertAlmostEqual(float(basis.effective_reserve.sum()), 25.0)
+            current = basis.audit[basis.audit["period"] == "2026Q2"].iloc[0]
+            self.assertEqual(int(current["observation_count"]), 6)
+            self.assertEqual(int(current["included_observation_count"]), 5)
+            self.assertEqual(int(current["excluded_observation_count"]), 1)
+
+
+    def test_current_portfolio_whitespace_is_normalized_before_history_allocation(self):
+        scenario = _scenario(_weighted_basis((0.5, 0.25, 0.25)))
+        results = _commercial_frame([100.0, 100.0], [10.0, 10.0])
+        results["cecl_portfolio"] = ["CRE", " CRE "]
+
+        prepared, basis = attach_cecl_reserve_basis(
+            results,
+            scenario,
+            [],
+            history=_history_frame(
+                [("CRE", "2026Q1", 20.0), ("CRE", "2025Q4", 20.0)]
+            ),
+        )
+
+        self.assertEqual(set(prepared["cecl_portfolio"]), {"CRE"})
+        self.assertEqual(len(basis.ratios), 1)
+        self.assertAlmostEqual(float(basis.effective_reserve.sum()), 20.0)
+
+    def test_history_field_names_must_be_distinct_and_noninternal(self):
+        for fields in (
+            {
+                "portfolio_field": "x",
+                "period_field": "x",
+                "reserve_field": "x",
+            },
+            {"portfolio_field": "_portfolio_key"},
+            {"period_field": "_source_file"},
+            {"reserve_field": "_source_file_row"},
+            {"reserve_field": "_source_row"},
+        ):
+            scenario = _with_history_source(
+                _scenario(_weighted_basis())
+            )
+            scenario["cecl"]["reserve_basis"]["historical"].update(fields)
+            with self.subTest(fields=fields):
+                with self.assertRaisesRegex(
+                    ValueError, "distinct|reserved internal"
+                ):
+                    validate_scenario(scenario)
+
+    def test_blank_history_keys_are_ignored_with_an_audit_warning(self):
+        scenario = _scenario(_weighted_basis())
+        results = _commercial_frame([100.0], [10.0])
+        exceptions: list[dict] = []
+
+        basis = _build_basis(
+            results,
+            scenario,
+            [
+                ("", "2026Q1", 999.0),
+                ("CRE", "", 999.0),
+                ("CRE", "2026Q1", 10.0),
+                ("CRE", "2025Q4", 10.0),
+            ],
+            exceptions,
+        )
+
+        self.assertAlmostEqual(float(basis.effective_reserve.iloc[0]), 10.0)
+        ignored = [
+            row
+            for row in exceptions
+            if row["code"] == "CECL_HISTORY_ROW_IGNORED"
+        ]
+        self.assertEqual(len(ignored), 1)
+        self.assertIn("ignored_count=2", ignored[0]["details"])
+
 
 class CeclReserveBasisReportingTest(unittest.TestCase):
     def test_aggregated_invalid_balance_cannot_become_zero_balance_cecl(self):
-        scenario = _scenario({"method": "in_place"})
+        scenario = _scenario(_weighted_basis())
         identity = pd.DataFrame(
             [
                 {
@@ -720,7 +1123,11 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             ]
         )
         borrowers = build_borrowers(identity, scenario, [])
-        basis = build_cecl_reserve_basis(borrowers, scenario, [])
+        basis = _build_basis(
+            borrowers,
+            scenario,
+            [("CRE", "2026Q1", 10.0), ("CRE", "2025Q4", 10.0)],
+        )
         bucket_summary = build_cecl_bucket_summary(
             borrowers, pd.DataFrame(), scenario
         )
@@ -750,7 +1157,7 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
     def test_nonfinite_commercial_balance_cannot_report_available_cecl(self):
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 2.0},
             }
         )
@@ -781,8 +1188,133 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
         self.assertTrue(pd.isna(base["proforma_cecl_reserve"]))
         self.assertEqual(aggregate["cecl_reserve_status"], "unavailable")
 
+    def test_positive_history_with_zero_current_balance_is_unavailable(self):
+        scenario = _scenario(_weighted_basis())
+        results = _commercial_frame([0.0], [0.0])
+        basis = _build_basis(
+            results,
+            scenario,
+            [("CRE", "2026Q1", 10.0), ("CRE", "2025Q4", 10.0)],
+        )
+        cecl = build_cecl_summary(
+            results,
+            pd.DataFrame(
+                [
+                    {
+                        "portfolio": "CRE",
+                        "stress_level": "Base",
+                        "bucket": "Pass",
+                        "balance": 0.0,
+                    }
+                ]
+            ),
+            scenario,
+            [],
+            basis,
+        )
+        base = cecl[
+            (cecl["portfolio"] == "CRE")
+            & (cecl["stress_level"] == "Base")
+            & (cecl["bucket"] == "Total")
+        ].iloc[0]
+
+        self.assertEqual(base["cecl_reserve_status"], "unavailable")
+        self.assertEqual(
+            base["exception_code"],
+            "CECL_HISTORY_ALLOCATION_BALANCE_INVALID",
+        )
+        self.assertTrue(pd.isna(base["proforma_cecl_reserve"]))
+
+    def test_invalid_base_bucket_balance_blocks_all_stressed_buckets(self):
+        scenario = _scenario(_weighted_basis())
+        identity = pd.DataFrame(
+            [
+                {
+                    "_source_row": 1,
+                    "borrower_id": "B1",
+                    "balance": 100.0,
+                    "cecl_portfolio": "CRE",
+                    "base_bucket": "Pass",
+                    "stressed_bucket_S1": "Pass",
+                    "stressed_bucket_S2": "Pass",
+                    "cecl_reserve": 10.0,
+                    "module_applied": "CRE",
+                },
+                {
+                    "_source_row": 2,
+                    "borrower_id": "B2",
+                    "balance": np.inf,
+                    "cecl_portfolio": "CRE",
+                    "base_bucket": "Substandard",
+                    "stressed_bucket_S1": "Pass",
+                    "stressed_bucket_S2": "Pass",
+                    "cecl_reserve": 5.0,
+                    "module_applied": "CRE",
+                },
+            ]
+        )
+        borrowers = build_borrowers(identity, scenario, [])
+        basis = _build_basis(
+            borrowers,
+            scenario,
+            [("CRE", "2026Q1", 10.0), ("CRE", "2025Q4", 10.0)],
+        )
+        buckets = build_cecl_bucket_summary(
+            borrowers, pd.DataFrame(), scenario
+        )
+        cecl = build_cecl_summary(
+            borrowers, buckets, scenario, [], basis
+        )
+
+        for level in ("Base", "S1", "S2"):
+            total = cecl[
+                (cecl["portfolio"] == "CRE")
+                & (cecl["stress_level"] == level)
+                & (cecl["bucket"] == "Total")
+            ].iloc[0]
+            self.assertEqual(total["cecl_reserve_status"], "unavailable")
+            self.assertIn("CECL_BALANCE_INVALID", total["exception_code"])
+        history_audit = basis.audit[
+            basis.audit["period_method"] == "portfolio_history"
+        ]
+        self.assertFalse(history_audit.empty)
+        self.assertTrue(history_audit["invalid_balance_count"].eq(1).all())
+
+    def test_unavailable_commercial_rows_retain_configured_basis_label(self):
+        scenario = _scenario(_weighted_basis())
+        results = _commercial_frame([100.0], [10.0]).drop(
+            columns=["cecl_reserve"]
+        )
+        basis = build_cecl_reserve_basis(results, scenario, [], history=None)
+        cecl = build_cecl_summary(
+            results,
+            pd.DataFrame(
+                [
+                    {
+                        "portfolio": "CRE",
+                        "stress_level": "Base",
+                        "bucket": "Pass",
+                        "balance": 100.0,
+                    }
+                ]
+            ),
+            scenario,
+            [],
+            basis,
+        )
+        base = cecl[
+            (cecl["portfolio"] == "CRE")
+            & (cecl["stress_level"] == "Base")
+            & (cecl["bucket"] == "Total")
+        ].iloc[0]
+
+        self.assertEqual(
+            base["reserve_basis"], "in_place+portfolio_history"
+        )
+        self.assertEqual(base["cecl_reserve_status"], "unavailable")
+
     def test_negative_commercial_and_consumer_balances_are_unavailable(self):
-        scenario = _scenario({"method": "central_tendency"})
+        scenario = _scenario({"current_method": "central_tendency"})
         commercial = _commercial_frame([-100.0], [10.0])
         commercial_buckets = pd.DataFrame(
             [
@@ -831,7 +1363,7 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
     def test_zero_balance_consumer_bucket_does_not_block_valid_portfolio(self):
         scenario = _scenario(
             {
-                "method": "central_tendency",
+                "current_method": "central_tendency",
                 "central_tendency": {"z_score_threshold": 2.0},
             }
         )
@@ -880,8 +1412,109 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
         self.assertEqual(float(total.at["Base", "proforma_cecl_reserve"]), 10.0)
         self.assertEqual(total.at["Base", "cecl_reserve_status"], "available")
 
-    def test_consumer_module_uses_the_selected_weighted_base(self):
-        scenario = _scenario(_weighted_basis())
+    def test_consumer_ignores_top_level_central_tendency(self):
+        scenario = _scenario(
+            {
+                "current_method": "central_tendency",
+                "central_tendency": {"z_score_threshold": 10.0},
+            }
+        )
+        results = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "C1",
+                    "balance": 100.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "base_bucket": "Pass",
+                    "cecl_reserve": 10.0,
+                    "module_applied": "Consumer",
+                },
+                {
+                    "borrower_id": "C2",
+                    "balance": 900.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "base_bucket": "Pass",
+                    "cecl_reserve": 180.0,
+                    "module_applied": "Consumer",
+                },
+            ]
+        )
+
+        prepared, basis = attach_cecl_reserve_basis(results, scenario, [])
+
+        # A commercial central-tendency calculation would assign a 15% ratio
+        # and total $150. Consumer must preserve the two authoritative current
+        # reserve amounts and identify its own basis as in-place.
+        np.testing.assert_allclose(
+            basis.effective_reserve.to_numpy(), np.array([10.0, 180.0])
+        )
+        self.assertAlmostEqual(float(basis.effective_reserve.sum()), 190.0)
+        self.assertTrue(
+            prepared["cecl_reserve_basis_method"].eq("in_place").all()
+        )
+
+    def test_consumer_reporting_uses_pre_stress_immutable_current_basis(self):
+        scenario = _scenario({"current_method": "in_place"})
+        scenario["cecl"]["portfolios"] = {
+            "Consumer": {"method": "expected_loss"}
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "C1",
+                    "balance": 100.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "base_bucket": "Pass",
+                    "cecl_reserve": 10.0,
+                    "module_applied": "Consumer",
+                    "consumer_el_unstressed": 4.0,
+                    "consumer_el_S1": 5.0,
+                    "consumer_el_S2": 6.0,
+                    "out_of_scope_S1": False,
+                    "out_of_scope_S2": False,
+                }
+            ]
+        )
+        basis = build_cecl_reserve_basis(results, scenario, [])
+
+        # Simulate any later module mutation of the configured source column.
+        # Reports must retain the current value captured before stress.
+        results["cecl_reserve"] = 999.0
+        consumer = build_consumer_summary(
+            results, scenario, basis
+        ).set_index("stress_level")
+        cecl = build_cecl_summary(
+            results,
+            pd.DataFrame([{"portfolio": "Consumer"}]),
+            scenario,
+            [],
+            basis,
+        )
+        consumer_cecl = cecl[
+            (cecl["portfolio"] == "Consumer")
+            & (cecl["bucket"] == "Total")
+        ].set_index("stress_level")
+
+        self.assertEqual(
+            float(consumer.at["Base", "proforma_cecl_reserve"]), 10.0
+        )
+        self.assertEqual(
+            float(consumer_cecl.at["Base", "proforma_cecl_reserve"]),
+            10.0,
+        )
+
+    def test_consumer_module_uses_current_in_place_under_history_option(self):
+        scenario = _with_history_source(
+            _scenario(
+                _weighted_basis(
+                    current_method="central_tendency",
+                    z_score_threshold=2.0,
+                )
+            )
+        )
         scenario["stress_levels"] = ["S1"]
         scenario["modules"] = {
             "Consumer": {
@@ -907,8 +1540,6 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
                     "module_applied": "",
                     "out_of_scope_S1": False,
                     "cecl_reserve": 10.0,
-                    "cecl_reserve_prior_1": 20.0,
-                    "cecl_reserve_prior_2": 30.0,
                     "fico_score": 700.0,
                     "appraised_value": 100.0,
                 }
@@ -922,24 +1553,73 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             )
         }
 
-        prepared, basis = attach_cecl_reserve_basis(results, scenario, [])
+        prepared, basis = attach_cecl_reserve_basis(
+            results,
+            scenario,
+            [],
+            history=_history_frame(
+                [
+                    ("Consumer", "2026Q1", 1_000.0),
+                    ("Consumer", "2025Q4", 2_000.0),
+                ]
+            ),
+        )
         stressed, out_of_scope = run_consumer(prepared, scenario, inputs, [])
 
         self.assertTrue(out_of_scope.empty)
-        self.assertAlmostEqual(float(basis.effective_reserve.iloc[0]), 20.0)
+        self.assertAlmostEqual(float(basis.effective_reserve.iloc[0]), 10.0)
         self.assertAlmostEqual(
-            float(stressed.at[0, "consumer_cecl_reserve_base"]), 20.0
+            float(stressed.at[0, "consumer_cecl_reserve_base"]), 10.0
         )
         self.assertAlmostEqual(
-            float(stressed.at[0, "consumer_qualitative_reserve"]), 20.0
+            float(stressed.at[0, "consumer_qualitative_reserve"]), 10.0
         )
         self.assertAlmostEqual(
             float(stressed.at[0, "consumer_proforma_cecl_S1"]),
-            float(stressed.at[0, "consumer_el_S1"]) + 20.0,
+            float(stressed.at[0, "consumer_el_S1"]) + 10.0,
+        )
+        self.assertTrue(
+            prepared["cecl_reserve_basis_method"].eq("in_place").all()
         )
 
-    def test_weighted_history_consumer_reconciles_and_remains_monotonic(self):
-        scenario = _scenario(_weighted_basis())
+    def test_consumer_only_history_option_does_not_require_history_input(self):
+        scenario = _with_history_source(
+            _scenario(_weighted_basis(current_method="central_tendency"))
+        )
+        scenario["cecl"]["portfolios"] = {
+            "Consumer": {"method": "expected_loss"}
+        }
+        results = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "C1",
+                    "balance": 100.0,
+                    "model_portfolio": "Consumer",
+                    "cecl_portfolio": "Consumer",
+                    "base_bucket": "Pass",
+                    "primary_module": "Consumer",
+                    "cecl_reserve": 10.0,
+                }
+            ]
+        )
+        exceptions: list[dict] = []
+
+        basis = build_cecl_reserve_basis(
+            results, scenario, exceptions, history=None
+        )
+
+        self.assertEqual(float(basis.effective_reserve.iloc[0]), 10.0)
+        self.assertEqual(basis.method_by_row.iloc[0], "in_place")
+        self.assertNotIn(
+            "CECL_HISTORY_SOURCE_UNAVAILABLE",
+            {row["code"] for row in exceptions},
+        )
+        self.assertFalse(
+            basis.audit["period"].isin(["2026Q1", "2025Q4"]).any()
+        )
+
+    def test_consumer_current_basis_reconciles_and_remains_monotonic_with_history_enabled(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
         scenario["cecl"]["portfolios"] = {
             "Consumer": {"method": "expected_loss"}
         }
@@ -952,8 +1632,6 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
                     "cecl_portfolio": "Consumer",
                     "base_bucket": "Pass",
                     "cecl_reserve": 10.0,
-                    "cecl_reserve_prior_1": 20.0,
-                    "cecl_reserve_prior_2": 30.0,
                     "module_applied": "Consumer",
                     "consumer_el_unstressed": 8.0,
                     "consumer_el_S1": 12.0,
@@ -971,8 +1649,6 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
                     "cecl_portfolio": "Consumer",
                     "base_bucket": "Pass",
                     "cecl_reserve": 20.0,
-                    "cecl_reserve_prior_1": 30.0,
-                    "cecl_reserve_prior_2": 40.0,
                     "module_applied": "Consumer",
                     "consumer_el_unstressed": 15.0,
                     "consumer_el_S1": np.nan,
@@ -986,7 +1662,14 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             ]
         )
 
-        consumer_summary = build_consumer_summary(results, scenario).set_index(
+        exceptions: list[dict] = []
+        basis = _build_basis(results, scenario, [], exceptions)
+        self.assertFalse(
+            any("HISTORY" in str(row.get("code", "")) for row in exceptions)
+        )
+        consumer_summary = build_consumer_summary(
+            results, scenario, basis
+        ).set_index(
             "stress_level"
         )
         cecl = build_cecl_summary(
@@ -994,15 +1677,16 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             pd.DataFrame([{"portfolio": "Consumer"}]),
             scenario,
             [],
+            basis,
         )
         consumer_cecl = cecl[
             (cecl["portfolio"] == "Consumer") & (cecl["bucket"] == "Total")
         ].set_index("stress_level")
 
         expected = {
-            "Base": (23.0, 27.0, 50.0),
-            "S1": (27.0, 27.0, 54.0),
-            "S2": (30.0, 27.0, 57.0),
+            "Base": (23.0, 7.0, 30.0),
+            "S1": (27.0, 7.0, 34.0),
+            "S2": (30.0, 7.0, 37.0),
         }
         for level, (quantitative, qualitative, proforma) in expected.items():
             self.assertAlmostEqual(
@@ -1021,8 +1705,10 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             self.assertAlmostEqual(
                 float(consumer_cecl.at[level, "proforma_cecl_reserve"]), proforma
             )
+            self.assertEqual(consumer_summary.at[level, "reserve_basis"], "in_place")
+            self.assertEqual(consumer_cecl.at[level, "reserve_basis"], "in_place")
         self.assertEqual(
-            list(consumer_cecl["proforma_cecl_reserve"]), [50.0, 54.0, 57.0]
+            list(consumer_cecl["proforma_cecl_reserve"]), [30.0, 34.0, 37.0]
         )
         self.assertEqual(float(results["cecl_reserve"].sum()), 30.0)
 

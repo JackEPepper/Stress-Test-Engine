@@ -33,6 +33,40 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertIn("subsector", identity_columns)
             self.assertIn("tag_hint", identity_columns)
             self.assertIn("tag_hint_2", identity_columns)
+            self.assertNotIn("cecl_reserve_prior_1", identity_columns)
+            self.assertNotIn("cecl_reserve_prior_2", identity_columns)
+
+            history = pd.read_csv(
+                ROOT / "examples" / "data" / "cecl_history.csv"
+            )
+            self.assertEqual(
+                set(history.columns),
+                {"cecl_portfolio", "period", "historical_cecl_reserve"},
+            )
+            self.assertNotIn("Consumer", set(history["cecl_portfolio"]))
+            self.assertFalse(
+                history.duplicated(["cecl_portfolio", "period"]).any()
+            )
+            expected_history_keys = {
+                (portfolio, period)
+                for portfolio in {
+                    "Asset-Based Lending",
+                    "BCC",
+                    "CRE",
+                    "EF",
+                    "Middle Market",
+                    "Sponsor and Specialty",
+                }
+                for period in {"2026Q1", "2025Q4"}
+            }
+            self.assertEqual(
+                set(history[["cecl_portfolio", "period"]].itertuples(index=False, name=None)),
+                expected_history_keys,
+            )
+            self.assertIs(
+                scenario["inputs"]["sources"]["cecl_history"]["merge"],
+                False,
+            )
 
             financial_columns = set(pd.read_csv(ROOT / "examples" / "data" / "financials.csv").columns)
             collateral_columns = set(pd.read_csv(ROOT / "examples" / "data" / "collateral.csv").columns)
@@ -210,6 +244,27 @@ class SampleScenarioRunTest(unittest.TestCase):
             s2 = float(consumer.loc[consumer["stress_level"] == "S2", "expected_loss"].iloc[0])
             self.assertGreater(s2, s1)
             self.assertGreater(s1, 0)
+
+            input_summary = result["reports"]["input_summary"]
+            self.assertIn(
+                "cecl_history", set(input_summary["dataset"].astype(str))
+            )
+            self.assertNotIn("cecl_reserve_prior_1", result["borrowers"].columns)
+            self.assertNotIn("cecl_reserve_prior_2", result["borrowers"].columns)
+            basis_audit = result["reports"]["cecl_basis_summary"]
+            consumer_basis = basis_audit[
+                basis_audit["portfolio"].eq("Consumer")
+            ]
+            self.assertEqual(set(consumer_basis["period"]), {"current"})
+            self.assertEqual(set(consumer_basis["reserve_basis"]), {"in_place"})
+            commercial_history = basis_audit[
+                basis_audit["period"].isin(["2026Q1", "2025Q4"])
+            ]
+            self.assertFalse(commercial_history.empty)
+            self.assertEqual(
+                set(commercial_history["period_method"]),
+                {"portfolio_history"},
+            )
 
             output_files = {path.name for path in Path(tmp).iterdir()}
             self.assertIn("borrower_audit_raw.csv", output_files)
@@ -481,6 +536,7 @@ class SampleScenarioRunTest(unittest.TestCase):
         ].iloc[0]
 
         self.assertEqual(set(consumer_cecl["method"]), {"expected_loss"})
+        self.assertEqual(set(consumer_cecl["reserve_basis"]), {"in_place"})
         self.assertEqual(
             float(consumer_result["consumer_cecl_reserve_base"]),
             float(consumer_result["cecl_effective_reserve_base"]),

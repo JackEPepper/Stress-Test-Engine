@@ -1,17 +1,17 @@
-loan_id,borrower_id,borrower_name,status,subsector,tag_hint,tag_hint_2,naics_code,risk_rating,maturity_date,outstanding_balance,cecl_reserve,cecl_reserve_prior_1,cecl_reserve_prior_2
-L001,B001,CRE Alpha,Active,Traditional Office,,,531120,6,2028-12-31,1000000,10000,9000,11000
-L002,B001,CRE Alpha,Active,Traditional Office,,,531120,6,2029-06-30,250000,2500,2250,2750
-L003,B002,CRE Beta,Active,Multifamily Market,,,531110,6,2026-12-31,800000,,,
-L004,B003,CRE Gamma,Active,Retail,,,531120,7,2027-03-31,600000,9000,8100,9900
-L005,B004,CRE Missing,Active,Industrial,,,531120,6,2028-01-01,500000,5000,4500,5500
-L006,B005,CI Middle,Active,Middle Market,,,211120,6,2027-07-01,700000,7000,6300,7700
-L007,B006,CI Sponsor,Active,Sponsor and Specialty,,,213112,7,2027-07-01,500000,7500,6750,8250
-L008,B007,Consumer One,Active,Consumer,,,522291,6,2031-01-01,300000,4000,3600,4400
-L009,B008,Equipment Finance Borrower,Active,Equipment Finance,,,532490,6,2027-01-01,400000,4000,3600,4400
-L010,B009,Business Credit Center Borrower,Active,Business Credit Center,,,522110,7,2027-01-01,200000,3000,2700,3300
-L011,B010,CI ABL,Active,Asset-Based Lending,,,333999,6,2027-07-01,450000,4500,4050,4950
-L012,B011,CI CRE Overlap,Active,Retail,,Middle Market,444110,6,2027-07-01,300000,3000,2700,3300
-L013,B012,CRE Substandard Anchor,Active,Hotel,,,721110,8,2028-01-01,100000,5000,4500,5500
-L014,B013,CI Middle SM Anchor,Active,Middle Market,,,332710,7,2027-07-01,100000,1500,1350,1650
-L015,B014,CI Sponsor Sub Anchor,Active,Sponsor and Specialty,,,324110,8,2027-07-01,100000,5000,4500,5500
-L016,B015,CI ABL Sub Anchor,Active,Asset-Based Lending,,,331110,8,2027-07-01,100000,5000,4500,5500
+loan_id,borrower_id,borrower_name,status,subsector,tag_hint,tag_hint_2,naics_code,risk_rating,maturity_date,outstanding_balance,cecl_reserve
+L001,B001,CRE Alpha,Active,Traditional Office,,,531120,6,2028-12-31,1000000,10000
+L002,B001,CRE Alpha,Active,Traditional Office,,,531120,6,2029-06-30,250000,2500
+L003,B002,CRE Beta,Active,Multifamily Market,,,531110,6,2026-12-31,800000,
+L004,B003,CRE Gamma,Active,Retail,,,531120,7,2027-03-31,600000,9000
+L005,B004,CRE Missing,Active,Industrial,,,531120,6,2028-01-01,500000,5000
+L006,B005,CI Middle,Active,Middle Market,,,211120,6,2027-07-01,700000,7000
+L007,B006,CI Sponsor,Active,Sponsor and Specialty,,,213112,7,2027-07-01,500000,7500
+L008,B007,Consumer One,Active,Consumer,,,522291,6,2031-01-01,300000,4000
+L009,B008,Equipment Finance Borrower,Active,Equipment Finance,,,532490,6,2027-01-01,400000,4000
+L010,B009,Business Credit Center Borrower,Active,Business Credit Center,,,522110,7,2027-01-01,200000,3000
+L011,B010,CI ABL,Active,Asset-Based Lending,,,333999,6,2027-07-01,450000,4500
+L012,B011,CI CRE Overlap,Active,Retail,,Middle Market,444110,6,2027-07-01,300000,3000
+L013,B012,CRE Substandard Anchor,Active,Hotel,,,721110,8,2028-01-01,100000,5000
+L014,B013,CI Middle SM Anchor,Active,Middle Market,,,332710,7,2027-07-01,100000,1500
+L015,B014,CI Sponsor Sub Anchor,Active,Sponsor and Specialty,,,324110,8,2027-07-01,100000,5000
+L016,B015,CI ABL Sub Anchor,Active,Asset-Based Lending,,,331110,8,2027-07-01,100000,5000

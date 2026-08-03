@@ -102,6 +102,7 @@ old run must be retained.
 examples/
 ├── data/                         Example source data
 │   ├── loans.csv
+│   ├── cecl_history.csv
 │   ├── financials.csv
 │   ├── collateral.csv
 │   ├── consumer_scores_1.csv
@@ -154,17 +155,21 @@ smaller JSON files:
     "reserve_field": "cecl_reserve",
     "portfolio_field": "cecl_portfolio",
     "reserve_basis": {
-      "method": "weighted_history",
+      "current_method": "in_place",
       "central_tendency": {
         "z_score_threshold": 2.0,
         "observation_grain": "borrower"
       },
-      "weighted_history": {
-        "period_method": "in_place",
+      "historical": {
+        "enabled": true,
+        "source": "cecl_history",
+        "portfolio_field": "cecl_portfolio",
+        "period_field": "period",
+        "reserve_field": "historical_cecl_reserve",
+        "current_period": {"name": "2026Q2", "weight": 0.3333333333333333},
         "periods": [
-          {"name": "2026Q2", "reserve_field": "cecl_reserve", "weight": 0.3333333333333333},
-          {"name": "2026Q1", "reserve_field": "cecl_reserve_prior_1", "weight": 0.3333333333333333},
-          {"name": "2025Q4", "reserve_field": "cecl_reserve_prior_2", "weight": 0.3333333333333333}
+          {"name": "2026Q1", "weight": 0.3333333333333333},
+          {"name": "2025Q4", "weight": 0.3333333333333333}
         ]
       }
     },
@@ -324,15 +329,27 @@ source does not enter the results; it is reported as an orphan source key.
 | `maturity_date` | Determines the CRE DSCR or refinance/LTV path |
 | `outstanding_balance` | Exposure amount |
 | `cecl_reserve` | Recorded base CECL reserve |
-| `cecl_reserve_prior_1` | First prior-period CECL reserve used by the example history blend |
-| `cecl_reserve_prior_2` | Second prior-period CECL reserve used by the example history blend |
 
-`loan_id`, `borrower_id`, `subsector`, `outstanding_balance`, and the three
-configured CECL reserve fields are required in the example. The other fields
+`loan_id`, `borrower_id`, `subsector`, `outstanding_balance`, and
+`cecl_reserve` are required in the example. The other fields
 become operationally required when a tag, module, or report uses them.
 
 Tag definitions can reference any canonical identity field. The example checks
 both `tag_hint` and `tag_hint_2`, so either source column can route a borrower.
+
+### CECL history file: portfolio-period reserve dollars
+
+`cecl_history.csv` is a long-form, non-merged input with one row per commercial
+CECL portfolio and historical period:
+
+| Field | Purpose |
+|---|---|
+| `cecl_portfolio` | Exact current CECL portfolio name |
+| `period` | Period name referenced by `reserve_basis.historical.periods` |
+| `historical_cecl_reserve` | Historical portfolio-level CECL reserve dollars |
+
+Consumer rows are not required and are ignored if supplied. Duplicate
+portfolio-period rows are rejected.
 
 ### Financial file: C&I cash-flow inputs
 
@@ -440,7 +457,9 @@ the tag configuration.
 
 The engine begins with loan rows and creates one row per borrower:
 
-- fields listed in `sum_fields`, such as balance and reserve, are summed;
+- fields listed in `sum_fields`, such as balance, are summed;
+- the configured current CECL reserve is always summed across a borrower's
+  loans, even if it is omitted from `sum_fields`;
 - loan IDs are collected into a unique list;
 - other ordinary fields use the first nonblank value unless an explicit
   aggregation is configured; and
@@ -731,39 +750,50 @@ a shock selector matched an exposure but an ARR-style exclusion vetoed it.
 
 ### CECL
 
-Commercial CECL calculates one base reserve ratio for each CECL portfolio and
-base risk bucket:
+For the current-quarter `in_place` component, commercial CECL calculates one
+base reserve ratio for each CECL portfolio and base risk bucket:
 
 ```text
 reserve ratio = sum of recorded CECL reserve ÷ sum of balance
 ```
 
-That portfolio-and-bucket ratio is then applied to stressed bucket balances.
+The final ratio applied to stressed bucket balances can also include a
+current-quarter central-tendency component or weighted portfolio history, as
+configured below.
 
-`cecl.reserve_basis.method` selects the source of the base reserve:
+`cecl.reserve_basis.current_method` selects the current-quarter commercial
+basis:
 
-- `in_place` uses the configured current `reserve_field`. This is the default
-  when `reserve_basis` is omitted and preserves legacy behavior.
-- `central_tendency` calculates each borrower's reserve-to-balance ratio,
-  calculates a one-pass population z-score within each CECL portfolio/base
-  bucket, inclusively retains observations whose absolute z-score is at or
-  below `z_score_threshold`, and uses the arithmetic mean of the retained
-  ratios. Singleton and zero-variance groups retain every observation.
-- `weighted_history` blends any number of configured reserve fields. Period
-  weights must be finite, greater than zero, sum to one, and include the current
-  `reserve_field` with a positive weight. `period_method` can be `in_place` or
-  `central_tendency`, so the historical blend can optionally trim each period
-  independently before applying its weight.
+- `in_place` uses the configured current loan-level `reserve_field`. This is
+  the default when `reserve_basis` is omitted and preserves legacy behavior.
+- `central_tendency` calculates each borrower's current reserve-to-balance
+  ratio, calculates a one-pass population z-score within each commercial CECL
+  portfolio/base bucket, inclusively retains observations whose absolute
+  z-score is at or below `z_score_threshold`, and uses the arithmetic mean of
+  the retained ratios. Singleton and zero-variance groups retain every
+  observation.
 
-Historical reserve fields are loan-grain identity columns. Each selected field
-must be present in identity `column_aliases`, `numeric_columns`, and
-`required_columns`, plus `borrower.sum_fields`; this keeps multi-loan borrowers
-and targeted loan runs consistent and makes a missing period column fail during
-input loading. Missing, invalid, or nonfinite cells are explicitly treated as
-zero and logged. The example blends current quarter and two prior quarters at
-one-third each. Its
-prior values are symmetric around current values, so enabling the example does
-not obscure regression comparisons with the prior in-place output.
+`reserve_basis.historical.enabled` independently controls portfolio history.
+When enabled, `source` must identify a `merge: false` long-form input with one
+unique row per commercial portfolio and configured historical period. Period
+weights, including `current_period.weight`, must be finite, greater than zero,
+and sum to one. An arbitrary number of historical periods is supported.
+
+Central tendency is applied only to the current-quarter loan population.
+Historical CSV rows are already portfolio-level values and are never z-score
+trimmed. Duplicate configured portfolio-period rows are rejected. Missing,
+negative, invalid, or nonfinite configured history is not filled or reweighted:
+the affected commercial portfolio is reported as unavailable. Extra portfolios
+or periods do not affect current calculations.
+The example blends current quarter and two prior portfolio values at one-third
+each.
+
+Historical reserve dollars must represent the same model-included commercial
+population used by the current run. Do not include Consumer or model-excluded
+subsets such as ARR in those amounts.
+
+Missing, invalid, or nonfinite values in the current loan-level
+`cecl.reserve_field` are treated as zero and recorded in the exception report.
 
 Negative, invalid, or nonfinite balance observations are never treated as
 zero-balance CECL rows. Their count is carried through borrower aggregation,
@@ -772,31 +802,53 @@ condition is recorded in both the basis audit and exception report. Only a
 finite balance whose absolute value is within `zero_balance_tolerance` is
 eligible for zero-balance not-applicable treatment.
 
-Historical reserve dollars use the current exposure balance, CECL portfolio,
-and base bucket as their denominator and routing. The field-based option does
-not reconstruct historical balances or historical portfolio migrations.
-
-The current `cecl.reserve_field` must use the same identity and borrower wiring
-when `method` is `central_tendency`, because the estimator is borrower-grain.
-
-Central tendency uses borrower-grain observations within each current CECL
-portfolio/base bucket, including targeted runs, and applies separately to every
-configured historical period. This avoids silently changing the estimator
-merely because the output grain changes from borrower to loan when routing is
-the same. `cecl_basis_summary.csv` records the method, period field,
-weight, observation and trimming counts, raw statistics, weighted component,
-final effective ratio, availability status, and exception code.
-The resolved amount and method are also retained on stressed result rows as
-`cecl_effective_reserve_base` and `cecl_reserve_basis_method`. Consumer uses
-that same amount when writing its raw Base reserve, qualitative residual, and
-stressed pro forma fields.
-
-Consumer Base CECL is the selected effective reserve basis. Stressed Consumer
-CECL is stressed quantitative expected loss plus the qualitative amount implied
-by:
+Each historical portfolio reserve is divided by that portfolio's current
+eligible commercial balance to create an allocation ratio. That same
+historical component is applied to every current base bucket in the portfolio:
 
 ```text
-selected base reserve − unstressed quantitative expected loss
+effective bucket ratio
+  = current weight x selected current bucket ratio
+  + sum(historical weight x historical portfolio reserve
+        / current eligible portfolio balance)
+```
+
+Consequently, the Base portfolio reserve reconciles exactly to the weighted
+current selected reserve dollars plus the weighted historical portfolio reserve
+dollars. The calculation does not reconstruct historical balances, loans,
+buckets, or migrations.
+
+The current `cecl.reserve_field` must use the same identity and borrower wiring
+when `current_method` is `central_tendency`, because the estimator is
+borrower-grain.
+Current reserve and portfolio field names must be nonblank, distinct, and must
+not reuse loader metadata, borrower keys, tag outputs, stress metrics, or other
+engine-owned columns. This prevents a later pipeline stage from overwriting an
+authoritative CECL input.
+
+Central tendency uses borrower-grain observations within each current CECL
+portfolio/base bucket, including targeted runs. This avoids silently changing
+the estimator merely because output grain changes from borrower to loan when
+routing is the same. `cecl_basis_summary.csv` records each current and
+historical component's source, method, period, weight, allocation balance,
+observation and current-period trimming counts, weighted component, final
+effective ratio, availability status, and exception code.
+Because one portfolio-level history component is allocated to every current
+base bucket, its reserve and allocation-balance audit values repeat on those
+bucket rows and must not be summed across buckets.
+The resolved amount and method are also retained on stressed result rows as
+`cecl_effective_reserve_base` and `cecl_reserve_basis_method`.
+
+Consumer never uses central tendency or portfolio history. Consumer Base CECL
+always uses each record's current in-place `cecl.reserve_field`, and its report
+rows identify `reserve_basis` as `in_place`. No Consumer row is required in the
+history CSV, and an unavailable commercial history component does not block
+Consumer CECL.
+Stressed Consumer CECL is stressed quantitative expected loss plus the
+qualitative amount implied by:
+
+```text
+current in-place reserve − unstressed quantitative expected loss
 ```
 
 The unstressed quantitative expected loss in this residual uses baseline
@@ -805,7 +857,7 @@ collateral after rushed-sale and closing-cost adjustments.
 Consumer reporting applies a borrower-level carry-forward waterfall in the
 declared stress-level order. Base quantitative expected loss is the calculated
 amount, or zero when the Base calculation is unavailable; Base qualitative
-reserve is the residual needed to equal the selected base reserve. For each
+reserve is the residual needed to equal the current in-place reserve. For each
 stressed level, quantitative expected loss is the greater of the prior
 effective amount and the current calculated amount. If the current level is missing or out of
 scope, the prior effective amount carries forward. Qualitative reserve is also

@@ -25,9 +25,11 @@ def build_borrowers(
     """Collapse the loan-level identity file into one row per borrower.
 
     Called by `StressEngine.run` immediately after input loading. Only fields
-    listed in scenario `sum_fields` are summed; all other fields follow explicit
-    aggregation rules or the configured default. This protects borrower-level
-    attributes from being accidentally added across multiple loans.
+    listed in scenario `sum_fields` are summed; the active current CECL reserve
+    and its data-quality counter are also summed automatically. All other
+    fields follow explicit aggregation rules or the configured default. This
+    protects borrower-level attributes from being accidentally added across
+    multiple loans without allowing multi-loan CECL reserves to be understated.
     """
     exceptions = exceptions if exceptions is not None else []
     config = scenario.get("borrower", {})
@@ -53,7 +55,8 @@ def build_borrowers(
             (~valid_balance) | balance_values.lt(0)
         ).astype(int)
         balance_fields.add(INVALID_BALANCE_COUNT_FIELD)
-    for reserve_field in reserve_basis_fields(scenario):
+    reserve_fields = set(reserve_basis_fields(scenario))
+    for reserve_field in reserve_fields:
         if reserve_field not in identity.columns:
             continue
         count_field = reserve_missing_count_field(reserve_field)
@@ -63,13 +66,20 @@ def build_borrowers(
             finite & valid_balance
         )
         identity[count_field] = (~finite).astype(int)
+        balance_fields.add(reserve_field)
         balance_fields.add(count_field)
     _separate_missing_borrower_ids(identity, borrower_id, exceptions)
     _record_identity_key_issues(identity, borrower_id, loan_id_field, exceptions)
     largest_fields = _largest_loan_fields(scenario, identity.columns)
     for field in balance_fields:
         if field in identity.columns:
-            aggregations.setdefault(field, "sum")
+            if field in reserve_fields:
+                # The configured current reserve is additive at loan grain.
+                # Never let an omitted or contradictory generic aggregation
+                # silently retain only one loan for a multi-loan borrower.
+                aggregations[field] = "sum"
+            else:
+                aggregations.setdefault(field, "sum")
     if loan_id_field and loan_id_field in identity.columns:
         aggregations.setdefault(loan_id_field, "list_unique")
 
@@ -168,6 +178,7 @@ def _largest_loan_fields(scenario: Mapping[str, Any], columns: Sequence[str]) ->
         config.get("borrower_id_field"),
         config.get("balance_field"),
         *as_list(config.get("sum_fields")),
+        *reserve_basis_fields(scenario),
     }
     fields = {
         config.get("risk_rating_field", "risk_rating"),
@@ -323,8 +334,8 @@ def build_source_reconciliation(
             continue
         frame = table.frame
         merge_enabled = spec.get("merge", True) is not False
-        key = spec.get("key", borrower_id)
-        identity_key = spec.get("identity_key")
+        key = spec.get("key", borrower_id) if merge_enabled else ""
+        identity_key = spec.get("identity_key") if merge_enabled else None
         base_row: Dict[str, Any] = {
             "source": name,
             "path": ";".join(str(path) for path in table.paths),
@@ -477,7 +488,6 @@ def record_identity_data_issues(
     borrower = scenario.get("borrower", {})
     balance_field = borrower.get("balance_field", "outstanding_balance")
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
-    reserve_fields = reserve_basis_fields(scenario)
     if balance_field not in identity.columns:
         record_exception(
             exceptions,
@@ -510,38 +520,28 @@ def record_identity_data_issues(
                 field=balance_field,
                 details=f"negative_count={int((balances < 0).sum())}",
             )
-    for field in reserve_fields:
-        is_current = field == reserve_field
-        if field not in identity.columns:
-            record_exception(
-                exceptions,
-                "ERROR",
-                "cecl",
-                (
-                    "CECL_RESERVE_FIELD_MISSING"
-                    if is_current
-                    else "CECL_BASIS_FIELD_MISSING"
-                ),
-                "A configured CECL reserve-basis field was missing from identity data.",
-                field=field,
-            )
-            continue
-        reserve_values = pd.to_numeric(identity[field], errors="coerce")
-        missing_reserve = ~np.isfinite(reserve_values)
-        if missing_reserve.any():
-            record_exception(
-                exceptions,
-                "WARNING",
-                "cecl",
-                (
-                    "CECL_LOAN_RESERVE_MISSING_TREATED_AS_ZERO"
-                    if is_current
-                    else "CECL_HISTORY_RESERVE_MISSING_TREATED_AS_ZERO"
-                ),
-                "Individual loan CECL reserve values were missing and treated as zero in the selected reserve basis.",
-                field=field,
-                details=f"missing_count={int(missing_reserve.sum())}",
-            )
+    if reserve_field not in identity.columns:
+        record_exception(
+            exceptions,
+            "ERROR",
+            "cecl",
+            "CECL_RESERVE_FIELD_MISSING",
+            "The configured current CECL reserve field was missing from identity data.",
+            field=reserve_field,
+        )
+        return
+    reserve_values = pd.to_numeric(identity[reserve_field], errors="coerce")
+    missing_reserve = ~np.isfinite(reserve_values)
+    if missing_reserve.any():
+        record_exception(
+            exceptions,
+            "WARNING",
+            "cecl",
+            "CECL_LOAN_RESERVE_MISSING_TREATED_AS_ZERO",
+            "Current loan CECL reserve values were missing, invalid, or nonfinite and treated as zero.",
+            field=reserve_field,
+            details=f"missing_count={int(missing_reserve.sum())}",
+        )
 
 
 def record_best_available_fallbacks(

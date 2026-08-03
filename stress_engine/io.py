@@ -253,12 +253,31 @@ def load_inputs(scenario: Mapping[str, Any], base_dir: Path) -> Dict[str, Loaded
     )
     identity_spec["string_columns"] = list(dict.fromkeys(identity_strings))
     loaded["identity"] = read_table("identity", identity_spec, base_dir)
+    cecl = scenario.get("cecl", {})
+    basis = cecl.get("reserve_basis", {}) if isinstance(cecl, Mapping) else {}
+    historical = (
+        basis.get("historical", {}) if isinstance(basis, Mapping) else {}
+    )
+    optional_history_source = (
+        str(historical.get("source", "")).strip()
+        if isinstance(historical, Mapping)
+        and historical.get("enabled", False) is True
+        else ""
+    )
     for name, spec in inputs.get("sources", {}).items():
         source_spec = dict(spec)
         key = source_spec.get("key")
         if key:
             source_spec["string_columns"] = list(dict.fromkeys([*source_spec.get("string_columns", []), key]))
-        loaded[name] = read_table(str(name), source_spec, base_dir)
+        try:
+            loaded[name] = read_table(str(name), source_spec, base_dir)
+        except FileNotFoundError:
+            if str(name) != optional_history_source:
+                raise
+            # Portfolio history is commercial-only. Deferring a missing file
+            # lets Consumer-only runs proceed and lets mixed runs report the
+            # commercial history component as unavailable in the CECL audit.
+            continue
     return loaded
 
 

@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .borrower import aggregate_source
-from .cecl import attach_cecl_reserve_basis
+from .cecl import attach_cecl_reserve_basis, cecl_history_frame
 from .exceptions import record_exception
 from .modules.base import initialize_results, targeted_override_column
 from .modules.ci import _brg_key, _ebitda_reduction, run_ci
@@ -467,6 +467,7 @@ def run_targeted_stress(
         initialize_results(context, baseline_scenario, exceptions),
         baseline_scenario,
         exceptions,
+        history=cecl_history_frame(baseline_scenario, loaded),
     )
     baseline, baseline_out_scope = _run_modules(
         baseline_input,

@@ -32,27 +32,28 @@
     "reserve_field": "cecl_reserve",
     "portfolio_field": "cecl_portfolio",
     "reserve_basis": {
-      "method": "weighted_history",
+      "current_method": "in_place",
       "central_tendency": {
         "z_score_threshold": 2.0,
         "observation_grain": "borrower"
       },
-      "weighted_history": {
-        "period_method": "in_place",
+      "historical": {
+        "enabled": true,
+        "source": "cecl_history",
+        "portfolio_field": "cecl_portfolio",
+        "period_field": "period",
+        "reserve_field": "historical_cecl_reserve",
+        "current_period": {
+          "name": "2026Q2",
+          "weight": 0.3333333333333333
+        },
         "periods": [
           {
-            "name": "2026Q2",
-            "reserve_field": "cecl_reserve",
-            "weight": 0.3333333333333333
-          },
-          {
             "name": "2026Q1",
-            "reserve_field": "cecl_reserve_prior_1",
             "weight": 0.3333333333333333
           },
           {
             "name": "2025Q4",
-            "reserve_field": "cecl_reserve_prior_2",
             "weight": 0.3333333333333333
           }
         ]
