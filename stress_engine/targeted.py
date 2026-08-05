@@ -17,6 +17,7 @@ from .modules.consumer import run_consumer
 from .modules.cre import run_cre
 from .reporting import build_reports
 from .tagging import (
+    add_cecl_selection_summary,
     apply_tags,
     assign_primary_modules,
     evaluate_conditions,
@@ -423,7 +424,10 @@ def build_loan_context(
                     len(model_excluded_rows)
                 )
     loans = assign_primary_modules(loans, scenario, exceptions)
-    loans = resolve_cecl_level_tags(loans, scenario)
+    loans = resolve_cecl_level_tags(loans, scenario, exceptions)
+    tag_summary = add_cecl_selection_summary(
+        tag_summary, loans, scenario
+    )
     loans = _enrich_loans(loans, scenario, loaded)
     return loans.sort_values(["_exposure_id"], kind="mergesort").reset_index(drop=True), tag_summary
 

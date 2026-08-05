@@ -529,11 +529,26 @@ A commercial tag can also define the scale for CECL reserve ratios:
 `cecl_level: true` marks the tag as a CECL grouping key. `cecl_module` scopes
 that key to a routed module. After model exclusions and module priority are
 resolved, the engine considers only active CECL-level tags whose `cecl_module`
-equals the borrower's `primary_module`. A commercial modeled borrower must
-resolve to exactly one such tag. No match or multiple matches in the selected
-module stop the run instead of depending on JSON order. Because overlay
-migrations are calculated at public-portfolio grain, every modeled row in one
-overlay CECL portfolio must resolve to the same single CECL-level tag.
+equals the borrower's `primary_module`. `cecl_priority` is an optional
+nonnegative integer rank within that module; lower numbers take precedence and
+the default is `0`. A unique lowest rank resolves an overlap without depending
+on JSON order. No match, or a tie at the lowest matched rank, still stops the
+run. The selected tag and all candidates/ranks are recorded as
+`CECL_LEVEL_TAG_OVERLAP_RESOLVED_BY_PRIORITY` in `exception_log.csv`, while all
+raw tag flags remain visible. Overlay events also record the previous public
+and CECL portfolios and the resolved portfolio. In targeted runs the event is
+written once per overlapping loan with `scenario_variant` set to `all`, because
+CECL tag resolution occurs before variant-specific shocks.
+
+The example gives `Business_Credit_Center_Overlay` a `cecl_priority` of `100`,
+making BCC a fallback behind the default-rank EF tag. BCC-only rows still
+resolve to BCC. For Overlay overlaps, the selected tag's configured Overlay
+portfolio assignment also becomes authoritative so public routing and CECL
+history cannot disagree. A priority-selected Overlay tag must explicitly assign
+`model_module: "Overlay"` and an enabled `model_portfolio`; if it also assigns
+the CECL portfolio field, that value must match. Because overlay migrations are
+calculated at public-portfolio grain, every modeled row in one overlay CECL
+portfolio must ultimately resolve to the same single CECL-level tag.
 
 This routing scope is important for overlaps. The example borrower that
 matches both CRE and Middle Market is routed to CRE, so `CRE_Model` is its CECL
@@ -851,7 +866,9 @@ definition, and model-included commercial population used by the current run.
 Do not supply Consumer or model-excluded subsets such as ARR. An ARR borrower
 continues to appear in its parent Sponsor and Specialty tag and tie-out, but it
 does not enter the current CECL population and is not represented in the
-historical ratio.
+historical ratio. Where priority creates a fallback tag such as BCC, historical
+BCC ratios must be calculated on the residual population left after
+higher-precedence tags have been selected in every historical period.
 
 Missing, invalid, or nonfinite values in the current loan-level
 `cecl.reserve_field` are treated as zero and recorded in the exception report.
@@ -1059,7 +1076,11 @@ subset such as ARR stays in its Sponsor and Specialty parent control. The
 `not_model_excluded_*` and `model_excluded_*` count and balance columns
 reconcile that raw population to the global model veto. These columns describe
 the veto split, not final module scope. Targeted runs additionally provide
-corresponding loan counts.
+corresponding loan counts. For CECL-level tags, `cecl_priority`,
+`cecl_selected_borrower_count`, and `cecl_selected_balance` distinguish the
+resolved, mutually exclusive CECL population from the inclusive raw tag; the
+targeted report also includes `cecl_selected_loan_count`. Selected CECL fields
+are populated only on population rows; tie-out rows leave them blank.
 
 ### 4. Out-of-scope reports
 

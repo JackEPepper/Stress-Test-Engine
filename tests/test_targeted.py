@@ -60,6 +60,55 @@ def _targeted_validation_scenario(values):
 
 
 class TargetedStressTest(unittest.TestCase):
+    def test_cecl_priority_overlap_is_logged_once_at_loan_grain(self):
+        scenario, base_dir = load_scenario(
+            ROOT / "examples" / "targeted_stress.json"
+        )
+        bcc_name = "Business_Credit_Center_Overlay"
+        scenario["tags"][bcc_name]["include"] = {
+            "field": "subsector",
+            "op": "has_any_token",
+            "value": ["Business Credit Center", "Equipment Finance"],
+        }
+        bcc_spec = scenario["tags"].pop(bcc_name)
+        scenario["tags"] = {bcc_name: bcc_spec, **scenario["tags"]}
+
+        result = StressEngine(scenario, base_dir).run(
+            write_outputs=False, run_comparison=False
+        )
+
+        context = result["loan_context"].set_index("loan_id")
+        ef = context.loc["L009"]
+        self.assertEqual(ef["borrower_id"], "B008")
+        self.assertTrue(bool(ef["tag_equipment_finance_overlay"]))
+        self.assertTrue(bool(ef["tag_business_credit_center_overlay"]))
+        self.assertEqual(ef["cecl_level_tag"], "Equipment_Finance_Overlay")
+        self.assertEqual(ef["model_portfolio"], "EF")
+        self.assertEqual(ef["cecl_portfolio"], "EF")
+
+        events = result["reports"]["exception_log"]
+        events = events[
+            events["code"].eq(
+                "CECL_LEVEL_TAG_OVERLAP_RESOLVED_BY_PRIORITY"
+            )
+        ]
+        self.assertEqual(len(events), 1)
+        event = events.iloc[0]
+        self.assertEqual(event["borrower_id"], "B008")
+        self.assertEqual(event["loan_id"], "L009")
+        self.assertEqual(event["scenario_variant"], "all")
+
+        tag_summary = result["reports"]["tag_summary"]
+        bcc = tag_summary[
+            tag_summary["tag"].eq(bcc_name)
+            & tag_summary["tie_out_name"].isna()
+        ].iloc[0]
+        self.assertEqual(int(bcc["borrower_count"]), 2)
+        self.assertEqual(int(bcc["loan_count"]), 2)
+        self.assertEqual(int(bcc["cecl_selected_borrower_count"]), 1)
+        self.assertEqual(int(bcc["cecl_selected_loan_count"]), 1)
+        self.assertEqual(float(bcc["cecl_selected_balance"]), 200000.0)
+
     def test_targeted_example_runs_baseline_layered_and_isolated_variants(self):
         scenario, base_dir = load_scenario(ROOT / "examples" / "targeted_stress.json")
         result = StressEngine(scenario, base_dir).run(

@@ -135,6 +135,21 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         assignments = tag.get("assign", {})
         assigned_module = assignments.get(module_field)
         is_overlay_route = assigned_module == "Overlay"
+        if (
+            is_overlay_route
+            and tag.get("cecl_level", False)
+            and tag.get("cecl_module") == "Overlay"
+            and cecl_portfolio_field in assignments
+        ):
+            if (
+                portfolio_field not in assignments
+                or assignments[cecl_portfolio_field]
+                != assignments[portfolio_field]
+            ):
+                raise ValueError(
+                    f"Overlay tag '{tag['name']}' must assign the same value "
+                    f"to '{portfolio_field}' and '{cecl_portfolio_field}'."
+                )
         disallowed_fields = [
             field
             for field in (

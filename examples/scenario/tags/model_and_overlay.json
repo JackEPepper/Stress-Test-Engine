@@ -138,6 +138,7 @@
       "model_eligible": false,
       "cecl_level": true,
       "cecl_module": "Overlay",
+      "cecl_priority": 100,
       "include": [
         {
           "field": "subsector",

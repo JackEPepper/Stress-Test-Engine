@@ -70,6 +70,12 @@ class SampleScenarioRunTest(unittest.TestCase):
                 if spec.get("cecl_level") is True
             }
             self.assertEqual(configured_cecl_tags, expected_cecl_tags)
+            self.assertEqual(
+                scenario["tags"]["Business_Credit_Center_Overlay"][
+                    "cecl_priority"
+                ],
+                100,
+            )
             for unflagged in (
                 "Consumer_Model",
                 "CI_Model",
@@ -260,6 +266,17 @@ class SampleScenarioRunTest(unittest.TestCase):
             tag_summary = result["reports"]["tag_summary"]
             tieouts = tag_summary[tag_summary["tie_out_name"].notna()]
             self.assertTrue(tieouts["passed"].astype(bool).all())
+            bcc_tag = tag_summary[
+                (tag_summary["tag"] == "Business_Credit_Center_Overlay")
+                & tag_summary["tie_out_name"].isna()
+            ].iloc[0]
+            self.assertEqual(int(bcc_tag["cecl_priority"]), 100)
+            self.assertEqual(
+                int(bcc_tag["cecl_selected_borrower_count"]), 1
+            )
+            self.assertEqual(
+                float(bcc_tag["cecl_selected_balance"]), 200000.0
+            )
 
             overlay_summary = result["reports"]["overlay_summary"]
             bcc_overlay = overlay_summary[
@@ -677,6 +694,99 @@ class SampleScenarioRunTest(unittest.TestCase):
         )
 
         self.assertNotEqual(cre_ratio, ci_ratio)
+
+    def test_bcc_cecl_priority_is_an_end_to_end_overlay_fallback(self):
+        scenario, base_dir = load_scenario(SCENARIO)
+        bcc_name = "Business_Credit_Center_Overlay"
+        scenario["tags"][bcc_name]["include"] = {
+            "field": "subsector",
+            "op": "has_any_token",
+            "value": ["Business Credit Center", "Equipment Finance"],
+        }
+        # Put the fallback first to prove CECL priority, rather than JSON
+        # declaration order, owns both selection and final Overlay routing.
+        bcc_spec = scenario["tags"].pop(bcc_name)
+        scenario["tags"] = {bcc_name: bcc_spec, **scenario["tags"]}
+
+        result = StressEngine(scenario, base_dir).run(
+            write_outputs=False, run_comparison=False
+        )
+
+        borrowers = result["borrowers"].set_index("borrower_id")
+        ef = borrowers.loc["B008"]
+        bcc = borrowers.loc["B009"]
+        self.assertTrue(bool(ef["tag_equipment_finance_overlay"]))
+        self.assertTrue(bool(ef["tag_business_credit_center_overlay"]))
+        self.assertEqual(ef["primary_module"], "Overlay")
+        self.assertEqual(ef["model_portfolio"], "EF")
+        self.assertEqual(ef["cecl_portfolio"], "EF")
+        self.assertEqual(
+            ef["cecl_level_tag"], "Equipment_Finance_Overlay"
+        )
+        self.assertEqual(
+            bcc["cecl_level_tag"], "Business_Credit_Center_Overlay"
+        )
+
+        tag_summary = result["reports"]["tag_summary"]
+        bcc_tag = tag_summary[
+            (tag_summary["tag"] == "Business_Credit_Center_Overlay")
+            & tag_summary["tie_out_name"].isna()
+        ].iloc[0]
+        self.assertEqual(int(bcc_tag["borrower_count"]), 2)
+        self.assertEqual(
+            int(bcc_tag["cecl_selected_borrower_count"]), 1
+        )
+        self.assertEqual(
+            float(bcc_tag["cecl_selected_balance"]), 200000.0
+        )
+
+        priority_events = result["reports"]["exception_log"]
+        priority_events = priority_events[
+            priority_events["code"]
+            == "CECL_LEVEL_TAG_OVERLAP_RESOLVED_BY_PRIORITY"
+        ]
+        self.assertEqual(len(priority_events), 1)
+        self.assertEqual(priority_events.iloc[0]["borrower_id"], "B008")
+        self.assertIn(
+            "previous_model_portfolio=BCC",
+            priority_events.iloc[0]["details"],
+        )
+        self.assertIn(
+            "resolved_portfolio=EF", priority_events.iloc[0]["details"]
+        )
+        assignment_conflicts = result["reports"]["exception_log"]
+        assignment_conflicts = assignment_conflicts[
+            assignment_conflicts["code"].eq("TAG_ASSIGNMENT_CONFLICT")
+        ]
+        self.assertTrue(
+            set(assignment_conflicts["source"].dropna()).isdisjoint(
+                {bcc_name, "Equipment_Finance_Overlay"}
+            )
+        )
+
+        cecl = result["reports"]["cecl_summary"]
+        ef_base = cecl[
+            cecl["portfolio"].eq("EF")
+            & cecl["stress_level"].eq("Base")
+            & cecl["bucket"].eq("Pass")
+        ].iloc[0]
+        bcc_base = cecl[
+            cecl["portfolio"].eq("BCC")
+            & cecl["stress_level"].eq("Base")
+            & cecl["bucket"].eq("Special Mention")
+        ].iloc[0]
+        self.assertEqual(float(ef_base["balance"]), 400000.0)
+        self.assertAlmostEqual(float(ef_base["reserve_ratio"]), 0.01)
+        self.assertAlmostEqual(
+            float(ef_base["proforma_cecl_reserve"]), 4000.0
+        )
+        self.assertEqual(float(bcc_base["balance"]), 200000.0)
+        self.assertAlmostEqual(float(bcc_base["reserve_ratio"]), 0.015)
+        self.assertAlmostEqual(
+            float(bcc_base["proforma_cecl_reserve"]), 3000.0
+        )
+        self.assertEqual(ef_base["cecl_reserve_status"], "available")
+        self.assertEqual(bcc_base["cecl_reserve_status"], "available")
 
 
 if __name__ == "__main__":

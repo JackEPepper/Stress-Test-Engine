@@ -64,6 +64,17 @@ def apply_tags(
     tag_rows: List[Dict[str, Any]] = []
     tag_defs = normalize_tag_defs(scenario.get("tags", {}))
     balance_field = scenario["borrower"]["balance_field"]
+    borrower_config = scenario.get("borrower", {})
+    cecl_config = scenario.get("cecl", {})
+    routing_fields = {
+        borrower_config.get("module_field", "model_module"),
+        borrower_config.get("portfolio_field", "model_portfolio"),
+        (
+            cecl_config.get("portfolio_field", "cecl_portfolio")
+            if isinstance(cecl_config, Mapping)
+            else "cecl_portfolio"
+        ),
+    }
 
     for tag in tag_defs:
         name = tag["name"]
@@ -100,6 +111,12 @@ def apply_tags(
             tag.get("assign", {}),
             exceptions,
             name,
+            (
+                routing_fields
+                if tag.get("cecl_level", False)
+                and tag.get("cecl_module") == "Overlay"
+                else set()
+            ),
         )
 
         tagged = result[result[tag_col]]
@@ -110,6 +127,7 @@ def apply_tags(
             "exclude_from_model": bool(tag.get("exclude_from_model", False)),
             "cecl_level": bool(tag.get("cecl_level", False)),
             "cecl_module": tag.get("cecl_module", np.nan),
+            "cecl_priority": tag.get("cecl_priority", np.nan),
             "borrower_count": int(len(tagged)),
             "balance_field": balance_field,
             "balance": float(pd.to_numeric(tagged.get(balance_field, pd.Series(dtype=float)), errors="coerce").sum()),
@@ -125,6 +143,9 @@ def apply_tags(
             tieout_row = _evaluate_tieout(name, tag_col, result, tieout, loaded, balance_field)
             tieout_row["cecl_level"] = bool(tag.get("cecl_level", False))
             tieout_row["cecl_module"] = tag.get("cecl_module", np.nan)
+            tieout_row["cecl_priority"] = tag.get(
+                "cecl_priority", np.nan
+            )
             tag_rows.append(tieout_row)
             match_count = tieout_row.get("expected_match_count")
             if pd.notna(match_count) and int(match_count) == 0:
@@ -233,9 +254,24 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
                     f"Tag '{name}' cannot be both cecl_level and exclude_from_model."
                 )
             item["cecl_module"] = cecl_module
+            cecl_priority = item.get("cecl_priority", 0)
+            if (
+                isinstance(cecl_priority, bool)
+                or not isinstance(cecl_priority, int)
+                or cecl_priority < 0
+            ):
+                raise ValueError(
+                    f"CECL-level tag '{name}' cecl_priority must be a "
+                    "nonnegative JSON integer."
+                )
+            item["cecl_priority"] = cecl_priority
         elif "cecl_module" in item:
             raise ValueError(
                 f"Tag '{name}' cecl_module requires cecl_level to be true."
+            )
+        elif "cecl_priority" in item:
+            raise ValueError(
+                f"Tag '{name}' cecl_priority requires cecl_level to be true."
             )
         if item.get("exclude_from_model", False):
             if item.get("model_eligible", False):
@@ -468,6 +504,7 @@ def _apply_assignments(
     assignments: Mapping[str, Any],
     exceptions: List[Dict[str, Any]],
     tag_name: str,
+    tracked_conflict_fields: set[str] | None = None,
 ) -> None:
     """Write derived field values for rows matched by a tag.
 
@@ -500,6 +537,10 @@ def _apply_assignments(
                 source=tag_name,
                 details=f"conflict_count={int(conflict.sum())}",
             )
+            if field in (tracked_conflict_fields or set()):
+                exceptions[-1]["_conflict_indices"] = list(
+                    df.index[conflict]
+                )
         write_mask = mask & existing.isna()
         df.loc[write_mask, field] = candidate.loc[write_mask]
 
@@ -787,15 +828,21 @@ def assign_primary_modules(
 def resolve_cecl_level_tags(
     df: pd.DataFrame,
     scenario: Mapping[str, Any],
+    exceptions: List[Dict[str, Any]] | None = None,
+    *,
+    emit_priority_warnings: bool = True,
 ) -> pd.DataFrame:
     """Resolve one CECL calibration tag after primary-module routing.
 
     CECL-level tags are scoped to a primary module so intentional cross-module
-    tag overlap does not make the CECL population ambiguous. Once any such tag
-    is configured, every included CRE, C&I, or Overlay row must match exactly
-    one tag in its selected module. Consumer and model-excluded rows retain
-    their existing treatment and never enter tagged commercial calibration.
+    tag overlap does not make the CECL population ambiguous. A uniquely lowest
+    ``cecl_priority`` resolves same-module overlap; tied candidates still fail
+    closed. Once any such tag is configured, every included CRE, C&I, or
+    Overlay row must resolve to one tag in its selected module. Consumer and
+    model-excluded rows retain their existing treatment and never enter tagged
+    commercial calibration.
     """
+    exceptions = exceptions if exceptions is not None else []
     result = df.copy()
     tag_defs = normalize_tag_defs(scenario.get("tags", {}))
     cecl_tags = [tag for tag in tag_defs if tag.get("cecl_level", False)]
@@ -822,6 +869,10 @@ def resolve_cecl_level_tags(
     borrower_id_field = scenario.get("borrower", {}).get(
         "borrower_id_field", "borrower_id"
     )
+    loan_id_field = scenario.get("borrower", {}).get(
+        "loan_id_field", "loan_id"
+    )
+    priority_resolved_indices: set[Any] = set()
     for idx, row in result.iterrows():
         excluded = row.get("model_excluded", False)
         if not is_missing(excluded) and bool(excluded):
@@ -841,30 +892,324 @@ def resolve_cecl_level_tags(
         if module not in CECL_LEVEL_MODULES:
             continue
 
-        candidates: List[str] = []
+        candidates: List[Dict[str, Any]] = []
         for tag in cecl_tags:
             if tag.get("cecl_module") != module:
                 continue
             column = f"tag_{stable_name(tag['name'])}"
             value = row.get(column, False)
             if not is_missing(value) and bool(value):
-                candidates.append(str(tag["name"]))
+                candidates.append(tag)
+        candidates.sort(
+            key=lambda tag: (
+                int(tag.get("cecl_priority", 0)), str(tag["name"])
+            )
+        )
         borrower_id = row.get(borrower_id_field)
         if not candidates:
             raise ValueError(
                 "Model-included commercial row matched no CECL-level tag for "
                 f"primary module '{module}' (borrower_id={borrower_id})."
             )
+        priority_resolved = False
         if len(candidates) > 1:
-            raise ValueError(
-                "Model-included commercial row matched multiple CECL-level "
-                f"tags for primary module '{module}' "
-                f"(borrower_id={borrower_id}): {', '.join(candidates)}."
+            selected_priority = min(
+                int(tag.get("cecl_priority", 0)) for tag in candidates
             )
-        result.at[idx, CECL_LEVEL_TAG_FIELD] = candidates[0]
+            preferred = [
+                tag
+                for tag in candidates
+                if int(tag.get("cecl_priority", 0)) == selected_priority
+            ]
+            candidate_details = ";".join(
+                f"{tag['name']}={int(tag.get('cecl_priority', 0))}"
+                for tag in candidates
+            )
+            if len(preferred) > 1:
+                raise ValueError(
+                    "Model-included commercial row matched multiple CECL-level "
+                    f"tags for primary module '{module}' at the same winning "
+                    f"priority (borrower_id={borrower_id}): "
+                    f"{candidate_details}."
+                )
+            selected = preferred[0]
+            priority_resolved = True
+        else:
+            selected = candidates[0]
+        result.at[idx, CECL_LEVEL_TAG_FIELD] = str(selected["name"])
+        route_audit: Dict[str, str] = {}
+        if module == "Overlay" and priority_resolved:
+            route_audit = _apply_selected_overlay_route(
+                result, idx, row, selected, scenario
+            )
+        if priority_resolved:
+            priority_resolved_indices.add(idx)
+            if emit_priority_warnings:
+                details = (
+                    f"candidates={candidate_details}; "
+                    f"selected={selected['name']}; "
+                    f"selected_priority={selected_priority}"
+                )
+                if route_audit:
+                    details += (
+                        "; previous_model_portfolio="
+                        f"{route_audit['previous_model_portfolio']}; "
+                        "previous_cecl_portfolio="
+                        f"{route_audit['previous_cecl_portfolio']}; "
+                        "resolved_portfolio="
+                        f"{route_audit['resolved_portfolio']}"
+                    )
+                record_exception(
+                    exceptions,
+                    "WARNING",
+                    "tagging",
+                    "CECL_LEVEL_TAG_OVERLAP_RESOLVED_BY_PRIORITY",
+                    "Borrower matched multiple same-module CECL-level tags; configured priority selected one tag.",
+                    borrower_id=borrower_id,
+                    loan_id=row.get(loan_id_field, pd.NA),
+                    module=module,
+                    field=CECL_LEVEL_TAG_FIELD,
+                    details=details,
+                    scenario_variant=(
+                        "all" if scenario.get("targeted_stress") else ""
+                    ),
+                )
 
+    _reconcile_priority_resolved_assignment_conflicts(
+        exceptions, priority_resolved_indices, cecl_tags, scenario
+    )
     _validate_repeated_commercial_cecl_rows(result, scenario)
     return result
+
+
+def _apply_selected_overlay_route(
+    df: pd.DataFrame,
+    idx: Any,
+    row: Mapping[str, Any],
+    selected_tag: Mapping[str, Any],
+    scenario: Mapping[str, Any],
+) -> Dict[str, str]:
+    """Keep Overlay public routing aligned with the selected CECL tag."""
+    borrower = scenario.get("borrower", {})
+    module_field = borrower.get("module_field", "model_module")
+    portfolio_field = borrower.get("portfolio_field", "model_portfolio")
+    cecl = scenario.get("cecl", {})
+    cecl_portfolio_field = (
+        cecl.get("portfolio_field", "cecl_portfolio")
+        if isinstance(cecl, Mapping)
+        else "cecl_portfolio"
+    )
+    assignments = selected_tag.get("assign", {})
+    if not isinstance(assignments, Mapping):
+        raise ValueError(
+            f"Priority-selected Overlay CECL tag '{selected_tag['name']}' "
+            "must define routing assignments."
+        )
+    assigned_module = _resolved_assignment_value(
+        row, assignments.get(module_field, pd.NA)
+    )
+    if is_missing(assigned_module) or str(assigned_module).strip() != "Overlay":
+        raise ValueError(
+            f"Priority-selected Overlay CECL tag '{selected_tag['name']}' "
+            f"must assign '{module_field}' to 'Overlay'."
+        )
+    portfolio = _resolved_assignment_value(
+        row, assignments.get(portfolio_field, pd.NA)
+    )
+    cecl_portfolio = _resolved_assignment_value(
+        row, assignments.get(cecl_portfolio_field, pd.NA)
+    )
+    if is_missing(portfolio) or not str(portfolio).strip():
+        raise ValueError(
+            f"Priority-selected Overlay CECL tag '{selected_tag['name']}' "
+            f"must assign a nonblank '{portfolio_field}'."
+        )
+    portfolio = str(portfolio).strip()
+    if (
+        not is_missing(cecl_portfolio)
+        and str(cecl_portfolio).strip()
+        and str(cecl_portfolio).strip() != portfolio
+    ):
+        raise ValueError(
+            f"Selected Overlay CECL tag '{selected_tag['name']}' assigns "
+            f"model portfolio '{portfolio}' but CECL portfolio "
+            f"'{str(cecl_portfolio).strip()}'. Overlay routing fields "
+            "must agree."
+        )
+    overlays = scenario.get("overlays", {})
+    if not isinstance(overlays, Mapping):
+        raise ValueError("Scenario overlays must be a JSON object.")
+    enabled_overlays = {
+        str(name)
+        for name, config in overlays.items()
+        if isinstance(config, Mapping) and config.get("enabled", True)
+    }
+    if portfolio not in enabled_overlays:
+        raise ValueError(
+            f"Selected Overlay CECL tag '{selected_tag['name']}' routes "
+            f"to portfolio '{portfolio}', which is not enabled and "
+            "configured."
+        )
+    previous_model_portfolio = _route_audit_value(row.get(portfolio_field))
+    previous_cecl_portfolio = _route_audit_value(
+        row.get(cecl_portfolio_field)
+    )
+    df.at[idx, module_field] = "Overlay"
+    df.at[idx, portfolio_field] = portfolio
+    df.at[idx, cecl_portfolio_field] = portfolio
+    return {
+        "previous_model_portfolio": previous_model_portfolio,
+        "previous_cecl_portfolio": previous_cecl_portfolio,
+        "resolved_portfolio": portfolio,
+    }
+
+
+def _route_audit_value(value: Any) -> str:
+    if is_missing(value) or not str(value).strip():
+        return "<blank>"
+    return str(value).strip()
+
+
+def _reconcile_priority_resolved_assignment_conflicts(
+    exceptions: List[Dict[str, Any]],
+    priority_resolved_indices: set[Any],
+    cecl_tags: List[Dict[str, Any]],
+    scenario: Mapping[str, Any],
+) -> None:
+    """Retain routing conflicts unless priority corrected those exact rows."""
+    overlay_tag_names = {
+        str(tag["name"])
+        for tag in cecl_tags
+        if tag.get("cecl_module") == "Overlay"
+    }
+    borrower = scenario.get("borrower", {})
+    cecl = scenario.get("cecl", {})
+    routing_fields = {
+        borrower.get("module_field", "model_module"),
+        borrower.get("portfolio_field", "model_portfolio"),
+        (
+            cecl.get("portfolio_field", "cecl_portfolio")
+            if isinstance(cecl, Mapping)
+            else "cecl_portfolio"
+        ),
+    }
+    retained: List[Dict[str, Any]] = []
+    for event in exceptions:
+        conflict_indices = event.pop("_conflict_indices", None)
+        if conflict_indices is None:
+            retained.append(event)
+            continue
+        is_tracked_overlay_conflict = (
+            event.get("code") == "TAG_ASSIGNMENT_CONFLICT"
+            and str(event.get("source", "")) in overlay_tag_names
+            and str(event.get("field", "")) in routing_fields
+        )
+        if not is_tracked_overlay_conflict:
+            retained.append(event)
+            continue
+        unresolved = [
+            idx
+            for idx in conflict_indices
+            if idx not in priority_resolved_indices
+        ]
+        if not unresolved:
+            continue
+        details = str(event.get("details", ""))
+        event["details"] = re.sub(
+            r"conflict_count=\d+",
+            f"conflict_count={len(unresolved)}",
+            details,
+        )
+        retained.append(event)
+    exceptions[:] = retained
+
+
+def _resolved_assignment_value(
+    row: Mapping[str, Any], value_spec: Any
+) -> Any:
+    if isinstance(value_spec, Mapping) and "from_field" in value_spec:
+        return row.get(value_spec["from_field"], pd.NA)
+    return value_spec
+
+
+def add_cecl_selection_summary(
+    tag_summary: pd.DataFrame,
+    resolved: pd.DataFrame,
+    scenario: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Add resolved CECL populations beside inclusive raw tag populations."""
+    summary = tag_summary.copy()
+    summary["cecl_selected_borrower_count"] = np.nan
+    summary["cecl_selected_balance"] = np.nan
+    has_loan_counts = "loan_count" in summary.columns
+    if has_loan_counts:
+        summary["cecl_selected_loan_count"] = np.nan
+    if summary.empty or "cecl_level" not in summary.columns:
+        return summary
+
+    borrower = scenario.get("borrower", {})
+    borrower_id_field = borrower.get("borrower_id_field", "borrower_id")
+    balance_field = borrower.get("balance_field", "outstanding_balance")
+    cecl_rows = summary["cecl_level"].fillna(False).astype(bool)
+    population_cecl_rows = cecl_rows.copy()
+    if "tie_out_name" in summary.columns:
+        population_cecl_rows &= summary["tie_out_name"].isna()
+    summary.loc[
+        population_cecl_rows, "cecl_selected_borrower_count"
+    ] = 0
+    summary.loc[population_cecl_rows, "cecl_selected_balance"] = 0.0
+    if has_loan_counts:
+        summary.loc[
+            population_cecl_rows, "cecl_selected_loan_count"
+        ] = 0
+
+    if CECL_LEVEL_TAG_FIELD not in resolved.columns:
+        return summary
+    for tag_name in summary.loc[
+        population_cecl_rows, "tag"
+    ].dropna().unique():
+        tag_rows = population_cecl_rows & summary["tag"].eq(tag_name)
+        selected_mask = resolved[CECL_LEVEL_TAG_FIELD].astype(str).eq(
+            str(tag_name)
+        )
+        if "model_excluded" in resolved.columns:
+            selected_mask &= ~resolved["model_excluded"].fillna(False).astype(
+                bool
+            )
+        if "cecl_module" in summary.columns and "primary_module" in resolved.columns:
+            modules = {
+                str(value).strip()
+                for value in summary.loc[tag_rows, "cecl_module"].dropna()
+                if str(value).strip()
+            }
+            if len(modules) == 1:
+                selected_mask &= resolved["primary_module"].astype(str).eq(
+                    next(iter(modules))
+                )
+        selected = resolved[selected_mask]
+        borrower_count = (
+            int(selected[borrower_id_field].nunique(dropna=True))
+            if borrower_id_field in selected.columns
+            else int(len(selected))
+        )
+        balance = (
+            float(
+                pd.to_numeric(
+                    selected[balance_field], errors="coerce"
+                ).sum()
+            )
+            if balance_field in selected.columns
+            else 0.0
+        )
+        summary.loc[tag_rows, "cecl_selected_borrower_count"] = (
+            borrower_count
+        )
+        summary.loc[tag_rows, "cecl_selected_balance"] = balance
+        if has_loan_counts:
+            summary.loc[tag_rows, "cecl_selected_loan_count"] = int(
+                len(selected)
+            )
+    return summary
 
 
 def _validate_repeated_commercial_cecl_rows(

@@ -13,6 +13,7 @@ from stress_engine.config import load_scenario, validate_scenario
 from stress_engine.io import load_inputs, read_table
 from stress_engine.tagging import (
     CECL_LEVEL_TAG_FIELD,
+    add_cecl_selection_summary,
     apply_tags,
     assign_primary_modules,
     resolve_cecl_level_tags,
@@ -410,6 +411,38 @@ class ScenarioConfigTest(unittest.TestCase):
                 "cecl_module requires cecl_level to be true",
             ),
             (
+                {
+                    "cecl_level": True,
+                    "cecl_module": "C&I",
+                    "cecl_priority": True,
+                },
+                {"C&I": {"enabled": False}},
+                "cecl_priority must be a nonnegative JSON integer",
+            ),
+            (
+                {
+                    "cecl_level": True,
+                    "cecl_module": "C&I",
+                    "cecl_priority": 1.5,
+                },
+                {"C&I": {"enabled": False}},
+                "cecl_priority must be a nonnegative JSON integer",
+            ),
+            (
+                {
+                    "cecl_level": True,
+                    "cecl_module": "C&I",
+                    "cecl_priority": -1,
+                },
+                {"C&I": {"enabled": False}},
+                "cecl_priority must be a nonnegative JSON integer",
+            ),
+            (
+                {"cecl_level": False, "cecl_priority": 10},
+                {},
+                "cecl_priority requires cecl_level to be true",
+            ),
+            (
                 {"cecl_level": True, "cecl_module": "Typo"},
                 {},
                 "not a configured module or Overlay",
@@ -484,6 +517,7 @@ class ScenarioConfigTest(unittest.TestCase):
         row = summary.iloc[0]
         self.assertTrue(bool(row["cecl_level"]))
         self.assertEqual(row["cecl_module"], "C&I")
+        self.assertEqual(int(row["cecl_priority"]), 0)
 
     def test_cecl_level_resolver_uses_primary_module_scope(self):
         scenario = self._minimal_scenario()
@@ -543,6 +577,475 @@ class ScenarioConfigTest(unittest.TestCase):
                 ),
                 scenario,
             )
+
+    def test_cecl_level_priority_resolves_overlay_fallback_and_routing(self):
+        def priority_scenario(reverse: bool = False) -> dict:
+            scenario = self._minimal_scenario()
+            scenario["borrower"]["loan_id_field"] = "loan_id"
+            scenario["cecl"] = {"portfolio_field": "cecl_portfolio"}
+            ef = {
+                "cecl_level": True,
+                "cecl_module": "Overlay",
+                "assign": {
+                    "model_module": "Overlay",
+                    "model_portfolio": "EF",
+                },
+            }
+            bcc = {
+                "cecl_level": True,
+                "cecl_module": "Overlay",
+                "cecl_priority": 100,
+                "assign": {
+                    "model_module": "Overlay",
+                    "model_portfolio": "BCC",
+                },
+            }
+            scenario["tags"] = (
+                {"BCC": bcc, "EF": ef}
+                if reverse
+                else {"EF": ef, "BCC": bcc}
+            )
+            scenario["overlays"] = {
+                "EF": {"enabled": True},
+                "BCC": {"enabled": True},
+            }
+            return scenario
+
+        overlap = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "B1",
+                    "loan_id": "L1",
+                    "primary_module": "Overlay",
+                    "model_module": "Overlay",
+                    "model_portfolio": "BCC",
+                    "cecl_portfolio": "BCC",
+                    "tag_ef": True,
+                    "tag_bcc": True,
+                    "model_excluded": False,
+                    "risk_rating": 6,
+                }
+            ]
+        )
+        observed_details: list[str] = []
+        for reverse in (False, True):
+            with self.subTest(reverse_declaration_order=reverse):
+                exceptions: list[dict] = []
+                resolved = resolve_cecl_level_tags(
+                    overlap, priority_scenario(reverse), exceptions
+                )
+                self.assertEqual(
+                    resolved.at[0, CECL_LEVEL_TAG_FIELD], "EF"
+                )
+                self.assertEqual(resolved.at[0, "model_portfolio"], "EF")
+                self.assertEqual(resolved.at[0, "cecl_portfolio"], "EF")
+                priority_events = [
+                    row
+                    for row in exceptions
+                    if row["code"]
+                    == "CECL_LEVEL_TAG_OVERLAP_RESOLVED_BY_PRIORITY"
+                ]
+                self.assertEqual(len(priority_events), 1)
+                self.assertEqual(priority_events[0]["severity"], "WARNING")
+                self.assertEqual(priority_events[0]["borrower_id"], "B1")
+                self.assertEqual(priority_events[0]["loan_id"], "L1")
+                self.assertEqual(priority_events[0]["module"], "Overlay")
+                self.assertIn("EF=0", priority_events[0]["details"])
+                self.assertIn("BCC=100", priority_events[0]["details"])
+                self.assertIn("selected=EF", priority_events[0]["details"])
+                self.assertIn(
+                    "previous_model_portfolio=BCC",
+                    priority_events[0]["details"],
+                )
+                self.assertIn(
+                    "previous_cecl_portfolio=BCC",
+                    priority_events[0]["details"],
+                )
+                self.assertIn(
+                    "resolved_portfolio=EF",
+                    priority_events[0]["details"],
+                )
+                observed_details.append(priority_events[0]["details"])
+        self.assertEqual(len(set(observed_details)), 1)
+
+        bcc_only = overlap.copy()
+        bcc_only["tag_ef"] = False
+        bcc_only["model_portfolio"] = "Existing"
+        bcc_only["cecl_portfolio"] = "Existing"
+        exceptions = []
+        resolved = resolve_cecl_level_tags(
+            bcc_only, priority_scenario(), exceptions
+        )
+        self.assertEqual(resolved.at[0, CECL_LEVEL_TAG_FIELD], "BCC")
+        self.assertEqual(resolved.at[0, "model_portfolio"], "Existing")
+        self.assertEqual(resolved.at[0, "cecl_portfolio"], "Existing")
+        self.assertFalse(
+            any(
+                row["code"]
+                == "CECL_LEVEL_TAG_OVERLAP_RESOLVED_BY_PRIORITY"
+                for row in exceptions
+            )
+        )
+
+        missing_route = priority_scenario()
+        missing_route["tags"]["EF"].pop("assign")
+        with self.assertRaisesRegex(
+            ValueError, "must assign 'model_module' to 'Overlay'"
+        ):
+            resolve_cecl_level_tags(overlap, missing_route, [])
+
+    def test_cecl_priority_applies_within_ci_and_equal_winners_fail(self):
+        scenario = self._minimal_scenario()
+        scenario["tags"] = {
+            "Specific": {
+                "cecl_level": True,
+                "cecl_module": "C&I",
+                "cecl_priority": 5,
+            },
+            "Fallback": {
+                "cecl_level": True,
+                "cecl_module": "C&I",
+                "cecl_priority": 20,
+            },
+        }
+        overlap = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "B1",
+                    "primary_module": "C&I",
+                    "tag_specific": True,
+                    "tag_fallback": True,
+                    "model_excluded": False,
+                    "risk_rating": 6,
+                }
+            ]
+        )
+
+        resolved = resolve_cecl_level_tags(overlap, scenario, [])
+        self.assertEqual(
+            resolved.at[0, CECL_LEVEL_TAG_FIELD], "Specific"
+        )
+
+        fallback_only = overlap.copy()
+        fallback_only["tag_specific"] = False
+        resolved = resolve_cecl_level_tags(fallback_only, scenario, [])
+        self.assertEqual(
+            resolved.at[0, CECL_LEVEL_TAG_FIELD], "Fallback"
+        )
+
+        scenario["tags"]["Fallback"]["cecl_priority"] = 5
+        with self.assertRaisesRegex(ValueError, "same winning priority"):
+            resolve_cecl_level_tags(overlap, scenario, [])
+
+    def test_overlay_routing_assignments_must_not_diverge(self):
+        scenario = self._minimal_scenario()
+        scenario["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        scenario["tags"] = {
+            "EF": {
+                "model_eligible": False,
+                "cecl_level": True,
+                "cecl_module": "Overlay",
+                "assign": {
+                    "model_module": "Overlay",
+                    "model_portfolio": "EF",
+                    "cecl_portfolio": "BCC",
+                },
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "must assign the same value"):
+            validate_scenario(scenario)
+
+        legacy = self._minimal_scenario()
+        legacy["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        legacy["tags"] = {
+            "Legacy Overlay Rollup": {
+                "model_eligible": False,
+                "assign": {
+                    "model_module": "Overlay",
+                    "model_portfolio": "Public Overlay",
+                    "cecl_portfolio": "Legacy CECL Rollup",
+                },
+            }
+        }
+        validate_scenario(legacy)
+
+    def test_cecl_selection_summary_separates_raw_and_resolved_populations(self):
+        scenario = self._minimal_scenario()
+        raw_summary = pd.DataFrame(
+            [
+                {
+                    "tag": "EF",
+                    "cecl_level": True,
+                    "cecl_module": "Overlay",
+                    "borrower_count": 1,
+                    "loan_count": 1,
+                    "balance": 100.0,
+                    "tie_out_name": pd.NA,
+                },
+                {
+                    "tag": "BCC",
+                    "cecl_level": True,
+                    "cecl_module": "Overlay",
+                    "borrower_count": 3,
+                    "loan_count": 4,
+                    "balance": 250.0,
+                    "tie_out_name": pd.NA,
+                },
+                {
+                    "tag": "BCC",
+                    "cecl_level": True,
+                    "cecl_module": "Overlay",
+                    "borrower_count": 3,
+                    "loan_count": 4,
+                    "balance": 250.0,
+                    "tie_out_name": "BCC control",
+                },
+            ]
+        )
+        resolved = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "B1",
+                    "loan_id": "L1",
+                    "balance": 100.0,
+                    "primary_module": "Overlay",
+                    "model_excluded": False,
+                    CECL_LEVEL_TAG_FIELD: "EF",
+                },
+                {
+                    "borrower_id": "B2",
+                    "loan_id": "L2",
+                    "balance": 75.0,
+                    "primary_module": "Overlay",
+                    "model_excluded": False,
+                    CECL_LEVEL_TAG_FIELD: "BCC",
+                },
+                {
+                    "borrower_id": "B2",
+                    "loan_id": "L3",
+                    "balance": 25.0,
+                    "primary_module": "Overlay",
+                    "model_excluded": False,
+                    CECL_LEVEL_TAG_FIELD: "BCC",
+                },
+                {
+                    "borrower_id": "B3",
+                    "loan_id": "L4",
+                    "balance": 50.0,
+                    "primary_module": "Overlay",
+                    "model_excluded": True,
+                    CECL_LEVEL_TAG_FIELD: "BCC",
+                },
+            ]
+        )
+
+        summary = add_cecl_selection_summary(
+            raw_summary, resolved, scenario
+        )
+        population = summary[summary["tie_out_name"].isna()].set_index(
+            "tag"
+        )
+        tie_out = summary[summary["tie_out_name"].notna()].iloc[0]
+
+        self.assertEqual(int(population.at["BCC", "borrower_count"]), 3)
+        self.assertEqual(float(population.at["BCC", "balance"]), 250.0)
+        self.assertEqual(
+            int(population.at["BCC", "cecl_selected_borrower_count"]), 1
+        )
+        self.assertEqual(
+            float(population.at["BCC", "cecl_selected_balance"]), 100.0
+        )
+        self.assertEqual(
+            int(population.at["BCC", "cecl_selected_loan_count"]), 2
+        )
+        self.assertTrue(pd.isna(tie_out["cecl_selected_borrower_count"]))
+        self.assertTrue(pd.isna(tie_out["cecl_selected_balance"]))
+        self.assertTrue(pd.isna(tie_out["cecl_selected_loan_count"]))
+
+    def test_cecl_selection_summary_does_not_count_consumer_name_collision(self):
+        scenario = self._minimal_scenario()
+        raw_summary = pd.DataFrame(
+            [
+                {
+                    "tag": "Consumer",
+                    "cecl_level": True,
+                    "cecl_module": "C&I",
+                    "borrower_count": 2,
+                    "balance": 125.0,
+                    "tie_out_name": pd.NA,
+                }
+            ]
+        )
+        resolved = pd.DataFrame(
+            [
+                {
+                    "borrower_id": "CON1",
+                    "balance": 50.0,
+                    "primary_module": "Consumer",
+                    "model_excluded": False,
+                    CECL_LEVEL_TAG_FIELD: "Consumer",
+                },
+                {
+                    "borrower_id": "CI1",
+                    "balance": 75.0,
+                    "primary_module": "C&I",
+                    "model_excluded": False,
+                    CECL_LEVEL_TAG_FIELD: "Consumer",
+                },
+            ]
+        )
+
+        summary = add_cecl_selection_summary(
+            raw_summary, resolved, scenario
+        ).iloc[0]
+
+        self.assertEqual(int(summary["cecl_selected_borrower_count"]), 1)
+        self.assertEqual(float(summary["cecl_selected_balance"]), 75.0)
+
+    def test_bcc_priority_resolves_full_tagging_and_routing_pipeline(self):
+        scenario = self._minimal_scenario()
+        scenario["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        scenario["overlays"] = {
+            "EF": {"enabled": True},
+            "BCC": {"enabled": True},
+        }
+        scenario["tags"] = {
+            "BCC": {
+                "model_eligible": False,
+                "cecl_level": True,
+                "cecl_module": "Overlay",
+                "cecl_priority": 100,
+                "include": {
+                    "field": "subsector",
+                    "op": "has_token",
+                    "value": "Business Credit Center",
+                },
+                "assign": {
+                    "model_module": "Overlay",
+                    "model_portfolio": "BCC",
+                },
+            },
+            "EF": {
+                "model_eligible": False,
+                "cecl_level": True,
+                "cecl_module": "Overlay",
+                "include": {
+                    "field": "subsector",
+                    "op": "has_token",
+                    "value": "Equipment Finance",
+                },
+                "assign": {
+                    "model_module": "Overlay",
+                    "model_portfolio": "EF",
+                },
+            },
+        }
+        exceptions: list[dict] = []
+        tagged, raw_summary = apply_tags(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "subsector": (
+                            "Equipment Finance;Business Credit Center"
+                        ),
+                        "balance": 100.0,
+                        "risk_rating": 6,
+                    }
+                ]
+            ),
+            scenario,
+            {},
+            exceptions,
+        )
+        routed = assign_primary_modules(tagged, scenario, exceptions)
+        self.assertEqual(routed.at[0, "model_portfolio"], "BCC")
+
+        resolved = resolve_cecl_level_tags(
+            routed, scenario, exceptions
+        )
+        summary = add_cecl_selection_summary(
+            raw_summary, resolved, scenario
+        ).set_index("tag")
+
+        self.assertEqual(resolved.at[0, CECL_LEVEL_TAG_FIELD], "EF")
+        self.assertEqual(resolved.at[0, "model_portfolio"], "EF")
+        self.assertEqual(resolved.at[0, "cecl_portfolio"], "EF")
+        self.assertEqual(
+            int(summary.at["EF", "cecl_selected_borrower_count"]), 1
+        )
+        self.assertEqual(
+            int(summary.at["BCC", "cecl_selected_borrower_count"]), 0
+        )
+        self.assertIn(
+            "CECL_LEVEL_TAG_OVERLAP_RESOLVED_BY_PRIORITY",
+            {row["code"] for row in exceptions},
+        )
+        self.assertNotIn(
+            "TAG_ASSIGNMENT_CONFLICT",
+            {row["code"] for row in exceptions},
+        )
+
+    def test_single_overlay_cecl_tag_keeps_route_conflict_visible(self):
+        scenario = self._minimal_scenario()
+        scenario["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        scenario["overlays"] = {
+            "EF": {"enabled": True},
+            "BCC": {"enabled": True},
+        }
+        scenario["tags"] = {
+            "BCC": {
+                "model_eligible": False,
+                "cecl_level": True,
+                "cecl_module": "Overlay",
+                "cecl_priority": 100,
+                "include": {
+                    "field": "subsector",
+                    "op": "has_token",
+                    "value": "Business Credit Center",
+                },
+                "assign": {
+                    "model_module": "Overlay",
+                    "model_portfolio": "BCC",
+                },
+            }
+        }
+        exceptions: list[dict] = []
+        tagged, _ = apply_tags(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "subsector": "Business Credit Center",
+                        "balance": 100.0,
+                        "risk_rating": 6,
+                        "model_module": "Overlay",
+                        "model_portfolio": "EF",
+                        "cecl_portfolio": "EF",
+                    }
+                ]
+            ),
+            scenario,
+            {},
+            exceptions,
+        )
+        routed = assign_primary_modules(tagged, scenario, exceptions)
+        resolved = resolve_cecl_level_tags(
+            routed, scenario, exceptions
+        )
+
+        self.assertEqual(resolved.at[0, CECL_LEVEL_TAG_FIELD], "BCC")
+        self.assertEqual(resolved.at[0, "model_portfolio"], "EF")
+        conflicts = [
+            row
+            for row in exceptions
+            if row["code"] == "TAG_ASSIGNMENT_CONFLICT"
+        ]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["source"], "BCC")
+        self.assertEqual(conflicts[0]["field"], "model_portfolio")
+        self.assertEqual(conflicts[0]["details"], "conflict_count=1")
 
     def test_cecl_level_resolver_preserves_bypasses_and_legacy_fallback(self):
         tagged = self._minimal_scenario()
