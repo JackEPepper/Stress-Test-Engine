@@ -19,6 +19,7 @@ DEFAULT_Z_SCORE_THRESHOLD = 2.0
 CECL_LEVEL_TAG_FIELD = "cecl_level_tag"
 CANONICAL_BUCKETS = ("Pass", "Special Mention", "Substandard")
 VALID_BUCKETS = frozenset((*CANONICAL_BUCKETS, "Unknown"))
+HISTORY_SKIP_TOKENS = frozenset({"n/a", "#n/a"})
 EFFECTIVE_RESERVE_FIELD = "cecl_effective_reserve_base"
 RESERVE_BASIS_METHOD_FIELD = "cecl_reserve_basis_method"
 INVALID_BALANCE_COUNT_FIELD = "_cecl_invalid_balance_count"
@@ -106,6 +107,7 @@ AUDIT_COLUMNS = [
     "source",
     "reserve_field",
     "weight",
+    "effective_weight",
     "observation_grain",
     "observation_count",
     "included_observation_count",
@@ -366,6 +368,7 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
     required = {str(value) for value in source_spec.get("required_columns", [])}
     numeric = {str(value) for value in source_spec.get("numeric_columns", [])}
     strings = {str(value) for value in source_spec.get("string_columns", [])}
+    dates = {str(value) for value in source_spec.get("date_columns", [])}
     expected = {tag_field, period_field, bucket_field, ratio_field}
     missing_aliases = sorted(expected - canonical)
     missing_required = sorted(expected - required)
@@ -385,6 +388,10 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
         raise ValueError(
             "The CECL historical ratio field must be numeric; missing: "
             f"{', '.join(missing_numeric)}."
+        )
+    if ratio_field in dates:
+        raise ValueError(
+            "The CECL historical ratio field cannot also be a date column."
         )
     if missing_strings:
         raise ValueError(
@@ -766,8 +773,9 @@ def build_cecl_reserve_basis(
                     )
                 )
 
+        _apply_effective_period_weights(selected, group_audit)
         for period, values in selected:
-            if values["status"] == "available":
+            if values["status"] in {"available", "skipped"}:
                 continue
             code = str(values.get("exception_code") or "CECL_BASIS_PERIOD_UNAVAILABLE")
             # Empty current cells are retained so a later stressed migration
@@ -807,7 +815,12 @@ def build_cecl_reserve_basis(
             effective.loc[group.index] = direct_values
 
         unavailable = [
-            values for _, values in selected if values["status"] != "available"
+            values for _, values in selected if values["status"] == "unavailable"
+        ]
+        skipped_periods = [
+            period
+            for period, values in selected
+            if values["status"] == "skipped"
         ]
         if basis_invalid_balance_count:
             ratio = np.nan
@@ -848,8 +861,9 @@ def build_cecl_reserve_basis(
                 code = "CECL_BASIS_RESULT_NONFINITE"
         else:
             ratio = _finite_fsum(
-                period["weight"] * values["period_reserve_ratio"]
-                for period, values in selected
+                row["effective_weight"] * values["period_reserve_ratio"]
+                for (_, values), row in zip(selected, group_audit)
+                if values["status"] == "available"
             )
             reserve = group_balance * ratio
             if np.isfinite(ratio) and np.isfinite(reserve):
@@ -862,6 +876,29 @@ def build_cecl_reserve_basis(
                 status = "unavailable"
                 code = "CECL_BASIS_RESULT_NONFINITE"
                 effective.loc[group.index] = np.nan
+
+        if status == "available" and skipped_periods:
+            skipped_names = ", ".join(
+                str(period["name"]) for period in skipped_periods
+            )
+            record_exception(
+                exceptions,
+                "WARNING",
+                "cecl",
+                "CECL_HISTORY_RATIO_SKIPPED_REWEIGHTED",
+                "An N/A historical CECL ratio cell was skipped and the remaining period weights for its tag and bucket were normalized to 100%.",
+                portfolio=portfolio,
+                bucket=bucket_text,
+                field=str(
+                    historical.get(
+                        "ratio_field", "historical_cecl_ratio"
+                    )
+                ),
+                details=(
+                    f"cecl_level_tag={_level_tag_key(cecl_level_tag)}; "
+                    f"skipped_periods={skipped_names}"
+                ),
+            )
 
         ratio_rows.append(
             {
@@ -1345,6 +1382,12 @@ def _prepare_history(
         sort=False,
     ):
         raw_ratio = group[ratio_field].iloc[0]
+        if _is_history_skip_token(raw_ratio):
+            lookup[key] = {
+                "status": "skipped",
+                "exception_code": "",
+            }
+            continue
         ratio = to_number(raw_ratio, np.nan)
         if (
             isinstance(raw_ratio, (bool, np.bool_))
@@ -1423,6 +1466,8 @@ def _historical_period_values(
         return _unavailable_period(
             "CECL_HISTORY_TAG_BUCKET_PERIOD_MISSING", current_bucket_balance
         )
+    if item.get("status") == "skipped":
+        return _skipped_period(current_bucket_balance)
     if item.get("status") != "available":
         return _unavailable_period(
             str(item.get("exception_code") or "CECL_HISTORY_RATIO_INVALID"),
@@ -1471,6 +1516,60 @@ def _unavailable_period(code: str, balance: float) -> Dict[str, Any]:
     }
 
 
+def _skipped_period(balance: float) -> Dict[str, Any]:
+    return {
+        "observation_count": 1,
+        "included_observation_count": 0,
+        "excluded_observation_count": 1,
+        "missing_reserve_count": 0,
+        "balance": balance,
+        "reserve": np.nan,
+        "raw_reserve_ratio": np.nan,
+        "raw_mean_reserve_ratio": np.nan,
+        "raw_std_reserve_ratio": np.nan,
+        "period_reserve_ratio": np.nan,
+        "status": "skipped",
+        "exception_code": "",
+    }
+
+
+def _apply_effective_period_weights(
+    selected: List[tuple[Dict[str, Any], Dict[str, Any]]],
+    audit_rows: List[Dict[str, Any]],
+) -> None:
+    unavailable = any(
+        values.get("status") == "unavailable" for _, values in selected
+    )
+    retained_weight = _finite_fsum(
+        period["weight"]
+        for period, values in selected
+        if values.get("status") == "available"
+    )
+    can_normalize = (
+        not unavailable
+        and np.isfinite(retained_weight)
+        and retained_weight > 0
+    )
+    for (period, values), row in zip(selected, audit_rows):
+        period_status = values.get("status")
+        if period_status == "skipped":
+            effective_weight = 0.0
+            component = 0.0
+        elif not can_normalize:
+            effective_weight = np.nan
+            component = np.nan
+        elif period_status == "available":
+            effective_weight = float(period["weight"]) / retained_weight
+            component = (
+                effective_weight * float(values["period_reserve_ratio"])
+            )
+        else:
+            effective_weight = np.nan
+            component = np.nan
+        row["effective_weight"] = effective_weight
+        row["weighted_ratio_component"] = component
+
+
 def _audit_row(
     portfolio: Any,
     cecl_level_tag: Any,
@@ -1501,6 +1600,7 @@ def _audit_row(
         "source": source,
         "reserve_field": reserve_field,
         "weight": weight,
+        "effective_weight": np.nan,
         "observation_grain": observation_grain,
         **values,
         "invalid_balance_count": invalid_balance_count,
@@ -1678,6 +1778,12 @@ def _normalized_portfolios(values: pd.Series) -> pd.Series:
 
 def _period_key(value: Any) -> str:
     return "" if pd.isna(value) else str(value).strip()
+
+
+def _is_history_skip_token(value: Any) -> bool:
+    if pd.isna(value):
+        return False
+    return str(value).strip().casefold() in HISTORY_SKIP_TOKENS
 
 
 def _finite_number(value: Any, path: str) -> float:

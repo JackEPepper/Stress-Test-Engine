@@ -13,6 +13,9 @@ import pandas as pd
 from .utils import coerce_numeric_frame, hash_file, json_safe, resolve_path, sort_frame
 
 
+_PRESERVED_NUMERIC_TOKEN = object()
+
+
 @dataclass
 class LoadedTable:
     """Container for one loaded input plus audit metadata."""
@@ -37,17 +40,88 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
     if not rename:
         raise ValueError(f"Input source '{name}' must define column_aliases for the columns it imports.")
     source_for_canonical = {canonical: source for source, canonical in rename.items()}
+    raw_preserved_numeric_tokens = spec.get(
+        "_preserve_numeric_tokens", {}
+    )
+    preserved_numeric_tokens = (
+        {
+            str(field): {
+                str(token).strip().casefold() for token in tokens
+            }
+            for field, tokens in raw_preserved_numeric_tokens.items()
+        }
+        if isinstance(raw_preserved_numeric_tokens, Mapping)
+        else {}
+    )
+    if preserved_numeric_tokens:
+        if str(read_options.get("engine", "")).strip().casefold() == "pyarrow":
+            raise ValueError(
+                f"Input source '{name}' cannot use the pyarrow CSV engine "
+                "when preserved numeric tokens are configured."
+            )
+        date_fields = {str(field) for field in spec.get("date_columns", [])}
+        date_conflicts = sorted(set(preserved_numeric_tokens) & date_fields)
+        if date_conflicts:
+            raise ValueError(
+                f"Input source '{name}' cannot parse preserved numeric token "
+                "fields as dates: "
+                f"{', '.join(date_conflicts)}"
+            )
+        configured_converters = read_options.get("converters")
+        if configured_converters is None:
+            converters: Dict[Any, Any] = {}
+        elif isinstance(configured_converters, Mapping):
+            converters = dict(configured_converters)
+        else:
+            raise ValueError(
+                f"Input source '{name}' read_options.converters must be an object."
+            )
+        for field, tokens in preserved_numeric_tokens.items():
+            source_field = source_for_canonical.get(field, field)
+            downstream = converters.get(source_field)
+            if downstream is not None and not callable(downstream):
+                raise ValueError(
+                    f"Input source '{name}' converter for '{source_field}' must be callable."
+                )
+            # A converter sees the raw cell before pandas' default or custom
+            # NA recognition. Preserve only the configured skip tokens while
+            # retaining the ordinary missing-value behavior of every other
+            # column in the file.
+            converters[source_field] = _preserved_numeric_token_converter(
+                tokens, downstream
+            )
+        read_options["converters"] = converters
     string_columns = [str(field) for field in spec.get("string_columns", [])]
-    if string_columns:
-        source_string_columns = [source_for_canonical.get(field, field) for field in string_columns]
-        configured_dtype = read_options.get("dtype")
-        if configured_dtype is None:
+    preserved_source_fields = {
+        source_for_canonical.get(field, field)
+        for field in preserved_numeric_tokens
+    }
+    source_string_columns = [
+        source_for_canonical.get(field, field)
+        for field in string_columns
+        if source_for_canonical.get(field, field)
+        not in preserved_source_fields
+    ]
+    configured_dtype = read_options.get("dtype")
+    if configured_dtype is None:
+        if source_string_columns:
             read_options["dtype"] = {field: "string" for field in source_string_columns}
-        elif isinstance(configured_dtype, Mapping):
-            merged_dtype = dict(configured_dtype)
-            for field in source_string_columns:
-                merged_dtype.setdefault(field, "string")
-            read_options["dtype"] = merged_dtype
+    elif isinstance(configured_dtype, Mapping):
+        merged_dtype = dict(configured_dtype)
+        for field in source_string_columns:
+            merged_dtype.setdefault(field, "string")
+        for field in preserved_source_fields:
+            merged_dtype.pop(field, None)
+        read_options["dtype"] = merged_dtype
+    elif preserved_source_fields:
+        # A scalar dtype cannot exclude the converter-owned ratio column.
+        # Expand it over imported source fields so pandas does not apply both
+        # a dtype and a converter to that column.
+        read_options["dtype"] = {
+            field: configured_dtype
+            for field in rename
+            if field not in preserved_source_fields
+        }
     frames: List[pd.DataFrame] = []
     file_row_counts: List[int] = []
     for path in paths:
@@ -89,12 +163,24 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
             df[field] = converted
 
     numeric_fields = set(spec.get("numeric_columns", []))
+    preserved_masks: Dict[str, pd.Series] = {}
     for field in sorted(numeric_fields):
         if field not in df.columns:
             continue
         original = df[field]
+        preserve_mask = pd.Series(False, index=df.index)
+        if field in preserved_numeric_tokens:
+            preserve_mask = original.map(
+                lambda value: value is _PRESERVED_NUMERIC_TOKEN
+            )
+            preserved_masks[field] = preserve_mask
         converted = coerce_numeric_frame(df[[field]], [field])[field]
-        invalid = original.notna() & original.astype(str).str.strip().ne("") & converted.isna()
+        invalid = (
+            original.notna()
+            & original.astype(str).str.strip().ne("")
+            & converted.isna()
+            & ~preserve_mask
+        )
         if invalid.any():
             coercion_issues.extend(
                 _coercion_issue_rows(
@@ -106,6 +192,11 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
                 )
             )
     df = coerce_numeric_frame(df, numeric_fields)
+    for field, preserve_mask in preserved_masks.items():
+        if not preserve_mask.any():
+            continue
+        df[field] = df[field].astype(object)
+        df.loc[preserve_mask, field] = "N/A"
     df = df.reset_index(drop=True)
     df["_source_row"] = np.arange(1, len(df) + 1)
 
@@ -125,6 +216,20 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
         profile=profile,
         coercion_issues=coercion_issues,
     )
+
+
+def _preserved_numeric_token_converter(
+    tokens: set[str], downstream: Any = None
+):
+    """Keep configured raw numeric sentinels ahead of pandas NA parsing."""
+
+    def convert(value: Any) -> Any:
+        text = str(value).strip()
+        if text.casefold() in tokens:
+            return _PRESERVED_NUMERIC_TOKEN
+        return downstream(value) if downstream is not None else value
+
+    return convert
 
 
 def _input_paths(name: str, spec: Mapping[str, Any], base_dir: Path) -> List[Path]:
@@ -266,6 +371,14 @@ def load_inputs(scenario: Mapping[str, Any], base_dir: Path) -> Dict[str, Loaded
     )
     for name, spec in inputs.get("sources", {}).items():
         source_spec = dict(spec)
+        if str(name) == optional_history_source:
+            source_spec["_preserve_numeric_tokens"] = {
+                str(
+                    historical.get(
+                        "ratio_field", "historical_cecl_ratio"
+                    )
+                ).strip(): ["N/A", "#N/A"]
+            }
         key = source_spec.get("key")
         if key:
             source_spec["string_columns"] = list(dict.fromkeys([*source_spec.get("string_columns", []), key]))

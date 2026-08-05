@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from stress_engine.borrower import build_borrowers, record_identity_data_issues
 from stress_engine.cecl import (
     attach_cecl_reserve_basis,
     build_cecl_reserve_basis,
+    cecl_history_frame,
 )
 from stress_engine.config import validate_scenario
 from stress_engine.engine import StressEngine
@@ -579,7 +581,16 @@ class CeclReserveBasisTest(unittest.TestCase):
             ignore_index=True,
         )
         results["borrower_id"] = ["CRE-1", "CI-1"]
-        invalid_values = (-1.0, 1.01, np.inf, np.nan, True)
+        invalid_values = (
+            -1.0,
+            1.01,
+            np.inf,
+            np.nan,
+            True,
+            "",
+            "NA",
+            "not-a-ratio",
+        )
         for value in invalid_values:
             with self.subTest(historical_cecl_ratio=value):
                 exceptions: list[dict] = []
@@ -618,6 +629,89 @@ class CeclReserveBasisTest(unittest.TestCase):
         ]
         self.assertEqual(set(history["period_reserve_ratio"]), {0.02, 0.04})
 
+    def test_na_history_ratio_skips_exact_cell_and_reweights(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        results = pd.concat(
+            [
+                _commercial_frame([100.0], [10.0], bucket="Pass"),
+                _commercial_frame(
+                    [100.0], [20.0], bucket="Special Mention"
+                ),
+            ],
+            ignore_index=True,
+        )
+        results["borrower_id"] = ["P1", "SM1"]
+        exceptions: list[dict] = []
+
+        basis = _build_basis(
+            results,
+            scenario,
+            _history_period("CRE", "2026Q1", "N/A", 0.20, 0.30)
+            + _history_period("CRE", "2025Q4", 0.30, 0.30, 0.30),
+            exceptions,
+        )
+
+        ratios = basis.ratios.set_index("bucket")["reserve_ratio"]
+        self.assertAlmostEqual(float(ratios["Pass"]), 0.20)
+        self.assertAlmostEqual(
+            float(ratios["Special Mention"]), (0.20 + 0.20 + 0.30) / 3
+        )
+        pass_audit = basis.audit[basis.audit["bucket"] == "Pass"].set_index(
+            "period"
+        )
+        self.assertTrue(pass_audit["weight"].eq(1 / 3).all())
+        self.assertAlmostEqual(
+            float(pass_audit.at["2026Q2", "effective_weight"]), 0.5
+        )
+        self.assertEqual(
+            float(pass_audit.at["2026Q1", "effective_weight"]), 0.0
+        )
+        self.assertAlmostEqual(
+            float(pass_audit.at["2025Q4", "effective_weight"]), 0.5
+        )
+        self.assertEqual(pass_audit.at["2026Q1", "status"], "skipped")
+        self.assertEqual(
+            float(pass_audit.at["2026Q1", "weighted_ratio_component"]),
+            0.0,
+        )
+        self.assertTrue(pass_audit["basis_status"].eq("available").all())
+        sm_audit = basis.audit[
+            basis.audit["bucket"] == "Special Mention"
+        ]
+        self.assertTrue(sm_audit["effective_weight"].eq(1 / 3).all())
+        warnings = [
+            row
+            for row in exceptions
+            if row["code"] == "CECL_HISTORY_RATIO_SKIPPED_REWEIGHTED"
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["severity"], "WARNING")
+        self.assertEqual(warnings[0]["portfolio"], "CRE")
+        self.assertEqual(warnings[0]["bucket"], "Pass")
+        self.assertIn("cecl_level_tag=CRE", warnings[0]["details"])
+        self.assertIn("skipped_periods=2026Q1", warnings[0]["details"])
+
+    def test_all_na_history_ratios_reweight_to_current_quarter(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        results = _commercial_frame([100.0], [10.0])
+
+        basis = _build_basis(
+            results,
+            scenario,
+            _history_period("CRE", "2026Q1", "N/A")
+            + _history_period("CRE", "2025Q4", "#N/A"),
+        )
+
+        passed = basis.ratios[basis.ratios["bucket"] == "Pass"].iloc[0]
+        self.assertEqual(passed["status"], "available")
+        self.assertAlmostEqual(float(passed["reserve_ratio"]), 0.10)
+        audit = basis.audit[basis.audit["bucket"] == "Pass"].set_index(
+            "period"
+        )
+        self.assertEqual(float(audit.at["2026Q2", "effective_weight"]), 1.0)
+        self.assertEqual(float(audit.at["2026Q1", "effective_weight"]), 0.0)
+        self.assertEqual(float(audit.at["2025Q4", "effective_weight"]), 0.0)
+
     def test_history_risk_ladder_must_not_decrease(self):
         scenario = _with_history_source(_scenario(_weighted_basis()))
         results = _commercial_frame([100.0], [10.0])
@@ -627,6 +721,25 @@ class CeclReserveBasisTest(unittest.TestCase):
             results,
             scenario,
             _history_period("CRE", "2026Q1", 0.03, 0.02, 0.04)
+            + _history_period("CRE", "2025Q4", 0.04, 0.05, 0.06),
+            exceptions,
+        )
+
+        self.assertTrue(basis.ratios["status"].eq("unavailable").all())
+        self.assertIn(
+            "CECL_HISTORY_RATIO_LADDER_INVALID",
+            {row["code"] for row in exceptions},
+        )
+
+    def test_skipped_ladder_cell_does_not_hide_a_decrease(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        results = _commercial_frame([100.0], [10.0])
+        exceptions: list[dict] = []
+
+        basis = _build_basis(
+            results,
+            scenario,
+            _history_period("CRE", "2026Q1", 0.03, "N/A", 0.02)
             + _history_period("CRE", "2025Q4", 0.04, 0.05, 0.06),
             exceptions,
         )
@@ -749,6 +862,7 @@ class CeclReserveBasisTest(unittest.TestCase):
             ("column_aliases", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["column_aliases"].pop("historical_cecl_ratio")),
             ("string_columns", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["string_columns"].remove("period")),
             ("numeric_columns", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["numeric_columns"].remove("historical_cecl_ratio")),
+            ("date_columns", lambda scenario: scenario["inputs"]["sources"]["cecl_history"].update(date_columns=["historical_cecl_ratio"])),
             ("required_columns", lambda scenario: scenario["inputs"]["sources"]["cecl_history"]["required_columns"].remove("cecl_tag")),
         )
         for location, mutate in mutations:
@@ -1023,6 +1137,94 @@ class CeclReserveBasisTest(unittest.TestCase):
         # column_aliases maps canonical engine names to vendor source headers;
         # validation must inspect the keys rather than requiring names to match.
         validate_scenario(scenario)
+
+    def test_csv_loader_preserves_only_explicit_na_skip_tokens(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        scenario["inputs"]["identity"]["path"] = "identity.csv"
+        scenario["inputs"]["sources"]["cecl_history"]["path"] = (
+            "history.csv"
+        )
+        converter_calls: list[str] = []
+
+        def ratio_converter(value: object) -> object:
+            converter_calls.append(str(value))
+            return value
+
+        scenario["inputs"]["sources"]["cecl_history"]["read_options"] = {
+            "na_values": ["N/A", "#N/A"],
+            "dtype": "string",
+            "converters": {
+                "historical_cecl_ratio": ratio_converter
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "identity.csv").write_text(
+                "borrower_id,balance,cecl_portfolio,cecl_reserve\n"
+                "B1,100,CRE,10\n",
+                encoding="utf-8",
+            )
+            (directory / "history.csv").write_text(
+                "cecl_tag,period,risk_bucket,historical_cecl_ratio\n"
+                "CRE,2026Q1,Pass,N/A\n"
+                "CRE,2026Q1,Special Mention,NA\n"
+                "CRE,2026Q1,Substandard,0.30\n"
+                "CRE,2025Q4,Pass,0.40\n"
+                "CRE,2025Q4,Special Mention,0.40\n"
+                "CRE,2025Q4,Substandard,#N/A\n"
+                "CRE,NA,Pass,0.99\n",
+                encoding="utf-8",
+            )
+            validate_scenario(scenario)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                loaded = load_inputs(scenario, directory)
+
+        self.assertNotIn("N/A", converter_calls)
+        self.assertNotIn("#N/A", converter_calls)
+        self.assertIn("0.40", converter_calls)
+        self.assertFalse(
+            any(
+                "converter and dtype" in str(item.message).casefold()
+                for item in caught
+            )
+        )
+
+        history = cecl_history_frame(scenario, loaded)
+        self.assertIsNotNone(history)
+        q1 = history[history["period"].eq("2026Q1")].set_index(
+            "risk_bucket"
+        )
+        self.assertEqual(q1.at["Pass", "historical_cecl_ratio"], "N/A")
+        self.assertTrue(
+            pd.isna(q1.at["Special Mention", "historical_cecl_ratio"])
+        )
+        q4 = history[history["period"].eq("2025Q4")].set_index(
+            "risk_bucket"
+        )
+        self.assertEqual(
+            q4.at["Substandard", "historical_cecl_ratio"], "N/A"
+        )
+        self.assertEqual(int(history["period"].isna().sum()), 1)
+        issues = loaded["cecl_history"].coercion_issues
+        self.assertEqual(sum(issue["count"] for issue in issues), 1)
+
+        basis = build_cecl_reserve_basis(
+            _commercial_frame([100.0], [10.0]),
+            scenario,
+            [],
+            history=history,
+        )
+        passed = basis.ratios[basis.ratios["bucket"] == "Pass"].iloc[0]
+        special = basis.ratios[
+            basis.ratios["bucket"] == "Special Mention"
+        ].iloc[0]
+        self.assertAlmostEqual(float(passed["reserve_ratio"]), 0.25)
+        self.assertEqual(special["status"], "unavailable")
+        self.assertEqual(
+            special["exception_code"], "CECL_HISTORY_RATIO_INVALID"
+        )
 
     def test_history_normalizes_validated_weights_and_join_keys_at_runtime(self):
         reserve_basis = _weighted_basis()
@@ -1331,6 +1533,58 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             float(base_pass["proforma_cecl_reserve"]), 4.0
         )
         self.assertAlmostEqual(float(base_pass["reserve_ratio"]), 0.02)
+
+    def test_reweighted_history_remains_available_in_public_totals(self):
+        scenario = _with_history_source(_scenario(_weighted_basis()))
+        results = _commercial_frame([100.0], [10.0])
+        exceptions: list[dict] = []
+        basis = _build_basis(
+            results,
+            scenario,
+            _history_period("CRE", "2026Q1", "N/A", 0.20, 0.30)
+            + _history_period("CRE", "2025Q4", 0.30, 0.30, 0.30),
+            exceptions,
+        )
+        buckets = build_cecl_bucket_summary(
+            results, pd.DataFrame(), scenario
+        )
+
+        cecl = build_cecl_summary(
+            results, buckets, scenario, exceptions, basis
+        )
+
+        for level in ("Base", "S1", "S2"):
+            with self.subTest(level=level):
+                pass_bucket = cecl[
+                    (cecl["portfolio"] == "CRE")
+                    & (cecl["stress_level"] == level)
+                    & (cecl["bucket"] == "Pass")
+                ].iloc[0]
+                portfolio_total = cecl[
+                    (cecl["portfolio"] == "CRE")
+                    & (cecl["stress_level"] == level)
+                    & (cecl["bucket"] == "Total")
+                ].iloc[0]
+                aggregate = cecl[
+                    (cecl["portfolio"] == "Aggregate")
+                    & (cecl["stress_level"] == level)
+                ].iloc[0]
+                self.assertEqual(
+                    pass_bucket["cecl_reserve_status"], "available"
+                )
+                self.assertAlmostEqual(
+                    float(pass_bucket["proforma_cecl_reserve"]), 20.0
+                )
+                self.assertAlmostEqual(
+                    float(pass_bucket["reserve_ratio"]), 0.20
+                )
+                for row in (portfolio_total, aggregate):
+                    self.assertEqual(
+                        row["cecl_reserve_status"], "available"
+                    )
+                    self.assertAlmostEqual(
+                        float(row["proforma_cecl_reserve"]), 20.0
+                    )
 
     def test_aggregated_invalid_balance_cannot_become_zero_balance_cecl(self):
         scenario = _scenario(_weighted_basis())

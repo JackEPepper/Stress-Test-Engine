@@ -310,7 +310,11 @@ parentheses for negatives. Nonblank values that cannot be converted become
 missing and are reported in the exception log.
 
 Leave unavailable values blank. Do not use zero as a missing-value code unless
-the relevant aggregation explicitly says `treat_zero_as_missing`.
+the relevant aggregation explicitly says `treat_zero_as_missing`. The one
+exception is an intentionally unavailable CECL history ratio: enter `N/A` or
+`#N/A` so that the engine can distinguish a skipped historical cell from
+missing or malformed data. Recognition is case-insensitive and ignores
+surrounding whitespace; `NA` without the slash is not a skip token.
 
 ### Identity file: loans
 
@@ -348,7 +352,7 @@ tag, historical period, and modeled risk bucket:
 | `cecl_tag` | Exact scenario tag object key whose definition sets `cecl_level: true` |
 | `period` | Period name referenced by `reserve_basis.historical.periods` |
 | `risk_bucket` | `Pass`, `Special Mention`, or `Substandard` |
-| `historical_cecl_ratio` | Historical CECL reserve ratio, written as a decimal |
+| `historical_cecl_ratio` | Historical CECL reserve ratio, written as a decimal, or `N/A`/`#N/A` to skip and reweight that cell (case-insensitive; surrounding whitespace ignored) |
 
 Consumer and model-excluded tags such as ARR do not belong in this file.
 Duplicate tag-period-bucket rows are rejected. The example contains the full
@@ -820,12 +824,22 @@ the public CECL portfolio grain.
 Central tendency is applied only to the current-quarter loan population.
 Historical CSV ratios are authoritative values and are never z-score trimmed
 or divided by current balances. Duplicate configured tag-period-bucket rows are
-rejected. Missing, negative, invalid, nonfinite, or greater-than-100% configured
-history is not filled or reweighted: the affected tag/bucket basis is
-unavailable. Active-tag history rows must use `Pass`, `Special Mention`, or
-`Substandard`; other bucket names are rejected. Extra tags and unconfigured
-periods do not affect current calculations. The example blends the current
-quarter and two prior tag/bucket ratios at one-third each.
+rejected. A ratio written as `N/A` or `#N/A` (case-insensitive, after trimming
+surrounding whitespace) skips only that historical tag/bucket/period cell. The
+remaining current and historical configured weights for that tag/bucket are
+normalized to sum to one. Missing rows, blank cells, `NA`, negative, malformed,
+nonfinite, or greater-than-100% values remain errors: they are not skipped or
+reweighted, and the affected tag/bucket basis is unavailable. The current
+period cannot be skipped. Active-tag history rows must use `Pass`, `Special
+Mention`, or `Substandard`; other bucket names are rejected. Extra tags and
+unconfigured periods do not affect current calculations. The example blends
+the current quarter and two prior tag/bucket ratios at one-third each before any
+cell-local reweighting.
+
+Each successfully reweighted CECL tag/bucket produces one `WARNING` with code
+`CECL_HISTORY_RATIO_SKIPPED_REWEIGHTED`; its details list every skipped period
+for that cell. This makes intentional skip-and-reweight decisions visible in
+`exception_log.csv` without marking the resulting basis unavailable.
 
 Within each tag and period, supplied ratios must not decrease from `Pass` to
 `Special Mention` to `Substandard`. The final applied ratios are checked again
@@ -853,19 +867,27 @@ Each commercial tag/bucket cell blends the selected current-quarter ratio with
 the historical ratios supplied for that exact tag and bucket:
 
 ```text
+retained weight
+  = sum(configured weights for the current period and non-skipped history)
+
+effective period weight
+  = configured period weight / retained weight
+
 effective tag/bucket ratio
-  = current weight x selected current tag/bucket ratio
-  + sum(historical period weight
-        x supplied historical ratio for the same tag/bucket)
+  = sum(effective period weight x available period ratio)
 ```
 
 The effective ratio is applied to that tag's balance in the applicable Base or
 stressed risk bucket. Historical balances, loans, and reserve dollars are not
 reconstructed. If a tag/bucket has no current observation while the current
 period has positive weight, its blended ratio is unavailable; history weights
-are not renormalized. A zero report balance for that cell remains
-not-applicable and does not block otherwise valid CECL totals, while a positive
-Base or stressed balance makes the affected result unavailable.
+are not renormalized around missing or invalid data. Explicit `N/A`/`#N/A`
+historical cells are the sole reweighting exception. If every configured
+historical cell for a tag/bucket is explicitly skipped, the available current
+quarter receives an effective weight of one. A zero report balance for that
+cell remains not-applicable and does not block otherwise valid CECL totals,
+while a positive Base or stressed balance makes the affected result
+unavailable.
 
 `Unknown` is intentionally outside the supplied historical risk ladder. A
 commercial row with an unknown base risk bucket keeps its current in-place
@@ -884,9 +906,11 @@ Central tendency uses borrower-grain observations within each resolved current
 CECL-level tag/base bucket, including targeted runs. This avoids silently
 changing the estimator merely because output grain changes from borrower to
 loan when routing is the same. `cecl_basis_summary.csv` records each current and
-historical component's CECL tag, risk bucket, source, method, period, weight,
-observation and current-period trimming counts, period ratio, weighted
-component, final effective ratio, availability status, and exception code.
+historical component's CECL tag, risk bucket, source, method, period, configured
+`weight`, normalized `effective_weight`, observation and current-period trimming
+counts, period ratio, weighted component, final effective ratio, availability
+status, and exception code. Explicitly skipped history rows have status
+`skipped`, effective weight zero, and weighted component zero.
 Each tag/bucket has one current-period audit row and one direct-ratio row for
 each configured historical period. Any balance and implied reserve shown on a
 history audit row are explanatory only; the supplied ratio is never derived by
@@ -1066,7 +1090,7 @@ files' aggregate balances are not expected to match.
 | `consumer_summary.csv` | Consumer PD, LGD, EL, and reserve summary |
 | `migration_summary.csv` | Commercial and overlay balance by portfolio, level, and bucket |
 | `overlay_summary.csv` | Overlay sources, weights, source ratios, and final stressed ratios |
-| `cecl_basis_summary.csv` | CECL period weights, central-tendency trimming, effective ratios, and availability controls |
+| `cecl_basis_summary.csv` | CECL configured/effective period weights, skipped history, central-tendency trimming, effective ratios, and availability controls |
 | `cecl_summary.csv` | Base and stressed pro forma reserve dollars and ratios |
 | `scenario_diff.csv` | Optional prior-scenario and marginal-variable comparison |
 | `metadata.json` | Scenario/input hashes, runtime versions, exception counts, and report hashes |
