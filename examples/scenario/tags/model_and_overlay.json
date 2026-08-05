@@ -2,6 +2,8 @@
   "tags": {
     "CRE_Model": {
       "model_eligible": true,
+      "cecl_level": true,
+      "cecl_module": "CRE",
       "include": {
         "any": [
           {
@@ -118,6 +120,8 @@
     },
     "Equipment_Finance_Overlay": {
       "model_eligible": false,
+      "cecl_level": true,
+      "cecl_module": "Overlay",
       "include": [
         {
           "field": "subsector",
@@ -132,6 +136,8 @@
     },
     "Business_Credit_Center_Overlay": {
       "model_eligible": false,
+      "cecl_level": true,
+      "cecl_module": "Overlay",
       "include": [
         {
           "field": "subsector",

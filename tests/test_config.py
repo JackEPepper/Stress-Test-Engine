@@ -11,7 +11,12 @@ import pandas as pd
 from stress_engine.borrower import build_borrowers, build_source_reconciliation, enrich_borrowers
 from stress_engine.config import load_scenario, validate_scenario
 from stress_engine.io import load_inputs, read_table
-from stress_engine.tagging import apply_tags, assign_primary_modules
+from stress_engine.tagging import (
+    CECL_LEVEL_TAG_FIELD,
+    apply_tags,
+    assign_primary_modules,
+    resolve_cecl_level_tags,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -366,6 +371,310 @@ class ScenarioConfigTest(unittest.TestCase):
                 scenario,
                 {},
                 [],
+            )
+
+    def test_cecl_level_tag_configuration_is_strict(self):
+        cases = [
+            (
+                {"cecl_level": "true", "cecl_module": "C&I"},
+                {},
+                "cecl_level must be a JSON boolean",
+            ),
+            (
+                {"cecl_level": True},
+                {},
+                "must define a nonblank cecl_module",
+            ),
+            (
+                {"cecl_level": True, "cecl_module": "Consumer"},
+                {"Consumer": {"enabled": False}},
+                "cannot target Consumer",
+            ),
+            (
+                {
+                    "cecl_level": True,
+                    "cecl_module": "C&I",
+                    "exclude_from_model": True,
+                    "include": {
+                        "field": "category",
+                        "op": "eq",
+                        "value": "ARR",
+                    },
+                },
+                {"C&I": {"enabled": False}},
+                "cannot be both cecl_level and exclude_from_model",
+            ),
+            (
+                {"cecl_level": False, "cecl_module": "C&I"},
+                {"C&I": {"enabled": False}},
+                "cecl_module requires cecl_level to be true",
+            ),
+            (
+                {"cecl_level": True, "cecl_module": "Typo"},
+                {},
+                "not a configured module or Overlay",
+            ),
+        ]
+        for spec, modules, message in cases:
+            with self.subTest(spec=spec):
+                scenario = self._minimal_scenario()
+                scenario["tags"] = {"CECL Segment": spec}
+                scenario["modules"] = modules
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_scenario(scenario)
+
+        for module, modules in (
+            ("C&I", {"C&I": {"enabled": False}}),
+            ("Overlay", {}),
+        ):
+            with self.subTest(valid_module=module):
+                scenario = self._minimal_scenario()
+                scenario["tags"] = {
+                    "CECL Segment": {
+                        "cecl_level": True,
+                        "cecl_module": module,
+                    }
+                }
+                scenario["modules"] = modules
+                validate_scenario(scenario)
+
+        for name in ("", "   ", " CECL Segment "):
+            with self.subTest(invalid_tag_name=repr(name)):
+                scenario = self._minimal_scenario()
+                scenario["tags"] = {
+                    name: {
+                        "cecl_level": True,
+                        "cecl_module": "Overlay",
+                    }
+                }
+                with self.assertRaisesRegex(
+                    ValueError, "nonblank|surrounding whitespace"
+                ):
+                    validate_scenario(scenario)
+
+    def test_cecl_level_tag_summary_fields_are_reported(self):
+        scenario = self._minimal_scenario()
+        scenario["tags"] = {
+            "Middle Market CECL": {
+                "model_eligible": False,
+                "cecl_level": True,
+                "cecl_module": "C&I",
+                "include": {
+                    "field": "sector",
+                    "op": "eq",
+                    "value": "Middle Market",
+                },
+            }
+        }
+        _, summary = apply_tags(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "sector": "Middle Market",
+                        "balance": 100.0,
+                    }
+                ]
+            ),
+            scenario,
+            {},
+            [],
+        )
+
+        row = summary.iloc[0]
+        self.assertTrue(bool(row["cecl_level"]))
+        self.assertEqual(row["cecl_module"], "C&I")
+
+    def test_cecl_level_resolver_uses_primary_module_scope(self):
+        scenario = self._minimal_scenario()
+        scenario["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        scenario["tags"] = {
+            "CRE Retail": {"cecl_level": True, "cecl_module": "CRE"},
+            "C&I Middle Market": {
+                "cecl_level": True,
+                "cecl_module": "C&I",
+            },
+        }
+        resolved = resolve_cecl_level_tags(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "primary_module": "CRE",
+                        "cecl_portfolio": "CRE",
+                        "tag_cre_retail": True,
+                        "tag_c_i_middle_market": True,
+                        "model_excluded": False,
+                        "risk_rating": 6,
+                    }
+                ]
+            ),
+            scenario,
+        )
+
+        self.assertEqual(resolved.at[0, CECL_LEVEL_TAG_FIELD], "CRE Retail")
+
+    def test_cecl_level_resolver_rejects_missing_and_ambiguous_matches(self):
+        scenario = self._minimal_scenario()
+        scenario["tags"] = {
+            "CRE One": {"cecl_level": True, "cecl_module": "CRE"},
+            "CRE Two": {"cecl_level": True, "cecl_module": "CRE"},
+        }
+        base = {
+            "borrower_id": "B1",
+            "primary_module": "CRE",
+            "model_excluded": False,
+            "risk_rating": 6,
+        }
+        with self.assertRaisesRegex(ValueError, "matched no CECL-level tag"):
+            resolve_cecl_level_tags(pd.DataFrame([base]), scenario)
+        with self.assertRaisesRegex(
+            ValueError, "matched multiple CECL-level tags"
+        ):
+            resolve_cecl_level_tags(
+                pd.DataFrame(
+                    [
+                        {
+                            **base,
+                            "tag_cre_one": True,
+                            "tag_cre_two": True,
+                        }
+                    ]
+                ),
+                scenario,
+            )
+
+    def test_cecl_level_resolver_preserves_bypasses_and_legacy_fallback(self):
+        tagged = self._minimal_scenario()
+        tagged["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        tagged["tags"] = {
+            "CRE One": {"cecl_level": True, "cecl_module": "CRE"}
+        }
+        resolved = resolve_cecl_level_tags(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "C1",
+                        "primary_module": "Consumer",
+                        "cecl_portfolio": "Consumer",
+                        "model_excluded": False,
+                    },
+                    {
+                        "borrower_id": "ARR1",
+                        "primary_module": pd.NA,
+                        "cecl_portfolio": "Sponsor and Specialty",
+                        "model_excluded": True,
+                    },
+                    {
+                        "borrower_id": "U1",
+                        "primary_module": pd.NA,
+                        "cecl_portfolio": "Unrouted",
+                        "model_excluded": False,
+                    },
+                ]
+            ),
+            tagged,
+        )
+        self.assertEqual(resolved.at[0, CECL_LEVEL_TAG_FIELD], "Consumer")
+        self.assertTrue(pd.isna(resolved.at[1, CECL_LEVEL_TAG_FIELD]))
+        self.assertTrue(pd.isna(resolved.at[2, CECL_LEVEL_TAG_FIELD]))
+
+        legacy = self._minimal_scenario()
+        legacy["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        legacy_resolved = resolve_cecl_level_tags(
+            pd.DataFrame(
+                [
+                    {
+                        "borrower_id": "B1",
+                        "primary_module": "C&I",
+                        "cecl_portfolio": " Middle Market ",
+                        "model_excluded": False,
+                        "risk_rating": 6,
+                    }
+                ]
+            ),
+            legacy,
+        )
+        self.assertEqual(
+            legacy_resolved.at[0, CECL_LEVEL_TAG_FIELD], "Middle Market"
+        )
+
+    def test_repeated_commercial_rows_require_tag_and_bucket_parity(self):
+        scenario = self._minimal_scenario()
+        scenario["tags"] = {
+            "C&I One": {"cecl_level": True, "cecl_module": "C&I"},
+            "C&I Two": {"cecl_level": True, "cecl_module": "C&I"},
+        }
+        common = {
+            "borrower_id": "B1",
+            "primary_module": "C&I",
+            "model_excluded": False,
+        }
+        with self.assertRaisesRegex(
+            ValueError, "different CECL-level tags"
+        ):
+            resolve_cecl_level_tags(
+                pd.DataFrame(
+                    [
+                        {
+                            **common,
+                            "risk_rating": 6,
+                            "tag_c_i_one": True,
+                            "tag_c_i_two": False,
+                        },
+                        {
+                            **common,
+                            "risk_rating": 6,
+                            "tag_c_i_one": False,
+                            "tag_c_i_two": True,
+                        },
+                    ]
+                ),
+                scenario,
+            )
+
+        with self.assertRaisesRegex(ValueError, "different base risk buckets"):
+            resolve_cecl_level_tags(
+                pd.DataFrame(
+                    [
+                        {
+                            **common,
+                            "risk_rating": 6,
+                            "tag_c_i_one": True,
+                            "tag_c_i_two": False,
+                        },
+                        {
+                            **common,
+                            "risk_rating": 7,
+                            "tag_c_i_one": True,
+                            "tag_c_i_two": False,
+                        },
+                    ]
+                ),
+                scenario,
+            )
+
+        legacy = self._minimal_scenario()
+        legacy["cecl"] = {"portfolio_field": "cecl_portfolio"}
+        with self.assertRaisesRegex(
+            ValueError, "different CECL-level tags"
+        ):
+            resolve_cecl_level_tags(
+                pd.DataFrame(
+                    [
+                        {
+                            **common,
+                            "risk_rating": 6,
+                            "cecl_portfolio": "Middle Market",
+                        },
+                        {
+                            **common,
+                            "risk_rating": 6,
+                            "cecl_portfolio": pd.NA,
+                        },
+                    ]
+                ),
+                legacy,
             )
 
     def test_non_model_eligible_tag_cannot_assign_stress_module(self):

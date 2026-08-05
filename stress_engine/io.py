@@ -274,7 +274,7 @@ def load_inputs(scenario: Mapping[str, Any], base_dir: Path) -> Dict[str, Loaded
         except FileNotFoundError:
             if str(name) != optional_history_source:
                 raise
-            # Portfolio history is commercial-only. Deferring a missing file
+            # CECL tag history is commercial-only. Deferring a missing file
             # lets Consumer-only runs proceed and lets mixed runs report the
             # commercial history component as unavailable in the CECL audit.
             continue

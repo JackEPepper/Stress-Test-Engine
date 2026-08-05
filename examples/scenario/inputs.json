@@ -39,21 +39,24 @@
         "type": "csv",
         "merge": false,
         "column_aliases": {
-          "cecl_portfolio": "cecl_portfolio",
+          "cecl_tag": "cecl_tag",
           "period": "period",
-          "historical_cecl_reserve": "historical_cecl_reserve"
+          "risk_bucket": "risk_bucket",
+          "historical_cecl_ratio": "historical_cecl_ratio"
         },
         "string_columns": [
-          "cecl_portfolio",
-          "period"
+          "cecl_tag",
+          "period",
+          "risk_bucket"
         ],
         "numeric_columns": [
-          "historical_cecl_reserve"
+          "historical_cecl_ratio"
         ],
         "required_columns": [
-          "cecl_portfolio",
+          "cecl_tag",
           "period",
-          "historical_cecl_reserve"
+          "risk_bucket",
+          "historical_cecl_ratio"
         ]
       },
       "financials": {

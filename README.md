@@ -163,9 +163,10 @@ smaller JSON files:
       "historical": {
         "enabled": true,
         "source": "cecl_history",
-        "portfolio_field": "cecl_portfolio",
+        "tag_field": "cecl_tag",
         "period_field": "period",
-        "reserve_field": "historical_cecl_reserve",
+        "bucket_field": "risk_bucket",
+        "ratio_field": "historical_cecl_ratio",
         "current_period": {"name": "2026Q2", "weight": 0.3333333333333333},
         "periods": [
           {"name": "2026Q1", "weight": 0.3333333333333333},
@@ -337,19 +338,21 @@ become operationally required when a tag, module, or report uses them.
 Tag definitions can reference any canonical identity field. The example checks
 both `tag_hint` and `tag_hint_2`, so either source column can route a borrower.
 
-### CECL history file: portfolio-period reserve dollars
+### CECL history file: tag/bucket reserve ratios
 
-`cecl_history.csv` is a long-form, non-merged input with one row per commercial
-CECL portfolio and historical period:
+`cecl_history.csv` is a long-form, non-merged input with one row per CECL-level
+tag, historical period, and modeled risk bucket:
 
 | Field | Purpose |
 |---|---|
-| `cecl_portfolio` | Exact current CECL portfolio name |
+| `cecl_tag` | Exact scenario tag object key whose definition sets `cecl_level: true` |
 | `period` | Period name referenced by `reserve_basis.historical.periods` |
-| `historical_cecl_reserve` | Historical portfolio-level CECL reserve dollars |
+| `risk_bucket` | `Pass`, `Special Mention`, or `Substandard` |
+| `historical_cecl_ratio` | Historical CECL reserve ratio, written as a decimal |
 
-Consumer rows are not required and are ignored if supplied. Duplicate
-portfolio-period rows are rejected.
+Consumer and model-excluded tags such as ARR do not belong in this file.
+Duplicate tag-period-bucket rows are rejected. The example contains the full
+six-tag by two-period by three-bucket grid, or 36 rows.
 
 ### Financial file: C&I cash-flow inputs
 
@@ -481,7 +484,8 @@ assigned. A tag can:
 - include borrowers that meet conditions;
 - exclude borrowers that meet other conditions;
 - assign derived fields such as `cre_subsector` or `ci_sector`;
-- make a borrower eligible for a model; and
+- make a borrower eligible for a model;
+- define a module-scoped CECL ratio group; and
 - compare its balance with an external tie-out.
 
 Supported condition operators are:
@@ -504,6 +508,36 @@ model-eligible tag. Use `"exclude_from_model": true` when a matched borrower
 must be excluded from all model calculations. Model-exclusion tags are
 automatically non-model-eligible, must define a nonempty include condition, and
 stop the run if any referenced condition field is absent.
+
+A commercial tag can also define the scale for CECL reserve ratios:
+
+```json
+"CI_Sector_Middle_Market": {
+  "model_eligible": false,
+  "cecl_level": true,
+  "cecl_module": "C&I",
+  "include": [
+    {"field": "subsector", "op": "has_token", "value": "Middle Market"}
+  ]
+}
+```
+
+`cecl_level: true` marks the tag as a CECL grouping key. `cecl_module` scopes
+that key to a routed module. After model exclusions and module priority are
+resolved, the engine considers only active CECL-level tags whose `cecl_module`
+equals the borrower's `primary_module`. A commercial modeled borrower must
+resolve to exactly one such tag. No match or multiple matches in the selected
+module stop the run instead of depending on JSON order. Because overlay
+migrations are calculated at public-portfolio grain, every modeled row in one
+overlay CECL portfolio must resolve to the same single CECL-level tag.
+
+This routing scope is important for overlaps. The example borrower that
+matches both CRE and Middle Market is routed to CRE, so `CRE_Model` is its CECL
+tag and `CI_Sector_Middle_Market` is ignored for CECL. Both raw tag flags and
+the Middle Market tie-out remain visible. The example marks exactly six tags:
+`CRE_Model`, the three `CI_Sector_*` tags, and the EF and BCC overlay tags.
+`Consumer_Model`, `CI_Model`, every CRE subsector tag, and `ARR` are deliberately
+unflagged.
 
 The example scenario defines `ARR` as an excluded subset of Sponsor and
 Specialty:
@@ -751,14 +785,14 @@ a shock selector matched an exposure but an ARR-style exclusion vetoed it.
 ### CECL
 
 For the current-quarter `in_place` component, commercial CECL calculates one
-base reserve ratio for each CECL portfolio and base risk bucket:
+base reserve ratio for each resolved CECL-level tag and base risk bucket:
 
 ```text
-reserve ratio = sum of recorded CECL reserve ÷ sum of balance
+reserve ratio = sum of recorded CECL reserve / sum of balance
 ```
 
 The final ratio applied to stressed bucket balances can also include a
-current-quarter central-tendency component or weighted portfolio history, as
+current-quarter central-tendency component or weighted tag/bucket history, as
 configured below.
 
 `cecl.reserve_basis.current_method` selects the current-quarter commercial
@@ -767,56 +801,76 @@ basis:
 - `in_place` uses the configured current loan-level `reserve_field`. This is
   the default when `reserve_basis` is omitted and preserves legacy behavior.
 - `central_tendency` calculates each borrower's current reserve-to-balance
-  ratio, calculates a one-pass population z-score within each commercial CECL
-  portfolio/base bucket, inclusively retains observations whose absolute
+  ratio, calculates a one-pass population z-score within each resolved
+  CECL-level tag/base bucket, inclusively retains observations whose absolute
   z-score is at or below `z_score_threshold`, and uses the arithmetic mean of
   the retained ratios. Singleton and zero-variance groups retain every
   observation.
 
-`reserve_basis.historical.enabled` independently controls portfolio history.
-When enabled, `source` must identify a `merge: false` long-form input with one
-unique row per commercial portfolio and configured historical period. Period
-weights, including `current_period.weight`, must be finite, greater than zero,
-and sum to one. An arbitrary number of historical periods is supported.
+`reserve_basis.historical.enabled` independently controls tag/bucket history.
+When enabled, the scenario must define at least one `cecl_level: true` tag, and
+`source` must identify a `merge: false` long-form input with one unique row per
+configured CECL-level tag, historical period, and risk bucket. Period weights,
+including `current_period.weight`, must be finite, greater than zero, and sum
+to one. An arbitrary number of historical periods is supported. Explicit-tag
+scenarios fail closed if the resolved `cecl_level_tag` field is absent; only
+legacy scenarios with neither tag history nor CECL-level tags may fall back to
+the public CECL portfolio grain.
 
 Central tendency is applied only to the current-quarter loan population.
-Historical CSV rows are already portfolio-level values and are never z-score
-trimmed. Duplicate configured portfolio-period rows are rejected. Missing,
-negative, invalid, or nonfinite configured history is not filled or reweighted:
-the affected commercial portfolio is reported as unavailable. Extra portfolios
-or periods do not affect current calculations.
-The example blends current quarter and two prior portfolio values at one-third
-each.
+Historical CSV ratios are authoritative values and are never z-score trimmed
+or divided by current balances. Duplicate configured tag-period-bucket rows are
+rejected. Missing, negative, invalid, nonfinite, or greater-than-100% configured
+history is not filled or reweighted: the affected tag/bucket basis is
+unavailable. Active-tag history rows must use `Pass`, `Special Mention`, or
+`Substandard`; other bucket names are rejected. Extra tags and unconfigured
+periods do not affect current calculations. The example blends the current
+quarter and two prior tag/bucket ratios at one-third each.
 
-Historical reserve dollars must represent the same model-included commercial
-population used by the current run. Do not include Consumer or model-excluded
-subsets such as ARR in those amounts.
+Within each tag and period, supplied ratios must not decrease from `Pass` to
+`Special Mention` to `Substandard`. The final applied ratios are checked again
+after blending; a decreasing commercial ladder is marked unavailable so an
+increasing-stress migration cannot silently reduce reported CECL.
+
+Historical ratios must represent the same CECL-level tag, risk-bucket
+definition, and model-included commercial population used by the current run.
+Do not supply Consumer or model-excluded subsets such as ARR. An ARR borrower
+continues to appear in its parent Sponsor and Specialty tag and tie-out, but it
+does not enter the current CECL population and is not represented in the
+historical ratio.
 
 Missing, invalid, or nonfinite values in the current loan-level
 `cecl.reserve_field` are treated as zero and recorded in the exception report.
 
 Negative, invalid, or nonfinite balance observations are never treated as
 zero-balance CECL rows. Their count is carried through borrower aggregation,
-the affected portfolio/base-bucket basis is marked unavailable, and the
-condition is recorded in both the basis audit and exception report. Only a
+every bucket basis for the affected CECL-level tag is marked unavailable, and
+the condition is recorded in both the basis audit and exception report. Only a
 finite balance whose absolute value is within `zero_balance_tolerance` is
 eligible for zero-balance not-applicable treatment.
 
-Each historical portfolio reserve is divided by that portfolio's current
-eligible commercial balance to create an allocation ratio. That same
-historical component is applied to every current base bucket in the portfolio:
+Each commercial tag/bucket cell blends the selected current-quarter ratio with
+the historical ratios supplied for that exact tag and bucket:
 
 ```text
-effective bucket ratio
-  = current weight x selected current bucket ratio
-  + sum(historical weight x historical portfolio reserve
-        / current eligible portfolio balance)
+effective tag/bucket ratio
+  = current weight x selected current tag/bucket ratio
+  + sum(historical period weight
+        x supplied historical ratio for the same tag/bucket)
 ```
 
-Consequently, the Base portfolio reserve reconciles exactly to the weighted
-current selected reserve dollars plus the weighted historical portfolio reserve
-dollars. The calculation does not reconstruct historical balances, loans,
-buckets, or migrations.
+The effective ratio is applied to that tag's balance in the applicable Base or
+stressed risk bucket. Historical balances, loans, and reserve dollars are not
+reconstructed. If a tag/bucket has no current observation while the current
+period has positive weight, its blended ratio is unavailable; history weights
+are not renormalized. A zero report balance for that cell remains
+not-applicable and does not block otherwise valid CECL totals, while a positive
+Base or stressed balance makes the affected result unavailable.
+
+`Unknown` is intentionally outside the supplied historical risk ladder. A
+commercial row with an unknown base risk bucket keeps its current in-place
+reserve and does not use central tendency or history; this preserves visibility
+and current CECL while the missing rating remains separately reported.
 
 The current `cecl.reserve_field` must use the same identity and borrower wiring
 when `current_method` is `central_tendency`, because the estimator is
@@ -826,24 +880,27 @@ not reuse loader metadata, borrower keys, tag outputs, stress metrics, or other
 engine-owned columns. This prevents a later pipeline stage from overwriting an
 authoritative CECL input.
 
-Central tendency uses borrower-grain observations within each current CECL
-portfolio/base bucket, including targeted runs. This avoids silently changing
-the estimator merely because output grain changes from borrower to loan when
-routing is the same. `cecl_basis_summary.csv` records each current and
-historical component's source, method, period, weight, allocation balance,
-observation and current-period trimming counts, weighted component, final
-effective ratio, availability status, and exception code.
-Because one portfolio-level history component is allocated to every current
-base bucket, its reserve and allocation-balance audit values repeat on those
-bucket rows and must not be summed across buckets.
+Central tendency uses borrower-grain observations within each resolved current
+CECL-level tag/base bucket, including targeted runs. This avoids silently
+changing the estimator merely because output grain changes from borrower to
+loan when routing is the same. `cecl_basis_summary.csv` records each current and
+historical component's CECL tag, risk bucket, source, method, period, weight,
+observation and current-period trimming counts, period ratio, weighted
+component, final effective ratio, availability status, and exception code.
+Each tag/bucket has one current-period audit row and one direct-ratio row for
+each configured historical period. Any balance and implied reserve shown on a
+history audit row are explanatory only; the supplied ratio is never derived by
+allocating a portfolio reserve amount. Historical audit rows use
+`period_method = tag_bucket_history`; a commercial in-place blend identifies
+its `reserve_basis` as `in_place+tag_bucket_history`.
 The resolved amount and method are also retained on stressed result rows as
 `cecl_effective_reserve_base` and `cecl_reserve_basis_method`.
 
-Consumer never uses central tendency or portfolio history. Consumer Base CECL
-always uses each record's current in-place `cecl.reserve_field`, and its report
-rows identify `reserve_basis` as `in_place`. No Consumer row is required in the
-history CSV, and an unavailable commercial history component does not block
-Consumer CECL.
+Consumer never uses CECL-level tags, central tendency, or tag/bucket history.
+Consumer Base CECL always uses each record's current in-place
+`cecl.reserve_field`, and its report rows identify `reserve_basis` as
+`in_place`. No Consumer row is required in the history CSV, and an unavailable
+commercial tag/bucket history component does not block Consumer CECL.
 Stressed Consumer CECL is stressed quantitative expected loss plus the
 qualitative amount implied by:
 

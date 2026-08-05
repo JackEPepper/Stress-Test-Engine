@@ -40,9 +40,10 @@
       "historical": {
         "enabled": true,
         "source": "cecl_history",
-        "portfolio_field": "cecl_portfolio",
+        "tag_field": "cecl_tag",
         "period_field": "period",
-        "reserve_field": "historical_cecl_reserve",
+        "bucket_field": "risk_bucket",
+        "ratio_field": "historical_cecl_ratio",
         "current_period": {
           "name": "2026Q2",
           "weight": 0.3333333333333333

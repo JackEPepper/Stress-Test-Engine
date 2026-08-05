@@ -16,7 +16,12 @@ from .modules.ci import _brg_key, _ebitda_reduction, run_ci
 from .modules.consumer import run_consumer
 from .modules.cre import run_cre
 from .reporting import build_reports
-from .tagging import apply_tags, assign_primary_modules, evaluate_conditions
+from .tagging import (
+    apply_tags,
+    assign_primary_modules,
+    evaluate_conditions,
+    resolve_cecl_level_tags,
+)
 from .utils import (
     as_list,
     condition_fields,
@@ -418,6 +423,7 @@ def build_loan_context(
                     len(model_excluded_rows)
                 )
     loans = assign_primary_modules(loans, scenario, exceptions)
+    loans = resolve_cecl_level_tags(loans, scenario)
     loans = _enrich_loans(loans, scenario, loaded)
     return loans.sort_values(["_exposure_id"], kind="mergesort").reset_index(drop=True), tag_summary
 

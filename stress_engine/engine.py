@@ -27,7 +27,11 @@ from .modules.ci import run_ci
 from .modules.consumer import run_consumer
 from .modules.cre import run_cre
 from .reporting import build_reports
-from .tagging import apply_tags, assign_primary_modules
+from .tagging import (
+    apply_tags,
+    assign_primary_modules,
+    resolve_cecl_level_tags,
+)
 from .targeted import run_targeted_stress, targeted_enabled
 from .utils import hash_json
 from .version import VERSION
@@ -69,6 +73,7 @@ class StressEngine:
         borrowers = build_borrowers(identity, self.scenario, exceptions)
         borrowers, tag_summary = apply_tags(borrowers, self.scenario, loaded, exceptions)
         borrowers = assign_primary_modules(borrowers, self.scenario, exceptions)
+        borrowers = resolve_cecl_level_tags(borrowers, self.scenario)
 
         # 3. Enrichment runs after tagging so sources can be restricted by tag
         # if the scenario requests it. The audit copy is the post-tag/enriched

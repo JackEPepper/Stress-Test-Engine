@@ -41,27 +41,89 @@ class SampleScenarioRunTest(unittest.TestCase):
             )
             self.assertEqual(
                 set(history.columns),
-                {"cecl_portfolio", "period", "historical_cecl_reserve"},
+                {
+                    "cecl_tag",
+                    "period",
+                    "risk_bucket",
+                    "historical_cecl_ratio",
+                },
             )
-            self.assertNotIn("Consumer", set(history["cecl_portfolio"]))
+            self.assertEqual(len(history), 36)
+            self.assertNotIn("Consumer_Model", set(history["cecl_tag"]))
+            self.assertNotIn("ARR", set(history["cecl_tag"]))
             self.assertFalse(
-                history.duplicated(["cecl_portfolio", "period"]).any()
+                history.duplicated(
+                    ["cecl_tag", "period", "risk_bucket"]
+                ).any()
             )
+            expected_cecl_tags = {
+                "CRE_Model": "CRE",
+                "CI_Sector_Middle_Market": "C&I",
+                "CI_Sector_Sponsor_and_Specialty": "C&I",
+                "CI_Sector_Asset_Based_Lending": "C&I",
+                "Equipment_Finance_Overlay": "Overlay",
+                "Business_Credit_Center_Overlay": "Overlay",
+            }
+            configured_cecl_tags = {
+                name: spec.get("cecl_module")
+                for name, spec in scenario["tags"].items()
+                if spec.get("cecl_level") is True
+            }
+            self.assertEqual(configured_cecl_tags, expected_cecl_tags)
+            for unflagged in (
+                "Consumer_Model",
+                "CI_Model",
+                "ARR",
+                "CRE_Subsector_Retail",
+            ):
+                self.assertIsNot(
+                    scenario["tags"][unflagged].get("cecl_level"), True
+                )
+                self.assertNotIn("cecl_module", scenario["tags"][unflagged])
             expected_history_keys = {
-                (portfolio, period)
-                for portfolio in {
-                    "Asset-Based Lending",
-                    "BCC",
-                    "CRE",
-                    "EF",
-                    "Middle Market",
-                    "Sponsor and Specialty",
-                }
+                (tag, period, bucket)
+                for tag in expected_cecl_tags
                 for period in {"2026Q1", "2025Q4"}
+                for bucket in {"Pass", "Special Mention", "Substandard"}
             }
             self.assertEqual(
-                set(history[["cecl_portfolio", "period"]].itertuples(index=False, name=None)),
+                set(
+                    history[
+                        ["cecl_tag", "period", "risk_bucket"]
+                    ].itertuples(index=False, name=None)
+                ),
                 expected_history_keys,
+            )
+            expected_history_ratios = {
+                ("CI_Sector_Asset_Based_Lending", "2026Q1"): 8550 / 550000,
+                ("CI_Sector_Asset_Based_Lending", "2025Q4"): 10450 / 550000,
+                ("Business_Credit_Center_Overlay", "2026Q1"): 2700 / 200000,
+                ("Business_Credit_Center_Overlay", "2025Q4"): 3300 / 200000,
+                ("CRE_Model", "2026Q1"): 31050 / 3550000,
+                ("CRE_Model", "2025Q4"): 37950 / 3550000,
+                ("Equipment_Finance_Overlay", "2026Q1"): 3600 / 400000,
+                ("Equipment_Finance_Overlay", "2025Q4"): 4400 / 400000,
+                ("CI_Sector_Middle_Market", "2026Q1"): 7650 / 800000,
+                ("CI_Sector_Middle_Market", "2025Q4"): 9350 / 800000,
+                ("CI_Sector_Sponsor_and_Specialty", "2026Q1"): 11250 / 600000,
+                ("CI_Sector_Sponsor_and_Specialty", "2025Q4"): 13750 / 600000,
+            }
+            for key, expected_ratio in expected_history_ratios.items():
+                tag, period = key
+                observed = history.loc[
+                    history["cecl_tag"].eq(tag)
+                    & history["period"].eq(period),
+                    "historical_cecl_ratio",
+                ]
+                self.assertEqual(len(observed), 3)
+                for ratio in observed:
+                    self.assertAlmostEqual(float(ratio), expected_ratio)
+            history_config = scenario["cecl"]["reserve_basis"]["historical"]
+            self.assertEqual(history_config["tag_field"], "cecl_tag")
+            self.assertEqual(history_config["period_field"], "period")
+            self.assertEqual(history_config["bucket_field"], "risk_bucket")
+            self.assertEqual(
+                history_config["ratio_field"], "historical_cecl_ratio"
             )
             self.assertIs(
                 scenario["inputs"]["sources"]["cecl_history"]["merge"],
@@ -154,6 +216,7 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertEqual(overlap["model_portfolio"], "CRE")
             self.assertEqual(overlap["model_module"], "CRE")
             self.assertEqual(overlap["cecl_portfolio"], "CRE")
+            self.assertEqual(overlap["cecl_level_tag"], "CRE_Model")
             self.assertEqual(overlap["cre_subsector"], "Retail")
             self.assertEqual(overlap["ci_sector"], "Middle Market")
             self.assertEqual(float(overlap["dscr"]), 1.25)
@@ -263,7 +326,11 @@ class SampleScenarioRunTest(unittest.TestCase):
             self.assertFalse(commercial_history.empty)
             self.assertEqual(
                 set(commercial_history["period_method"]),
-                {"portfolio_history"},
+                {"tag_bucket_history"},
+            )
+            self.assertEqual(
+                set(commercial_history["reserve_basis"]),
+                {"in_place+tag_bucket_history"},
             )
 
             output_files = {path.name for path in Path(tmp).iterdir()}
@@ -334,7 +401,9 @@ class SampleScenarioRunTest(unittest.TestCase):
                 & (cecl["stress_level"] == "Base")
                 & (cecl["bucket"] == "Total")
             ].iloc[0]
-            self.assertEqual(float(aggregate_base["proforma_cecl_reserve"]), 76000.0)
+            self.assertAlmostEqual(
+                float(aggregate_base["proforma_cecl_reserve"]), 76000.0
+            )
 
     def test_arr_retains_sponsor_population_but_is_excluded_from_models(self):
         scenario, base_dir = load_scenario(SCENARIO)
@@ -376,6 +445,7 @@ class SampleScenarioRunTest(unittest.TestCase):
             "model_module",
             "model_portfolio",
             "cecl_portfolio",
+            "cecl_level_tag",
         ):
             self.assertTrue(pd.isna(arr[field]), msg=field)
 
@@ -383,6 +453,10 @@ class SampleScenarioRunTest(unittest.TestCase):
         self.assertEqual(sponsor_control["primary_module"], "C&I")
         self.assertEqual(
             sponsor_control["cecl_portfolio"], "Sponsor and Specialty"
+        )
+        self.assertEqual(
+            sponsor_control["cecl_level_tag"],
+            "CI_Sector_Sponsor_and_Specialty",
         )
 
         stressed = result["results"].set_index("borrower_id")

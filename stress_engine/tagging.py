@@ -10,7 +10,19 @@ import pandas as pd
 
 from .exceptions import record_exception
 from .io import LoadedTable
-from .utils import as_list, compare_values, condition_fields, is_missing, stable_name, to_number
+from .utils import (
+    as_list,
+    compare_values,
+    condition_fields,
+    is_missing,
+    risk_bucket_from_rating,
+    stable_name,
+    to_number,
+)
+
+
+CECL_LEVEL_TAG_FIELD = "cecl_level_tag"
+CECL_LEVEL_MODULES = {"CRE", "C&I", "Overlay"}
 
 
 TAG_CONDITION_OPERATORS = {
@@ -96,6 +108,8 @@ def apply_tags(
             "tag_column": tag_col,
             "model_eligible": bool(tag.get("model_eligible", True)),
             "exclude_from_model": bool(tag.get("exclude_from_model", False)),
+            "cecl_level": bool(tag.get("cecl_level", False)),
+            "cecl_module": tag.get("cecl_module", np.nan),
             "borrower_count": int(len(tagged)),
             "balance_field": balance_field,
             "balance": float(pd.to_numeric(tagged.get(balance_field, pd.Series(dtype=float)), errors="coerce").sum()),
@@ -109,6 +123,8 @@ def apply_tags(
         tag_rows.append(row)
         for tieout in as_list(tag.get("tie_out")):
             tieout_row = _evaluate_tieout(name, tag_col, result, tieout, loaded, balance_field)
+            tieout_row["cecl_level"] = bool(tag.get("cecl_level", False))
+            tieout_row["cecl_module"] = tag.get("cecl_module", np.nan)
             tag_rows.append(tieout_row)
             match_count = tieout_row.get("expected_match_count")
             if pd.notna(match_count) and int(match_count) == 0:
@@ -177,6 +193,12 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
         raise ValueError("Scenario tags must be a JSON object keyed by tag name.")
     out = []
     for name, spec in tags.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Scenario tag names must be nonblank strings.")
+        if name != name.strip():
+            raise ValueError(
+                f"Scenario tag name '{name}' cannot contain surrounding whitespace."
+            )
         if not isinstance(spec, Mapping):
             raise ValueError(f"Tag '{name}' must be a JSON object.")
         if "name" in spec:
@@ -185,7 +207,7 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
         item["name"] = str(name)
         if "assign" in item and not isinstance(item["assign"], Mapping):
             raise ValueError(f"Tag '{name}' assign must be a JSON object.")
-        for flag in ("model_eligible", "exclude_from_model"):
+        for flag in ("model_eligible", "exclude_from_model", "cecl_level"):
             if flag in item and not isinstance(item[flag], bool):
                 raise ValueError(f"Tag '{name}' {flag} must be a JSON boolean.")
         include_has_conditions = _validate_condition_block(
@@ -194,6 +216,27 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
         _validate_condition_block(
             item.get("exclude", []), f"Tag '{name}' exclude"
         )
+        if item.get("cecl_level", False):
+            cecl_module = item.get("cecl_module")
+            if not isinstance(cecl_module, str) or not cecl_module.strip():
+                raise ValueError(
+                    f"CECL-level tag '{name}' must define a nonblank cecl_module."
+                )
+            cecl_module = cecl_module.strip()
+            if cecl_module == "Consumer":
+                raise ValueError(
+                    f"CECL-level tag '{name}' cannot target Consumer; Consumer "
+                    "always uses its current in-place CECL reserve."
+                )
+            if item.get("exclude_from_model", False):
+                raise ValueError(
+                    f"Tag '{name}' cannot be both cecl_level and exclude_from_model."
+                )
+            item["cecl_module"] = cecl_module
+        elif "cecl_module" in item:
+            raise ValueError(
+                f"Tag '{name}' cecl_module requires cecl_level to be true."
+            )
         if item.get("exclude_from_model", False):
             if item.get("model_eligible", False):
                 raise ValueError(
@@ -206,6 +249,18 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
                 )
             item["model_eligible"] = False
         out.append(item)
+    cecl_columns: Dict[str, str] = {}
+    for tag in out:
+        if not tag.get("cecl_level", False):
+            continue
+        column = stable_name(tag["name"])
+        previous = cecl_columns.get(column)
+        if previous is not None:
+            raise ValueError(
+                "CECL-level tag names must produce unique tag columns; "
+                f"'{previous}' and '{tag['name']}' both normalize to '{column}'."
+            )
+        cecl_columns[column] = str(tag["name"])
     return out
 
 
@@ -727,3 +782,156 @@ def assign_primary_modules(
         else:
             result.at[idx, cecl_portfolio_field] = selected["name"]
     return result
+
+
+def resolve_cecl_level_tags(
+    df: pd.DataFrame,
+    scenario: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Resolve one CECL calibration tag after primary-module routing.
+
+    CECL-level tags are scoped to a primary module so intentional cross-module
+    tag overlap does not make the CECL population ambiguous. Once any such tag
+    is configured, every included CRE, C&I, or Overlay row must match exactly
+    one tag in its selected module. Consumer and model-excluded rows retain
+    their existing treatment and never enter tagged commercial calibration.
+    """
+    result = df.copy()
+    tag_defs = normalize_tag_defs(scenario.get("tags", {}))
+    cecl_tags = [tag for tag in tag_defs if tag.get("cecl_level", False)]
+    cecl = scenario.get("cecl", {})
+    cecl_portfolio_field = (
+        str(cecl.get("portfolio_field", "cecl_portfolio"))
+        if isinstance(cecl, Mapping)
+        else "cecl_portfolio"
+    )
+    result[CECL_LEVEL_TAG_FIELD] = pd.Series(
+        pd.NA, index=result.index, dtype=object
+    )
+
+    if not cecl_tags:
+        if cecl_portfolio_field in result.columns:
+            result[CECL_LEVEL_TAG_FIELD] = result[cecl_portfolio_field].map(
+                lambda value: (
+                    value if is_missing(value) else str(value).strip()
+                )
+            )
+        _validate_repeated_commercial_cecl_rows(result, scenario)
+        return result
+
+    borrower_id_field = scenario.get("borrower", {}).get(
+        "borrower_id_field", "borrower_id"
+    )
+    for idx, row in result.iterrows():
+        excluded = row.get("model_excluded", False)
+        if not is_missing(excluded) and bool(excluded):
+            continue
+        module_value = row.get("primary_module")
+        module = (
+            "" if is_missing(module_value) else str(module_value).strip()
+        )
+        if module == "Consumer":
+            if cecl_portfolio_field in result.columns:
+                portfolio = row.get(cecl_portfolio_field)
+                if not is_missing(portfolio):
+                    result.at[idx, CECL_LEVEL_TAG_FIELD] = str(
+                        portfolio
+                    ).strip()
+            continue
+        if module not in CECL_LEVEL_MODULES:
+            continue
+
+        candidates: List[str] = []
+        for tag in cecl_tags:
+            if tag.get("cecl_module") != module:
+                continue
+            column = f"tag_{stable_name(tag['name'])}"
+            value = row.get(column, False)
+            if not is_missing(value) and bool(value):
+                candidates.append(str(tag["name"]))
+        borrower_id = row.get(borrower_id_field)
+        if not candidates:
+            raise ValueError(
+                "Model-included commercial row matched no CECL-level tag for "
+                f"primary module '{module}' (borrower_id={borrower_id})."
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                "Model-included commercial row matched multiple CECL-level "
+                f"tags for primary module '{module}' "
+                f"(borrower_id={borrower_id}): {', '.join(candidates)}."
+            )
+        result.at[idx, CECL_LEVEL_TAG_FIELD] = candidates[0]
+
+    _validate_repeated_commercial_cecl_rows(result, scenario)
+    return result
+
+
+def _validate_repeated_commercial_cecl_rows(
+    df: pd.DataFrame,
+    scenario: Mapping[str, Any],
+) -> None:
+    """Require loan-grain rows to agree with borrower-grain CECL routing."""
+    borrower = scenario.get("borrower", {})
+    borrower_id_field = borrower.get("borrower_id_field", "borrower_id")
+    if borrower_id_field not in df.columns or "primary_module" not in df.columns:
+        return
+    included = pd.Series(True, index=df.index)
+    if "model_excluded" in df.columns:
+        included &= ~df["model_excluded"].fillna(False).astype(bool)
+    commercial = included & df["primary_module"].astype(str).isin(
+        CECL_LEVEL_MODULES
+    )
+    work = df.loc[commercial].copy()
+    if work.empty:
+        return
+
+    if "base_bucket" in work.columns:
+        work["_cecl_bucket_check"] = work["base_bucket"].map(
+            lambda value: (
+                "Unknown"
+                if is_missing(value) or not str(value).strip()
+                else str(value).strip()
+            )
+        )
+    else:
+        risk_rating_field = borrower.get("risk_rating_field", "risk_rating")
+        if risk_rating_field in work.columns:
+            work["_cecl_bucket_check"] = work[risk_rating_field].apply(
+                risk_bucket_from_rating
+            )
+        else:
+            work["_cecl_bucket_check"] = "Unknown"
+
+    for borrower_id, group in work.groupby(
+        borrower_id_field, dropna=False, sort=False
+    ):
+        if len(group) < 2:
+            continue
+        tags = sorted(
+            {
+                "<missing>"
+                if is_missing(value) or not str(value).strip()
+                else str(value).strip()
+                for value in group[CECL_LEVEL_TAG_FIELD]
+            }
+        )
+        if len(tags) > 1:
+            raise ValueError(
+                "Repeated commercial rows for one borrower resolved to "
+                f"different CECL-level tags (borrower_id={borrower_id}): "
+                f"{', '.join(tags)}."
+            )
+        buckets = sorted(
+            {
+                str(value).strip()
+                for value in group["_cecl_bucket_check"].dropna()
+                if str(value).strip()
+            }
+        )
+        if len(buckets) > 1:
+            raise ValueError(
+                "Repeated commercial rows for one borrower resolve to "
+                f"different base risk buckets (borrower_id={borrower_id}): "
+                f"{', '.join(buckets)}."
+            )

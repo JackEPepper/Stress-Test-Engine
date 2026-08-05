@@ -1,4 +1,4 @@
-"""Configurable current and portfolio-history CECL reserve bases."""
+"""Configurable current and CECL-level tag-history reserve bases."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ from .utils import pct, to_number
 CURRENT_METHODS = {"in_place", "central_tendency"}
 WEIGHT_TOLERANCE = 1e-9
 DEFAULT_Z_SCORE_THRESHOLD = 2.0
+CECL_LEVEL_TAG_FIELD = "cecl_level_tag"
+CANONICAL_BUCKETS = ("Pass", "Special Mention", "Substandard")
+VALID_BUCKETS = frozenset((*CANONICAL_BUCKETS, "Unknown"))
 EFFECTIVE_RESERVE_FIELD = "cecl_effective_reserve_base"
 RESERVE_BASIS_METHOD_FIELD = "cecl_reserve_basis_method"
 INVALID_BALANCE_COUNT_FIELD = "_cecl_invalid_balance_count"
@@ -25,6 +28,8 @@ RESERVED_INPUT_FIELDS = {
     "_source_row",
     "_portfolio_key",
     "_period_key",
+    "_tag_key",
+    "_bucket_key",
 }
 CURRENT_CECL_RESERVED_FIELDS = RESERVED_INPUT_FIELDS | {
     INVALID_BALANCE_COUNT_FIELD,
@@ -40,6 +45,7 @@ CURRENT_CECL_RESERVED_FIELDS = RESERVED_INPUT_FIELDS | {
     "consumer_collateral_value_unstressed",
     "consumer_fico",
     "consumer_qualitative_reserve",
+    CECL_LEVEL_TAG_FIELD,
     "eligible_modules",
     "loan_count",
     "_exposure_id",
@@ -75,6 +81,7 @@ CURRENT_CECL_RESERVED_PREFIXES = (
 
 RATIO_COLUMNS = [
     "portfolio",
+    CECL_LEVEL_TAG_FIELD,
     "bucket",
     "reserve_basis",
     "current_method",
@@ -89,6 +96,7 @@ RATIO_COLUMNS = [
 
 AUDIT_COLUMNS = [
     "portfolio",
+    CECL_LEVEL_TAG_FIELD,
     "bucket",
     "reserve_basis",
     "current_method",
@@ -209,7 +217,7 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
     if "weighted_history" in basis:
         raise ValueError(
             "cecl.reserve_basis.weighted_history is no longer supported; "
-            "use reserve_basis.historical with a portfolio-level input source."
+            "use reserve_basis.historical with a CECL-level tag input source."
         )
 
     _validated_current_method(basis)
@@ -247,26 +255,44 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
     if not enabled:
         return
 
+    if not _configured_cecl_level_tags(scenario):
+        raise ValueError(
+            "Historical CECL ratios require at least one CECL-level scenario "
+            "tag with cecl_level set to true."
+        )
+
+    legacy_fields = sorted(
+        key for key in ("portfolio_field", "reserve_field") if key in historical
+    )
+    if legacy_fields:
+        raise ValueError(
+            "Portfolio-level historical CECL reserve inputs are no longer "
+            "supported. Replace "
+            f"{', '.join(legacy_fields)} with tag_field, bucket_field, and "
+            "ratio_field, and provide one CECL ratio per tag, period, and "
+            "risk bucket."
+        )
+
     source = _nonblank_setting(
         historical,
         "source",
         "cecl.reserve_basis.historical.source",
     )
+    tag_field = _configured_field(historical, "tag_field", "cecl_tag")
     period_field = _configured_field(
         historical, "period_field", "period"
     )
-    portfolio_field = _configured_field(
-        historical,
-        "portfolio_field",
-        str(cecl.get("portfolio_field", "cecl_portfolio")),
+    bucket_field = _configured_field(
+        historical, "bucket_field", "risk_bucket"
     )
-    reserve_field = _configured_field(
-        historical, "reserve_field", "historical_cecl_reserve"
+    ratio_field = _configured_field(
+        historical, "ratio_field", "historical_cecl_ratio"
     )
-    historical_fields = {period_field, portfolio_field, reserve_field}
-    if len(historical_fields) != 3:
+    historical_fields = {tag_field, period_field, bucket_field, ratio_field}
+    if len(historical_fields) != 4:
         raise ValueError(
-            "CECL historical portfolio, period, and reserve fields must be distinct."
+            "CECL historical tag, period, risk-bucket, and ratio fields must "
+            "be distinct."
         )
     conflicts = sorted(historical_fields & RESERVED_INPUT_FIELDS)
     if conflicts:
@@ -301,9 +327,13 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
         path = f"cecl.reserve_basis.historical.periods[{index}]"
         if not isinstance(period, Mapping):
             raise ValueError(f"{path} must be a JSON object.")
-        if "reserve_field" in period or "period_method" in period:
+        if (
+            "reserve_field" in period
+            or "ratio_field" in period
+            or "period_method" in period
+        ):
             raise ValueError(
-                f"{path} must reference a portfolio CSV period by name and weight only."
+                f"{path} must reference a tag-ratio CSV period by name and weight only."
             )
         name = str(period.get("name", "")).strip()
         if not name:
@@ -336,11 +366,11 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
     required = {str(value) for value in source_spec.get("required_columns", [])}
     numeric = {str(value) for value in source_spec.get("numeric_columns", [])}
     strings = {str(value) for value in source_spec.get("string_columns", [])}
-    expected = {period_field, portfolio_field, reserve_field}
+    expected = {tag_field, period_field, bucket_field, ratio_field}
     missing_aliases = sorted(expected - canonical)
     missing_required = sorted(expected - required)
-    missing_numeric = sorted({reserve_field} - numeric)
-    missing_strings = sorted({period_field, portfolio_field} - strings)
+    missing_numeric = sorted({ratio_field} - numeric)
+    missing_strings = sorted({tag_field, period_field, bucket_field} - strings)
     if missing_aliases:
         raise ValueError(
             "CECL historical fields must be canonical source column aliases; "
@@ -353,12 +383,13 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
         )
     if missing_numeric:
         raise ValueError(
-            "The CECL historical reserve field must be numeric; missing: "
+            "The CECL historical ratio field must be numeric; missing: "
             f"{', '.join(missing_numeric)}."
         )
     if missing_strings:
         raise ValueError(
-            "CECL historical portfolio and period fields must be string_columns; "
+            "CECL historical tag, period, and risk-bucket fields must be "
+            "string_columns; "
             f"missing: {', '.join(missing_strings)}."
         )
 
@@ -382,7 +413,7 @@ def build_cecl_reserve_basis(
     exceptions: List[Dict[str, Any]] | None = None,
     history: pd.DataFrame | None = None,
 ) -> CeclReserveBasis:
-    """Resolve current and optional portfolio-history reserve ratios."""
+    """Resolve current and optional tag-and-bucket historical CECL ratios."""
     exceptions = exceptions if exceptions is not None else []
     cecl = scenario.get("cecl", {})
     if not isinstance(cecl, Mapping):
@@ -408,10 +439,35 @@ def build_cecl_reserve_basis(
         basis_results[portfolio_field] = _normalized_portfolios(
             basis_results[portfolio_field]
         )
+    if CECL_LEVEL_TAG_FIELD in basis_results.columns:
+        basis_results[CECL_LEVEL_TAG_FIELD] = _normalized_portfolios(
+            basis_results[CECL_LEVEL_TAG_FIELD]
+        )
     effective = pd.Series(np.nan, index=results.index, dtype=float)
     method_by_row = _row_basis_methods(
         basis_results, scenario, portfolio_field, method
     )
+
+    configured_level_tags = _configured_cecl_level_tags(scenario)
+    if history_enabled and not configured_level_tags:
+        code = "CECL_LEVEL_TAG_CONFIGURATION_MISSING"
+        record_exception(
+            exceptions,
+            "ERROR",
+            "cecl",
+            code,
+            "Historical CECL ratios require at least one configured CECL-level tag.",
+            field=CECL_LEVEL_TAG_FIELD,
+        )
+        return _unavailable_basis(
+            method,
+            current_method,
+            history_enabled,
+            effective,
+            method_by_row,
+            required_fields,
+            code,
+        )
 
     if current_field not in basis_results.columns:
         record_exception(
@@ -501,26 +557,95 @@ def build_cecl_reserve_basis(
             "base_bucket"
         ].astype(str).str.strip().eq("")
         frame.loc[missing_bucket, "base_bucket"] = "Unknown"
+        frame["base_bucket"] = frame["base_bucket"].map(_bucket_key)
 
-    consumer_portfolios = _consumer_portfolios(
-        frame, scenario, portfolio_field
-    )
-    commercial_frame = frame[
-        ~frame[portfolio_field].map(_portfolio_key).isin(consumer_portfolios)
+    consumer_mask = _consumer_row_mask(frame, scenario, portfolio_field)
+    if CECL_LEVEL_TAG_FIELD not in frame.columns and configured_level_tags:
+        consumer_only = _consumer_row_mask(
+            frame, scenario, portfolio_field
+        ).all()
+        if not consumer_only:
+            code = "CECL_LEVEL_TAG_MISSING"
+            record_exception(
+                exceptions,
+                "ERROR",
+                "cecl",
+                code,
+                "The resolved CECL-level tag field is missing; reserve-basis calibration is unavailable.",
+                field=CECL_LEVEL_TAG_FIELD,
+            )
+            return _unavailable_basis(
+                method,
+                current_method,
+                history_enabled,
+                effective,
+                method_by_row,
+                required_fields,
+                code,
+            )
+        frame[CECL_LEVEL_TAG_FIELD] = frame[portfolio_field]
+    if CECL_LEVEL_TAG_FIELD not in frame.columns:
+        # Backward compatibility for programmatic callers that predate tag
+        # routing. This is permitted only when the scenario has not opted into
+        # CECL-level tags or tag history.
+        frame[CECL_LEVEL_TAG_FIELD] = frame[portfolio_field]
+    frame.loc[consumer_mask, CECL_LEVEL_TAG_FIELD] = frame.loc[
+        consumer_mask, portfolio_field
     ]
-    portfolio_balances: Dict[str, float] = {}
-    portfolio_invalid: Dict[str, int] = {}
-    for portfolio, group in commercial_frame.groupby(portfolio_field, dropna=False):
-        key = _portfolio_key(portfolio)
-        portfolio_balances[key] = float(_finite_numeric(group[balance_field]).sum())
-        portfolio_invalid[key] = _invalid_balance_count(group, balance_field)
+    missing_level_tag = (
+        ~consumer_mask
+        & (
+            frame[CECL_LEVEL_TAG_FIELD].isna()
+            | frame[CECL_LEVEL_TAG_FIELD].astype(str).str.strip().eq("")
+        )
+    )
+    if missing_level_tag.any():
+        record_exception(
+            exceptions,
+            "ERROR",
+            "cecl",
+            "CECL_LEVEL_TAG_MISSING",
+            "Commercial rows without a resolved CECL-level tag were excluded from reserve-basis calibration.",
+            field=CECL_LEVEL_TAG_FIELD,
+            details=f"missing_count={int(missing_level_tag.sum())}",
+        )
+        frame = frame.loc[~missing_level_tag].copy()
+        consumer_mask = consumer_mask.reindex(frame.index, fill_value=False)
+
+    consumer_frame = frame.loc[consumer_mask].copy()
+    commercial_frame = frame.loc[~consumer_mask].copy()
+    commercial_tags = {
+        _level_tag_key(value)
+        for value in commercial_frame[CECL_LEVEL_TAG_FIELD]
+        if _level_tag_key(value)
+    }
+    tag_invalid: Dict[str, int] = {}
+    for tag, tag_group in commercial_frame.groupby(
+        CECL_LEVEL_TAG_FIELD, dropna=False, sort=False
+    ):
+        tag_key = _level_tag_key(tag)
+        invalid_count = _invalid_balance_count(tag_group, balance_field)
+        tag_invalid[tag_key] = invalid_count
+        if invalid_count:
+            record_exception(
+                exceptions,
+                "ERROR",
+                "cecl",
+                "CECL_BALANCE_INVALID",
+                "A CECL-level tag contains negative, invalid, or nonfinite balances; every bucket ratio for that tag is unavailable.",
+                field=balance_field,
+                details=(
+                    f"cecl_level_tag={tag_key}; "
+                    f"invalid_balance_count={invalid_count}"
+                ),
+            )
 
     history_lookup, history_global_code = _prepare_history(
         history,
         historical,
         history_enabled,
         exceptions,
-        set(portfolio_balances),
+        commercial_tags,
     )
     threshold = to_number(
         basis_config.get("central_tendency", {}).get(
@@ -537,23 +662,23 @@ def build_cecl_reserve_basis(
 
     ratio_rows: List[Dict[str, Any]] = []
     audit_rows: List[Dict[str, Any]] = []
-    group_columns = [portfolio_field, "base_bucket"]
-    for (portfolio, bucket), group in frame.groupby(group_columns, dropna=False):
-        bucket_text = str(bucket)
-        if bucket_text not in {
-            "Pass",
-            "Special Mention",
-            "Substandard",
-            "Unknown",
-        }:
-            continue
-        portfolio_key = _portfolio_key(portfolio)
-        is_consumer = portfolio_key in consumer_portfolios
-        group_current_method = "in_place" if is_consumer else current_method
-        group_history_enabled = history_enabled and not is_consumer
+
+    def process_group(
+        portfolio: Any,
+        cecl_level_tag: Any,
+        bucket_text: str,
+        group: pd.DataFrame,
+        *,
+        is_consumer: bool,
+        basis_invalid_balance_count: int,
+    ) -> None:
+        current_only = is_consumer or bucket_text == "Unknown"
+        group_current_method = "in_place" if current_only else current_method
+        group_history_enabled = history_enabled and not current_only
         group_method = _basis_label(
             group_current_method, group_history_enabled
         )
+        method_by_row.loc[group.index] = group_method
         group_current_period = (
             {"name": "current", "weight": 1.0}
             if is_consumer or not group_history_enabled
@@ -563,12 +688,7 @@ def build_cecl_reserve_basis(
         eligible_group = group.loc[finite_balances.notna()]
         group_balance = float(finite_balances.sum())
         invalid_balance_count = _invalid_balance_count(group, balance_field)
-        basis_invalid_balance_count = (
-            invalid_balance_count
-            if is_consumer
-            else portfolio_invalid.get(portfolio_key, invalid_balance_count)
-        )
-        if invalid_balance_count:
+        if is_consumer and invalid_balance_count:
             record_exception(
                 exceptions,
                 "ERROR",
@@ -596,6 +716,7 @@ def build_cecl_reserve_basis(
         group_audit: List[Dict[str, Any]] = [
             _audit_row(
                 portfolio,
+                cecl_level_tag,
                 bucket_text,
                 group_method,
                 group_current_method,
@@ -606,42 +727,41 @@ def build_cecl_reserve_basis(
                 current_field,
                 "borrower",
                 "current_bucket",
-                invalid_balance_count,
+                basis_invalid_balance_count,
                 current_values,
             )
         ]
 
         if group_history_enabled:
-            portfolio_balance = portfolio_balances.get(portfolio_key, np.nan)
-            portfolio_balance_invalid = portfolio_invalid.get(portfolio_key, 0)
             for period in historical_periods:
                 values = _historical_period_values(
                     history_lookup,
                     history_global_code,
-                    portfolio_key,
+                    _level_tag_key(cecl_level_tag),
+                    bucket_text,
                     period["name"],
-                    portfolio_balance,
-                    portfolio_balance_invalid,
+                    group_balance,
                 )
                 selected.append((period, values))
                 group_audit.append(
                     _audit_row(
                         portfolio,
+                        cecl_level_tag,
                         bucket_text,
                         group_method,
                         group_current_method,
                         True,
-                        "portfolio_history",
+                        "tag_bucket_history",
                         period,
                         str(historical.get("source", "")),
                         str(
                             historical.get(
-                                "reserve_field", "historical_cecl_reserve"
+                                "ratio_field", "historical_cecl_ratio"
                             )
                         ),
-                        "portfolio",
-                        "current_portfolio",
-                        portfolio_balance_invalid,
+                        "cecl_level_tag_risk_bucket",
+                        "current_cecl_tag_bucket",
+                        basis_invalid_balance_count,
                         values,
                     )
                 )
@@ -650,21 +770,32 @@ def build_cecl_reserve_basis(
             if values["status"] == "available":
                 continue
             code = str(values.get("exception_code") or "CECL_BASIS_PERIOD_UNAVAILABLE")
-            record_exception(
-                exceptions,
-                "ERROR" if group_balance > 0 else "WARNING",
-                "cecl",
-                code,
-                "A configured CECL basis period is unavailable.",
-                portfolio=portfolio,
-                bucket=bucket_text,
-                field=(
-                    current_field
-                    if period is group_current_period
-                    else str(historical.get("reserve_field", "historical_cecl_reserve"))
-                ),
-                details=f"period={period['name']}",
-            )
+            # Empty current cells are retained so a later stressed migration
+            # can identify a missing ratio. They are not errors unless they
+            # currently carry balance; reporting performs the stressed check.
+            if group_balance > 0:
+                record_exception(
+                    exceptions,
+                    "ERROR",
+                    "cecl",
+                    code,
+                    "A configured CECL basis period is unavailable.",
+                    portfolio=portfolio,
+                    bucket=bucket_text,
+                    field=(
+                        current_field
+                        if period is group_current_period
+                        else str(
+                            historical.get(
+                                "ratio_field", "historical_cecl_ratio"
+                            )
+                        )
+                    ),
+                    details=(
+                        f"cecl_level_tag={_level_tag_key(cecl_level_tag)}; "
+                        f"period={period['name']}"
+                    ),
+                )
 
         direct_amount_basis = (
             group_current_method == "in_place" and not group_history_enabled
@@ -735,6 +866,7 @@ def build_cecl_reserve_basis(
         ratio_rows.append(
             {
                 "portfolio": portfolio,
+                CECL_LEVEL_TAG_FIELD: cecl_level_tag,
                 "bucket": bucket_text,
                 "reserve_basis": group_method,
                 "current_method": group_current_method,
@@ -753,6 +885,57 @@ def build_cecl_reserve_basis(
             row["basis_exception_code"] = code
             audit_rows.append(row)
 
+    for (portfolio, bucket), group in consumer_frame.groupby(
+        [portfolio_field, "base_bucket"], dropna=False, sort=False
+    ):
+        bucket_text = _bucket_key(bucket)
+        if bucket_text not in VALID_BUCKETS:
+            continue
+        process_group(
+            portfolio,
+            portfolio,
+            bucket_text,
+            group,
+            is_consumer=True,
+            basis_invalid_balance_count=_invalid_balance_count(
+                group, balance_field
+            ),
+        )
+
+    for cecl_level_tag, tag_group in commercial_frame.groupby(
+        CECL_LEVEL_TAG_FIELD, dropna=False, sort=False
+    ):
+        tag_key = _level_tag_key(cecl_level_tag)
+        portfolio = _portfolio_label(tag_group[portfolio_field])
+        observed_buckets = [
+            bucket
+            for bucket in (*CANONICAL_BUCKETS, "Unknown")
+            if tag_group["base_bucket"].eq(bucket).any()
+        ]
+        buckets = list(CANONICAL_BUCKETS) if history_enabled else observed_buckets
+        if "Unknown" in observed_buckets:
+            buckets.append("Unknown")
+        for bucket_text in buckets:
+            group = tag_group.loc[
+                tag_group["base_bucket"].eq(bucket_text)
+            ].copy()
+            process_group(
+                portfolio,
+                cecl_level_tag,
+                bucket_text,
+                group,
+                is_consumer=False,
+                basis_invalid_balance_count=tag_invalid.get(tag_key, 0),
+            )
+
+    _invalidate_decreasing_effective_ladders(
+        ratio_rows,
+        audit_rows,
+        commercial_frame,
+        effective,
+        exceptions,
+    )
+
     return CeclReserveBasis(
         method=method,
         current_method=current_method,
@@ -765,12 +948,97 @@ def build_cecl_reserve_basis(
     )
 
 
+def _invalidate_decreasing_effective_ladders(
+    ratio_rows: List[Dict[str, Any]],
+    audit_rows: List[Dict[str, Any]],
+    commercial_frame: pd.DataFrame,
+    effective: pd.Series,
+    exceptions: List[Dict[str, Any]],
+) -> None:
+    """Fail closed when an applied commercial CECL risk ladder decreases."""
+    commercial_tags = {
+        _level_tag_key(value)
+        for value in commercial_frame.get(
+            CECL_LEVEL_TAG_FIELD, pd.Series(dtype=object)
+        )
+        if _level_tag_key(value)
+    }
+    by_tag: Dict[str, Dict[str, float]] = {}
+    for row in ratio_rows:
+        tag = _level_tag_key(row.get(CECL_LEVEL_TAG_FIELD))
+        bucket = _bucket_key(row.get("bucket"))
+        ratio = to_number(row.get("reserve_ratio"), np.nan)
+        if (
+            tag in commercial_tags
+            and bucket in CANONICAL_BUCKETS
+            and row.get("status") == "available"
+            and np.isfinite(ratio)
+        ):
+            by_tag.setdefault(tag, {})[bucket] = float(ratio)
+
+    invalid_tags: set[str] = set()
+    for tag, ratios in by_tag.items():
+        ordered = [
+            ratios[bucket]
+            for bucket in CANONICAL_BUCKETS
+            if bucket in ratios
+        ]
+        if any(
+            later + WEIGHT_TOLERANCE < earlier
+            for earlier, later in zip(ordered, ordered[1:])
+        ):
+            invalid_tags.add(tag)
+    if not invalid_tags:
+        return
+
+    code = "CECL_RESERVE_RATIO_LADDER_INVALID"
+    for row in ratio_rows:
+        if _level_tag_key(row.get(CECL_LEVEL_TAG_FIELD)) not in invalid_tags:
+            continue
+        row["base_reserve"] = np.nan
+        row["reserve_ratio"] = np.nan
+        row["status"] = "unavailable"
+        row["exception_code"] = code
+    for row in audit_rows:
+        if _level_tag_key(row.get(CECL_LEVEL_TAG_FIELD)) not in invalid_tags:
+            continue
+        row["effective_reserve_ratio"] = np.nan
+        row["basis_status"] = "unavailable"
+        row["basis_exception_code"] = code
+    tag_keys = commercial_frame[CECL_LEVEL_TAG_FIELD].map(_level_tag_key)
+    effective.loc[
+        commercial_frame.index[tag_keys.isin(invalid_tags)]
+    ] = np.nan
+    for tag in sorted(invalid_tags):
+        record_exception(
+            exceptions,
+            "ERROR",
+            "cecl",
+            code,
+            "Applied commercial CECL ratios must not decrease from Pass to Special Mention to Substandard.",
+            details=f"cecl_level_tag={tag}",
+        )
+
+
 def _basis_config(scenario: Mapping[str, Any]) -> Mapping[str, Any]:
     cecl = scenario.get("cecl", {})
     if not isinstance(cecl, Mapping):
         return {}
     basis = cecl.get("reserve_basis", {})
     return basis if isinstance(basis, Mapping) else {}
+
+
+def _configured_cecl_level_tags(scenario: Mapping[str, Any]) -> set[str]:
+    tags = scenario.get("tags", {})
+    if not isinstance(tags, Mapping):
+        return set()
+    return {
+        str(name).strip()
+        for name, spec in tags.items()
+        if isinstance(spec, Mapping)
+        and spec.get("cecl_level") is True
+        and str(name).strip()
+    }
 
 
 def _historical_config(basis: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -805,7 +1073,7 @@ def _current_method(basis: Mapping[str, Any]) -> str:
 
 def _basis_label(current_method: str, history_enabled: bool) -> str:
     return (
-        f"{current_method}+portfolio_history"
+        f"{current_method}+tag_bucket_history"
         if history_enabled
         else current_method
     )
@@ -967,19 +1235,20 @@ def _prepare_history(
     config: Mapping[str, Any],
     enabled: bool,
     exceptions: List[Dict[str, Any]],
-    commercial_portfolios: set[str],
-) -> tuple[Dict[tuple[str, str], Dict[str, Any]], str]:
+    commercial_tags: set[str],
+) -> tuple[Dict[tuple[str, str, str], Dict[str, Any]], str]:
     if not enabled:
         return {}, ""
-    if not commercial_portfolios:
-        # Portfolio history is a commercial-only feature. A Consumer-only run
+    if not commercial_tags:
+        # Tag history is a commercial-only feature. A Consumer-only run
         # must not require, validate, or log errors for a history table.
         return {}, ""
     source = str(config.get("source", "")).strip()
-    portfolio_field = str(config.get("portfolio_field", "cecl_portfolio")).strip()
+    tag_field = str(config.get("tag_field", "cecl_tag")).strip()
     period_field = str(config.get("period_field", "period")).strip()
-    reserve_field = str(
-        config.get("reserve_field", "historical_cecl_reserve")
+    bucket_field = str(config.get("bucket_field", "risk_bucket")).strip()
+    ratio_field = str(
+        config.get("ratio_field", "historical_cecl_ratio")
     ).strip()
     if history is None:
         code = "CECL_HISTORY_SOURCE_UNAVAILABLE"
@@ -988,13 +1257,13 @@ def _prepare_history(
             "ERROR",
             "cecl",
             code,
-            "The configured portfolio-level CECL history source is unavailable.",
+            "The configured CECL tag-ratio history source is unavailable.",
             source=source,
         )
         return {}, code
     missing = [
         field
-        for field in (portfolio_field, period_field, reserve_field)
+        for field in (tag_field, period_field, bucket_field, ratio_field)
         if field not in history.columns
     ]
     if missing:
@@ -1005,7 +1274,7 @@ def _prepare_history(
                 "ERROR",
                 "cecl",
                 code,
-                "A required portfolio-history field is missing.",
+                "A required CECL tag-history field is missing.",
                 source=source,
                 field=field,
             )
@@ -1016,98 +1285,165 @@ def _prepare_history(
         for period in config.get("periods", [])
         if isinstance(period, Mapping)
     }
-    work = history[[portfolio_field, period_field, reserve_field]].copy()
-    work["_portfolio_key"] = work[portfolio_field].map(_portfolio_key)
+    work = history[
+        [tag_field, period_field, bucket_field, ratio_field]
+    ].copy()
+    work["_tag_key"] = work[tag_field].map(_level_tag_key)
     work["_period_key"] = work[period_field].map(_period_key)
-    blank = work["_portfolio_key"].eq("") | work["_period_key"].eq("")
+    work["_bucket_key"] = work[bucket_field].map(_bucket_key)
+    blank = (
+        work["_tag_key"].eq("")
+        | work["_period_key"].eq("")
+        | work["_bucket_key"].eq("")
+    )
     if blank.any():
         record_exception(
             exceptions,
             "WARNING",
             "cecl",
             "CECL_HISTORY_ROW_IGNORED",
-            "Portfolio-history rows with blank portfolio or period values were ignored.",
+            "CECL tag-history rows with blank tag, period, or risk-bucket values were ignored.",
             source=source,
             details=f"ignored_count={int(blank.sum())}",
         )
     relevant = (
         ~blank
         & work["_period_key"].isin(configured_periods)
-        & work["_portfolio_key"].isin(commercial_portfolios)
+        & work["_tag_key"].isin(commercial_tags)
     )
     work = work.loc[relevant].copy()
-    duplicate = work.duplicated(["_portfolio_key", "_period_key"], keep=False)
+    invalid_buckets = sorted(
+        set(work.loc[~work["_bucket_key"].isin(CANONICAL_BUCKETS), "_bucket_key"])
+    )
+    if invalid_buckets:
+        raise ValueError(
+            "CECL tag history risk buckets must be Pass, Special Mention, "
+            "or Substandard; invalid values: "
+            f"{', '.join(invalid_buckets)}."
+        )
+    duplicate = work.duplicated(
+        ["_tag_key", "_period_key", "_bucket_key"], keep=False
+    )
     if duplicate.any():
         duplicate_keys = sorted(
             {
-                f"{portfolio}/{period}"
-                for portfolio, period in work.loc[
-                    duplicate, ["_portfolio_key", "_period_key"]
+                f"{tag}/{period}/{bucket}"
+                for tag, period, bucket in work.loc[
+                    duplicate,
+                    ["_tag_key", "_period_key", "_bucket_key"],
                 ].itertuples(index=False, name=None)
             }
         )
         raise ValueError(
-            "CECL portfolio history must contain one unique row per "
-            f"portfolio and period; duplicates: {', '.join(duplicate_keys)}."
+            "CECL tag history must contain one unique row per tag, period, "
+            f"and risk bucket; duplicates: {', '.join(duplicate_keys)}."
         )
-    lookup: Dict[tuple[str, str], Dict[str, Any]] = {}
-    for key, group in work.groupby(["_portfolio_key", "_period_key"], dropna=False):
-        reserve = to_number(group[reserve_field].iloc[0], np.nan)
-        if not np.isfinite(reserve) or reserve < 0:
+    lookup: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+    for key, group in work.groupby(
+        ["_tag_key", "_bucket_key", "_period_key"],
+        dropna=False,
+        sort=False,
+    ):
+        raw_ratio = group[ratio_field].iloc[0]
+        ratio = to_number(raw_ratio, np.nan)
+        if (
+            isinstance(raw_ratio, (bool, np.bool_))
+            or not np.isfinite(ratio)
+            or ratio < 0
+            or ratio > 1
+        ):
             lookup[key] = {
                 "status": "unavailable",
-                "exception_code": "CECL_HISTORY_RESERVE_INVALID",
+                "exception_code": "CECL_HISTORY_RATIO_INVALID",
             }
             continue
         lookup[key] = {
             "status": "available",
             "exception_code": "",
-            "reserve": float(reserve),
+            "ratio": float(ratio),
         }
+
+    # A historical risk ladder that falls as credit quality worsens would
+    # undermine scenario monotonicity. Invalidate only the affected tag-period.
+    grouped_keys: Dict[tuple[str, str], Dict[str, float]] = {}
+    for (tag, bucket, period), item in lookup.items():
+        if item.get("status") == "available":
+            grouped_keys.setdefault((tag, period), {})[bucket] = float(
+                item["ratio"]
+            )
+    for (tag, period), ratios in grouped_keys.items():
+        ordered = [
+            (bucket, ratios[bucket])
+            for bucket in CANONICAL_BUCKETS
+            if bucket in ratios
+        ]
+        if any(
+            later_ratio < earlier_ratio
+            for (_, earlier_ratio), (_, later_ratio) in zip(
+                ordered, ordered[1:]
+            )
+        ):
+            for bucket in CANONICAL_BUCKETS:
+                key = (tag, bucket, period)
+                if key in lookup:
+                    lookup[key] = {
+                        "status": "unavailable",
+                        "exception_code": "CECL_HISTORY_RATIO_LADDER_INVALID",
+                    }
+            record_exception(
+                exceptions,
+                "ERROR",
+                "cecl",
+                "CECL_HISTORY_RATIO_LADDER_INVALID",
+                "Historical CECL ratios must not decrease from Pass to Special Mention to Substandard.",
+                source=source,
+                details=f"cecl_level_tag={tag}; period={period}",
+            )
     return lookup, ""
 
 
 def _historical_period_values(
-    lookup: Mapping[tuple[str, str], Mapping[str, Any]],
+    lookup: Mapping[tuple[str, str, str], Mapping[str, Any]],
     global_code: str,
-    portfolio: str,
+    cecl_level_tag: str,
+    bucket: str,
     period: str,
-    current_portfolio_balance: float,
-    invalid_portfolio_balance_count: int,
+    current_bucket_balance: float,
 ) -> Dict[str, Any]:
-    item = lookup.get((portfolio, _period_key(period)))
+    item = lookup.get(
+        (
+            _level_tag_key(cecl_level_tag),
+            _bucket_key(bucket),
+            _period_key(period),
+        )
+    )
     if global_code:
-        return _unavailable_period(global_code, current_portfolio_balance)
+        return _unavailable_period(global_code, current_bucket_balance)
     if item is None:
         return _unavailable_period(
-            "CECL_HISTORY_PERIOD_MISSING", current_portfolio_balance
+            "CECL_HISTORY_TAG_BUCKET_PERIOD_MISSING", current_bucket_balance
         )
     if item.get("status") != "available":
         return _unavailable_period(
-            str(item.get("exception_code") or "CECL_HISTORY_RESERVE_INVALID"),
-            current_portfolio_balance,
+            str(item.get("exception_code") or "CECL_HISTORY_RATIO_INVALID"),
+            current_bucket_balance,
         )
-    if (
-        invalid_portfolio_balance_count
-        or not np.isfinite(current_portfolio_balance)
-        or current_portfolio_balance <= 0
-    ):
+    ratio = float(item["ratio"])
+    if not np.isfinite(ratio) or ratio < 0 or ratio > 1:
         return _unavailable_period(
-            "CECL_HISTORY_ALLOCATION_BALANCE_INVALID",
-            current_portfolio_balance,
+            "CECL_HISTORY_RATIO_INVALID", current_bucket_balance
         )
-    reserve = float(item["reserve"])
-    ratio = reserve / current_portfolio_balance
-    if not np.isfinite(ratio):
-        return _unavailable_period(
-            "CECL_HISTORY_RATIO_NONFINITE", current_portfolio_balance
-        )
+    reserve = (
+        current_bucket_balance * ratio
+        if np.isfinite(current_bucket_balance)
+        else np.nan
+    )
     return {
         "observation_count": 1,
         "included_observation_count": 1,
         "excluded_observation_count": 0,
         "missing_reserve_count": 0,
-        "balance": current_portfolio_balance,
+        "balance": current_bucket_balance,
         "reserve": reserve,
         "raw_reserve_ratio": ratio,
         "raw_mean_reserve_ratio": np.nan,
@@ -1137,6 +1473,7 @@ def _unavailable_period(code: str, balance: float) -> Dict[str, Any]:
 
 def _audit_row(
     portfolio: Any,
+    cecl_level_tag: Any,
     bucket: str,
     reserve_basis: str,
     current_method: str,
@@ -1154,6 +1491,7 @@ def _audit_row(
     ratio = values.get("period_reserve_ratio", np.nan)
     return {
         "portfolio": portfolio,
+        CECL_LEVEL_TAG_FIELD: cecl_level_tag,
         "bucket": bucket,
         "reserve_basis": reserve_basis,
         "current_method": current_method,
@@ -1275,23 +1613,6 @@ def _row_basis_methods(
     return methods
 
 
-def _consumer_portfolios(
-    frame: pd.DataFrame,
-    scenario: Mapping[str, Any],
-    portfolio_field: str,
-) -> set[str]:
-    configured = scenario.get("cecl", {}).get("portfolios", {})
-    portfolios = {
-        _portfolio_key(name)
-        for name, spec in configured.items()
-        if isinstance(spec, Mapping) and spec.get("method") == "expected_loss"
-    } if isinstance(configured, Mapping) else set()
-    if portfolio_field in frame.columns:
-        mask = _consumer_row_mask(frame, scenario, portfolio_field)
-        portfolios.update(frame.loc[mask, portfolio_field].map(_portfolio_key))
-    return portfolios
-
-
 def _consumer_row_mask(
     frame: pd.DataFrame,
     scenario: Mapping[str, Any],
@@ -1318,6 +1639,34 @@ def _consumer_row_mask(
 
 def _portfolio_key(value: Any) -> str:
     return "" if pd.isna(value) else str(value).strip()
+
+
+def _level_tag_key(value: Any) -> str:
+    return "" if pd.isna(value) else str(value).strip()
+
+
+def _bucket_key(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    canonical = {
+        "pass": "Pass",
+        "special mention": "Special Mention",
+        "substandard": "Substandard",
+        "unknown": "Unknown",
+    }
+    return canonical.get(text.casefold(), text)
+
+
+def _portfolio_label(values: pd.Series) -> str:
+    portfolios = sorted(
+        {
+            _portfolio_key(value)
+            for value in values
+            if _portfolio_key(value)
+        }
+    )
+    return " | ".join(portfolios)
 
 
 def _normalized_portfolios(values: pd.Series) -> pd.Series:

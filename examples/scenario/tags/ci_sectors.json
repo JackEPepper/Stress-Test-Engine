@@ -2,6 +2,8 @@
   "tags": {
     "CI_Sector_Sponsor_and_Specialty": {
       "model_eligible": false,
+      "cecl_level": true,
+      "cecl_module": "C&I",
       "include": [
         {
           "field": "subsector",
@@ -54,6 +56,8 @@
     },
     "CI_Sector_Middle_Market": {
       "model_eligible": false,
+      "cecl_level": true,
+      "cecl_module": "C&I",
       "include": {
         "any": [
           {
@@ -86,6 +90,8 @@
     },
     "CI_Sector_Asset_Based_Lending": {
       "model_eligible": false,
+      "cecl_level": true,
+      "cecl_module": "C&I",
       "include": [
         {
           "field": "subsector",

@@ -111,6 +111,19 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     from .tagging import normalize_tag_defs
 
     tag_defs = normalize_tag_defs(scenario.get("tags", {}))
+    configured_modules = scenario.get("modules", {})
+    for tag in tag_defs:
+        if not tag.get("cecl_level", False):
+            continue
+        cecl_module = str(tag["cecl_module"])
+        if cecl_module != "Overlay" and (
+            not isinstance(configured_modules, Mapping)
+            or cecl_module not in configured_modules
+        ):
+            raise ValueError(
+                f"CECL-level tag '{tag['name']}' references cecl_module "
+                f"'{cecl_module}', which is not a configured module or Overlay."
+            )
     module_field = borrower.get("module_field", "model_module")
     portfolio_field = borrower.get("portfolio_field", "model_portfolio")
     cecl_portfolio_field = scenario.get("cecl", {}).get(

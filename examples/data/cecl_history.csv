@@ -1,13 +1,37 @@
-cecl_portfolio,period,historical_cecl_reserve
-Asset-Based Lending,2026Q1,8550
-Asset-Based Lending,2025Q4,10450
-BCC,2026Q1,2700
-BCC,2025Q4,3300
-CRE,2026Q1,31050
-CRE,2025Q4,37950
-EF,2026Q1,3600
-EF,2025Q4,4400
-Middle Market,2026Q1,7650
-Middle Market,2025Q4,9350
-Sponsor and Specialty,2026Q1,11250
-Sponsor and Specialty,2025Q4,13750
+cecl_tag,period,risk_bucket,historical_cecl_ratio
+CI_Sector_Asset_Based_Lending,2026Q1,Pass,0.015545454545454545
+CI_Sector_Asset_Based_Lending,2026Q1,Special Mention,0.015545454545454545
+CI_Sector_Asset_Based_Lending,2026Q1,Substandard,0.015545454545454545
+CI_Sector_Asset_Based_Lending,2025Q4,Pass,0.019
+CI_Sector_Asset_Based_Lending,2025Q4,Special Mention,0.019
+CI_Sector_Asset_Based_Lending,2025Q4,Substandard,0.019
+Business_Credit_Center_Overlay,2026Q1,Pass,0.0135
+Business_Credit_Center_Overlay,2026Q1,Special Mention,0.0135
+Business_Credit_Center_Overlay,2026Q1,Substandard,0.0135
+Business_Credit_Center_Overlay,2025Q4,Pass,0.0165
+Business_Credit_Center_Overlay,2025Q4,Special Mention,0.0165
+Business_Credit_Center_Overlay,2025Q4,Substandard,0.0165
+CRE_Model,2026Q1,Pass,0.008746478873239437
+CRE_Model,2026Q1,Special Mention,0.008746478873239437
+CRE_Model,2026Q1,Substandard,0.008746478873239437
+CRE_Model,2025Q4,Pass,0.010690140845070423
+CRE_Model,2025Q4,Special Mention,0.010690140845070423
+CRE_Model,2025Q4,Substandard,0.010690140845070423
+Equipment_Finance_Overlay,2026Q1,Pass,0.009
+Equipment_Finance_Overlay,2026Q1,Special Mention,0.009
+Equipment_Finance_Overlay,2026Q1,Substandard,0.009
+Equipment_Finance_Overlay,2025Q4,Pass,0.011
+Equipment_Finance_Overlay,2025Q4,Special Mention,0.011
+Equipment_Finance_Overlay,2025Q4,Substandard,0.011
+CI_Sector_Middle_Market,2026Q1,Pass,0.0095625
+CI_Sector_Middle_Market,2026Q1,Special Mention,0.0095625
+CI_Sector_Middle_Market,2026Q1,Substandard,0.0095625
+CI_Sector_Middle_Market,2025Q4,Pass,0.0116875
+CI_Sector_Middle_Market,2025Q4,Special Mention,0.0116875
+CI_Sector_Middle_Market,2025Q4,Substandard,0.0116875
+CI_Sector_Sponsor_and_Specialty,2026Q1,Pass,0.01875
+CI_Sector_Sponsor_and_Specialty,2026Q1,Special Mention,0.01875
+CI_Sector_Sponsor_and_Specialty,2026Q1,Substandard,0.01875
+CI_Sector_Sponsor_and_Specialty,2025Q4,Pass,0.022916666666666667
+CI_Sector_Sponsor_and_Specialty,2025Q4,Special Mention,0.022916666666666667
+CI_Sector_Sponsor_and_Specialty,2025Q4,Substandard,0.022916666666666667
