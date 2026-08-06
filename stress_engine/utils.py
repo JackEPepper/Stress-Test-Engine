@@ -127,7 +127,20 @@ def coerce_numeric_frame(df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFram
 
 
 def parse_date_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
+    """Parse mixed date values consistently and normalize timezones to UTC."""
+
+    def parse_value(value: Any) -> Any:
+        """Parse one scalar so pandas cannot infer one format for the column."""
+        if is_missing(value):
+            return pd.NaT
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            return pd.NaT
+        # Model dates are calendar cutoffs, not timezone-bearing instants. An
+        # aware source is first converted to UTC, then stored timezone-naive.
+        return parsed.tz_localize(None)
+
+    return series.map(parse_value)
 
 
 def risk_bucket_from_rating(rating: Any) -> str:
@@ -237,6 +250,7 @@ def ensure_columns(df: pd.DataFrame, fields: Sequence[str], context: str) -> Non
 
 
 def first_non_null(values: pd.Series) -> Any:
+    """Return the first nonmissing value or ``NaN`` when none exists."""
     not_null = values.dropna()
     if not_null.empty:
         return np.nan
@@ -244,11 +258,13 @@ def first_non_null(values: pd.Series) -> Any:
 
 
 def join_unique(values: pd.Series) -> str:
+    """Join distinct nonmissing values in deterministic lexical order."""
     items = [str(item) for item in values.dropna().astype(str).unique()]
     return ";".join(sorted(items))
 
 
 def hash_file(path: Path) -> str:
+    """Return a file's SHA-256 digest without loading it all at once."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -257,11 +273,13 @@ def hash_file(path: Path) -> str:
 
 
 def hash_json(data: Any) -> str:
+    """Return a stable SHA-256 digest for JSON-compatible content."""
     payload = json.dumps(data, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
 def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
+    """Recursively merge mappings while deep-copying retained values."""
     merged = copy.deepcopy(dict(base))
     for key, value in override.items():
         if (
@@ -276,6 +294,7 @@ def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str
 
 
 def flatten_json(data: Any, prefix: str = "") -> Dict[str, Any]:
+    """Flatten nested mappings and lists into deterministic JSON paths."""
     out: Dict[str, Any] = {}
     if isinstance(data, Mapping):
         for key in sorted(data):
@@ -297,11 +316,20 @@ _PATH_TOKEN_RE = re.compile(r"([^\.\[\]]+)|\[(\d+)\]")
 
 def json_path_tokens(path: str) -> List[Any]:
     """Tokenize dotted JSON paths such as ``modules.CRE.x[0]``."""
-    tokens = [
-        match.group(1) if match.group(1) is not None else int(match.group(2))
-        for match in _PATH_TOKEN_RE.finditer(path)
-    ]
-    if not tokens:
+    if not isinstance(path, str):
+        raise ValueError(f"Invalid JSON path: {path}")
+    matches = list(_PATH_TOKEN_RE.finditer(path))
+    tokens: List[Any] = []
+    position = 0
+    for index, match in enumerate(matches):
+        is_key = match.group(1) is not None
+        separator = path[position : match.start()]
+        expected_separator = "" if index == 0 or not is_key else "."
+        if separator != expected_separator:
+            raise ValueError(f"Invalid JSON path: {path}")
+        tokens.append(match.group(1) if is_key else int(match.group(2)))
+        position = match.end()
+    if not tokens or position != len(path):
         raise ValueError(f"Invalid JSON path: {path}")
     return tokens
 
@@ -344,6 +372,7 @@ def set_json_path(data: Any, path: str, value: Any) -> Any:
 
 
 def resolve_path(path_value: Any, base_dir: Path) -> Path:
+    """Resolve a configured path against its scenario directory anchor."""
     path = Path(str(path_value))
     if path.is_absolute():
         return path
@@ -351,6 +380,7 @@ def resolve_path(path_value: Any, base_dir: Path) -> Path:
 
 
 def sort_frame(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    """Stably sort by available columns and always return a clean index."""
     sort_cols = [column for column in columns if column in df.columns]
     if not sort_cols:
         return df.reset_index(drop=True)
@@ -358,9 +388,15 @@ def sort_frame(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
 
 
 def compare_values(left: Any, right: Any) -> bool:
-    if is_missing(left) and is_missing(right):
-        return True
-    return left == right
+    """Compare scalar values while treating paired missing values as equal."""
+    left_missing = is_missing(left)
+    right_missing = is_missing(right)
+    if left_missing or right_missing:
+        return bool(left_missing and right_missing)
+    try:
+        return bool(left == right)
+    except (TypeError, ValueError):
+        return False
 
 
 def weighted_average(values: pd.Series, weights: pd.Series) -> float:
@@ -382,6 +418,7 @@ def pct(numerator: float, denominator: float) -> float:
 
 
 def json_safe(value: Any) -> Any:
+    """Convert NumPy, pandas, and nested values to JSON-safe primitives."""
     if isinstance(value, (pd.Timestamp, np.datetime64)):
         if pd.isna(value):
             return None

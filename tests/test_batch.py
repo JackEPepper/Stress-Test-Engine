@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator, Sequence
 from unittest.mock import patch
 
 import numpy as np
@@ -17,6 +19,8 @@ from stress_engine.batch import (
 )
 from stress_engine.config import load_scenario
 from stress_engine.engine import OUTPUT_MANIFEST_KIND, StressEngine
+from stress_engine.progress import ProgressReporter, ProgressStep
+from stress_engine.utils import json_path_tokens
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,7 +80,114 @@ class _FakeStressEngine:
         }
 
 
+class _WarningStressEngine(_FakeStressEngine):
+    def run(self, output_dir=None, write_outputs=True, run_comparison=True):
+        result = super().run(output_dir, write_outputs, run_comparison)
+        result["reports"]["exception_log"] = pd.DataFrame(
+            [
+                {
+                    "severity": "WARNING",
+                    "stage": "demo",
+                    "code": "DEMO_WARNING",
+                    "message": "Review this run.",
+                }
+            ]
+        )
+        result["metadata"]["exception_count"] = 1
+        return result
+
+
+class _RecordingProgress(ProgressReporter):
+    def __init__(self):
+        self.planned = []
+        self.completed = []
+        self.updates = []
+
+    def start(self, title: str, steps: Sequence[ProgressStep]) -> None:
+        self.planned = [step.key for step in steps]
+
+    @contextmanager
+    def step(self, key: str) -> Iterator[None]:
+        yield
+        self.completed.append(key)
+
+    def update(self, message: str, **kwargs) -> None:
+        self.updates.append(message)
+
+
 class BatchScenarioTest(unittest.TestCase):
+    def test_json_paths_reject_skipped_or_malformed_characters(self):
+        self.assertEqual(
+            json_path_tokens("modules.CRE.tests[0].value"),
+            ["modules", "CRE", "tests", 0, "value"],
+        )
+        for path in (
+            "modules..CRE",
+            ".modules.CRE",
+            "modules.CRE.",
+            "modules.[0]",
+            "modules[0]value",
+            "modules[-1]",
+            "modules[all]",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "Invalid JSON path"):
+                    json_path_tokens(path)
+
+    def test_batch_progress_wraps_children_without_changing_child_api(self):
+        scenario = {
+            "scenario_id": "tiny_batch",
+            "value": 0,
+            "scenario_batch": {
+                "mode": "grid",
+                "variables": [{"path": "value", "values": [1, 2]}],
+            },
+        }
+        progress = _RecordingProgress()
+        with patch("stress_engine.batch.StressEngine", _FakeStressEngine):
+            result = run_batch_scenarios(
+                scenario,
+                ROOT,
+                write_outputs=False,
+                run_comparison=False,
+                progress=progress,
+            )
+
+        self.assertEqual(result["metadata"]["generated_scenario_count"], 2)
+        self.assertEqual(result["metadata"]["exception_count"], 0)
+        self.assertEqual(result["metadata"]["exception_counts_by_severity"], {})
+        self.assertEqual(
+            progress.planned,
+            ["base", "generated", "reports", "metadata"],
+        )
+        self.assertEqual(progress.completed, progress.planned)
+        self.assertTrue(
+            any("scenario 2/2: scenario_0002" in item for item in progress.updates)
+        )
+
+    def test_batch_metadata_aggregates_child_control_severities(self):
+        scenario = {
+            "scenario_id": "warning_batch",
+            "value": 0,
+            "scenario_batch": {
+                "mode": "grid",
+                "variables": [{"path": "value", "values": [1]}],
+            },
+        }
+        with patch("stress_engine.batch.StressEngine", _WarningStressEngine):
+            result = run_batch_scenarios(
+                scenario,
+                ROOT,
+                write_outputs=False,
+                run_comparison=False,
+            )
+
+        self.assertEqual(result["metadata"]["exception_count"], 2)
+        self.assertEqual(
+            result["metadata"]["exception_counts_by_severity"],
+            {"WARNING": 2},
+        )
+
     def test_grid_expansion_is_deterministic(self):
         scenario, _ = load_scenario([SCENARIO, BATCH])
         expanded = expand_batch_scenarios(scenario)

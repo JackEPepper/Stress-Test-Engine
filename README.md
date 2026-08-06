@@ -36,24 +36,44 @@ using any result.
 You need:
 
 - a command line (the examples below use Windows PowerShell);
-- Python 3.9 or newer; and
+- Python 3.11 or newer for a new production environment; and
 - permission to install the project dependencies.
 
-From the repository folder, create a private Python environment and install the
-engine:
+Python 3.9 remains functionally compatible for legacy Anaconda installations,
+but it is end-of-life and should not be used for a new production environment.
+
+For Anaconda, create a dedicated environment from the checked-in specification.
+Do not install or demo the project from the `base` environment:
+
+```powershell
+conda env create --file environment.yml
+conda activate credit-stress
+python -m pip install --no-deps .
+credit-stress --version
+```
+
+Conda installs the numerical and Excel dependencies first; pip then installs
+only this local Python package. Always activate the environment before running
+the engine. From automation, `conda run -n credit-stress credit-stress ...` is
+the equivalent without interactive activation.
+
+For a standard Python virtual environment instead:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install .
+.\.venv\Scripts\credit-stress.exe --version
 ```
 
 If the `py` command is unavailable, use `python` in its place.
+Developers who want source edits to be immediately importable can substitute
+`python -m pip install -e .` for the production install command.
 
 ### 2. Run the included example
 
 ```powershell
-.\.venv\Scripts\python.exe -m stress_engine examples/scenario.json --no-comparison
+python -m stress_engine examples/scenario.json --no-comparison --progress
 ```
 
 The example writes results to:
@@ -61,6 +81,12 @@ The example writes results to:
 ```text
 examples/outputs/example_2026q2
 ```
+
+Interactive terminals show progress automatically. `--progress` forces the
+line-oriented display in IDEs, redirected sessions, and recorded demos. Each
+step prints an approximate ETA before it starts and its actual duration when
+done. Progress goes to standard error; the stable completion and control
+summary remains on standard output.
 
 ### 3. Review the run
 
@@ -99,6 +125,7 @@ old run must be retained.
 ## Repository map
 
 ```text
+environment.yml                  Recommended dedicated Anaconda environment
 examples/
 ├── data/                         Example source data
 │   ├── loans.csv
@@ -108,8 +135,10 @@ examples/
 │   ├── consumer_scores_1.csv
 │   ├── consumer_scores_2.csv
 │   ├── fico_pd_lookup.csv
+│   ├── tariff_partner_list.csv
 │   └── tag_tieouts.csv
 ├── scenario.json                 Manifest, migration cutoffs, CECL, and includes
+├── targeted_stress.json          Loan-grain oil/tariff control example
 ├── scenario/
 │   ├── inputs.json               Inputs and borrower construction settings
 │   ├── modules/
@@ -308,6 +337,17 @@ borrower, the run stops because choosing either borrower would be ambiguous.
 Numeric conversion understands commas, dollar signs, percentage signs, and
 parentheses for negatives. Nonblank values that cannot be converted become
 missing and are reported in the exception log.
+
+Dates are parsed one cell at a time, so mixed common formats do not change
+meaning between pandas releases. Prefer ISO `YYYY-MM-DD` values for human
+review. Timezone-bearing timestamps are converted to UTC and then stored
+without timezone metadata because model cutoffs are calendar values.
+
+The engine owns a stable default missing-value vocabulary instead of inheriting
+pandas' version-specific defaults. Blank cells and common tokens such as
+`None`, `NULL`, `NA`, `N/A`, and `#N/A` load as missing unless a configured
+converter deliberately preserves a token. A source can override this policy
+through its explicit `read_options`.
 
 Leave unavailable values blank. Do not use zero as a missing-value code unless
 the relevant aggregation explicitly says `treat_zero_as_missing`. The one
@@ -801,6 +841,14 @@ Additional controls are written to:
 final selection. In particular, `selection_reason = model_excluded` shows that
 a shock selector matched an exposure but an ARR-style exclusion vetoed it.
 
+The checked-in targeted example also demonstrates fail-closed CECL controls.
+Its three non-baseline variants create positive Middle Market S2 Substandard
+balance without a usable current-period in-place ratio, so the run reports
+three `CECL_RESERVE_RATIO_UNAVAILABLE` errors and leaves the affected portfolio
+and Aggregate S2 CECL totals unavailable. Use the standard example for a
+zero-error introductory demo; use the targeted example when demonstrating how
+the engine refuses to turn a missing reserve basis into a zero.
+
 ### CECL
 
 For the current-quarter `in_place` component, commercial CECL calculates one
@@ -1032,7 +1080,7 @@ This is why out-of-scope files must be reviewed alongside headline results.
 ### Standard run
 
 ```powershell
-.\.venv\Scripts\python.exe -m stress_engine examples/scenario.json --no-comparison
+.\.venv\Scripts\python.exe -m stress_engine examples/scenario.json --no-comparison --progress
 ```
 
 ### Override the output folder
@@ -1048,6 +1096,8 @@ writes under `examples/outputs/2026q2_review`.
 
 | Option | Meaning |
 |---|---|
+| `--help` | Show the complete command reference without loading numerical dependencies |
+| `--version` | Print the installed engine version without loading numerical dependencies |
 | `--output-dir PATH` | Override the configured output directory |
 | `--no-comparison` | Skip prior-scenario comparisons |
 | `--no-write` | Calculate in memory without creating output files |
@@ -1056,6 +1106,21 @@ writes under `examples/outputs/2026q2_review`.
 | `--batch-mode grid|paired` | Override the configured batch mode |
 | `--max-scenarios N` | Limit the number of generated sensitivity runs |
 | `--no-write-child-outputs` | Keep batch summaries but omit full child folders; previously engine-owned child outputs are cleaned up when reusing the directory |
+| `--progress` | Force line-oriented live timings and ETAs, including in IDEs and recorded demos |
+| `--no-progress` | Suppress live progress while retaining the final run summary |
+
+Progress is enabled automatically only when standard error is attached to an
+interactive terminal. It is always line-oriented and flushed immediately; no
+ANSI control codes or background timing threads are used. ETAs are adaptive
+estimates, while completed-step and total durations are measured with a
+monotonic clock.
+
+The final `Controls:` line always reports ERROR, WARNING, and INFO totals. A
+process exit code of zero means the engine completed its requested workflow;
+it does not mean every modeled result is available. Review ERROR controls
+before using results, followed by WARNING and INFO. Configuration, input, and
+filesystem failures that prevent a run return a nonzero status with a concise
+`ERROR:` message instead of an application traceback.
 
 ## Control review
 
@@ -1071,6 +1136,10 @@ writes under `examples/outputs/2026q2_review`.
 
 Start with ERROR, then WARNING. INFO rows are useful for explaining how defaults
 were applied.
+
+Prior-scenario load failures and marginal-rerun failures are promoted from
+`scenario_diff.csv` into this log as `SCENARIO_COMPARISON_FAILED`, so they are
+included in both metadata counts and the terminal control summary.
 
 ### 2. Source reconciliation
 
@@ -1141,7 +1210,7 @@ files' aggregate balances are not expected to match.
 | `cecl_basis_summary.csv` | CECL configured/effective period weights, skipped history, central-tendency trimming, effective ratios, and availability controls |
 | `cecl_summary.csv` | Base and stressed pro forma reserve dollars and ratios |
 | `scenario_diff.csv` | Optional prior-scenario and marginal-variable comparison |
-| `metadata.json` | Scenario/input hashes, runtime versions, exception counts, and report hashes |
+| `metadata.json` | Scenario/input hashes, Python/pandas/NumPy/openpyxl versions, exception counts, and report hashes |
 | `scenario_used.json` | Merged configuration used for audit; not a portable rerun package |
 | `output_manifest.json` | Files owned by the engine in this output directory |
 
@@ -1185,7 +1254,7 @@ for generated scenarios.
 ### Run the batch
 
 ```powershell
-.\.venv\Scripts\python.exe -m stress_engine examples/scenario.json examples/scenario_batch.json --batch --no-comparison --no-write-child-outputs
+.\.venv\Scripts\python.exe -m stress_engine examples/scenario.json examples/scenario_batch.json --batch --no-comparison --no-write-child-outputs --progress
 ```
 
 Batch outputs are:
@@ -1196,7 +1265,7 @@ Batch outputs are:
 | `batch_variables.csv` | Variable values used in each generated run |
 | `batch_cecl_summary.csv` | Full CECL rows with run and variable columns |
 | `batch_exceptions.csv` | Exceptions from all included runs |
-| `batch_metadata.json` | Scenario counts, hashes, per-run exception counts, and report hashes |
+| `batch_metadata.json` | Scenario counts, hashes, aggregate severity counts, per-run exception counts, and report hashes |
 | `batch_output_manifest.json` | Batch reports and child directories owned by the engine for safe cleanup on reuse |
 
 The maximum-scenario limit is checked before a grid or paired set is built, so
@@ -1223,6 +1292,11 @@ Run the comparison:
 ```powershell
 .\.venv\Scripts\python.exe -m stress_engine examples/scenario.json --previous-scenario archive/2026q1/scenario.json
 ```
+
+A `--previous-scenario` path is interpreted from the shell's working directory
+and converted to an absolute path at CLI intake. Paths stored inside a
+scenario's `comparison.previous_scenarios` list are resolved relative to that
+scenario's folder, matching input and output path behavior.
 
 `scenario_diff.csv` reports:
 
@@ -1254,6 +1328,8 @@ when moved into an output directory.
 | Consumer value carries forward in stressed CECL | Review missing FICO/appraisal/lookup values, invalid assumptions, and Consumer out-of-scope detail |
 | CRE/C&I out of scope | Review borrower, field, test, and reason in out-of-scope detail |
 | Batch exceeds maximum | Reduce values, use paired mode, or deliberately raise `max_scenarios` |
+| Missing runtime dependency | Activate the project environment, then run `python -m pip install .` |
+| Comparison finished with errors | Review `scenario_diff.csv` and `SCENARIO_COMPARISON_FAILED` rows in `exception_log.csv` |
 | Excel read error | Confirm XLSX/XLSM format, sheet name, and that the file is not corrupt |
 
 ## Glossary
@@ -1288,3 +1364,5 @@ Run the complete automated test suite:
 The tests cover the sample run, split manifests, configured source aliases,
 ignored extra source columns, borrower aggregation, missing-data behavior,
 overlays, CECL, comparisons, batch generation, and deterministic reporting.
+They also cover CLI stream separation, adaptive progress reporting, malformed
+JSON paths, comparison error visibility, and batch-level severity totals.

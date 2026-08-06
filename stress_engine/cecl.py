@@ -223,6 +223,8 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
             f"Current CECL reserve field '{current_field}' must use borrower "
             "aggregation 'sum'."
         )
+    # The current reserve contract is valid on its own. Historical calibration
+    # adds a second, stricter contract only when reserve_basis is configured.
     basis = cecl.get("reserve_basis")
     if basis is None:
         return
@@ -287,6 +289,9 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
             "risk bucket."
         )
 
+    # Historical ratios live at tag/period/bucket grain and must remain outside
+    # the loan merge; enforcing the loader schema here prevents silent coercion
+    # or duplication before calibration begins.
     source = _nonblank_setting(
         historical,
         "source",
@@ -458,7 +463,7 @@ def normalized_balance_values(
     )
     if balance_field not in frame.columns:
         return pd.Series(np.nan, index=frame.index, dtype=float)
-    balances = _coerced_balance_values(frame[balance_field])
+    balances = coerced_numeric_values(frame[balance_field])
     balances = balances.where(np.isfinite(balances))
     tolerance = zero_balance_tolerance(scenario)
     return balances.mask(balances.abs().le(tolerance), 0.0)
@@ -475,7 +480,7 @@ def invalid_balance_mask(
     )
     if balance_field not in frame.columns:
         return pd.Series(False, index=frame.index, dtype=bool)
-    balances = _coerced_balance_values(frame[balance_field])
+    balances = coerced_numeric_values(frame[balance_field])
     tolerance = zero_balance_tolerance(scenario)
     return pd.Series(
         (~np.isfinite(balances)) | balances.lt(-tolerance),
@@ -484,12 +489,17 @@ def invalid_balance_mask(
     )
 
 
-def _coerced_balance_values(values: pd.Series) -> pd.Series:
+def coerced_numeric_values(values: pd.Series) -> pd.Series:
     """Return ordinary float values for NumPy and nullable pandas inputs."""
     numeric = pd.to_numeric(values, errors="coerce")
     try:
-        array = numeric.to_numpy(dtype=float, na_value=np.nan)
-    except (AttributeError, TypeError, ValueError):
+        # Older pandas releases can warn and then raise on nullable Series with
+        # duplicate labels. Conversion is positional, so normalize only the
+        # temporary index and restore the authoritative labels below.
+        array = numeric.reset_index(drop=True).to_numpy(
+            dtype=float, na_value=np.nan
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
         array = np.asarray(numeric, dtype=float)
     result = pd.Series(array, index=values.index, dtype=float)
     boolean_values = values.map(
@@ -526,6 +536,8 @@ def build_cecl_reserve_basis(
         scenario.get("borrower", {}).get("balance_field", "outstanding_balance")
     )
     output_index = results.index.copy()
+    # All assignments below are positional because callers may supply duplicate
+    # row labels. The original labels are restored only on the returned series.
     basis_results = results.reset_index(drop=True).copy()
     if portfolio_field in basis_results.columns:
         basis_results[portfolio_field] = _normalized_portfolios(
@@ -586,6 +598,8 @@ def build_cecl_reserve_basis(
             output_index,
         )
 
+    # Missing-reserve diagnostics follow model eligibility: excluded loans and
+    # malformed balances cannot contribute to CECL calibration totals.
     reserve_scope = pd.Series(True, index=basis_results.index)
     if "model_excluded" in basis_results.columns:
         reserve_scope &= ~basis_results["model_excluded"].fillna(False).astype(
@@ -738,6 +752,8 @@ def build_cecl_reserve_basis(
         frame = frame.loc[~missing_level_tag].copy()
         consumer_mask = consumer_mask.reindex(frame.index, fill_value=False)
 
+    # Consumer CECL preserves loan-level in-place reserve amounts. Commercial
+    # CECL can instead calibrate and apply tag/bucket ratios, including history.
     consumer_frame = frame.loc[consumer_mask].copy()
     commercial_frame = frame.loc[~consumer_mask].copy()
     commercial_tags = {
@@ -777,6 +793,7 @@ def build_cecl_reserve_basis(
         is_consumer: bool,
         basis_invalid_balance_count: int,
     ) -> None:
+        """Resolve one CECL tag/bucket basis and append its ratio and audit rows."""
         current_only = is_consumer or bucket_text == "Unknown"
         group_current_method = "in_place" if current_only else current_method
         group_history_enabled = history_enabled and not current_only
@@ -890,6 +907,9 @@ def build_cecl_reserve_basis(
                     ),
                 )
 
+        # In-place/current-only groups retain each loan's actual reserve amount.
+        # Ratio-based groups allocate the calibrated group ratio back by balance
+        # so downstream module calculations reconcile to the reported reserve.
         direct_amount_basis = (
             group_current_method == "in_place" and not group_history_enabled
         )
@@ -1002,7 +1022,10 @@ def build_cecl_reserve_basis(
             audit_rows.append(row)
 
     for (portfolio, bucket), group in consumer_frame.groupby(
-        [portfolio_field, "base_bucket"], dropna=False, sort=False
+        [portfolio_field, "base_bucket"],
+        dropna=False,
+        sort=False,
+        observed=True,
     ):
         bucket_text = _bucket_key(bucket)
         if bucket_text not in VALID_BUCKETS:
@@ -1016,8 +1039,13 @@ def build_cecl_reserve_basis(
             basis_invalid_balance_count=0,
         )
 
+    # When history is enabled, materialize every canonical commercial bucket,
+    # even an empty one, so a later stressed migration has a ratio ready to use.
     for cecl_level_tag, tag_group in commercial_frame.groupby(
-        CECL_LEVEL_TAG_FIELD, dropna=False, sort=False
+        CECL_LEVEL_TAG_FIELD,
+        dropna=False,
+        sort=False,
+        observed=True,
     ):
         portfolio = _portfolio_label(tag_group[portfolio_field])
         observed_buckets = [
@@ -1075,6 +1103,8 @@ def _warn_decreasing_effective_ladders(
         )
         if _level_tag_key(value)
     }
+    # Inspect only ratios actually applied to commercial rows; raw historical
+    # ladders are validated separately while their source period is still known.
     by_tag: Dict[str, Dict[str, float]] = {}
     for row in ratio_rows:
         tag = _level_tag_key(row.get(CECL_LEVEL_TAG_FIELD))
@@ -1132,6 +1162,7 @@ def _warn_decreasing_effective_ladders(
 
 
 def _basis_config(scenario: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the CECL reserve-basis mapping, or an empty mapping."""
     cecl = scenario.get("cecl", {})
     if not isinstance(cecl, Mapping):
         return {}
@@ -1140,6 +1171,7 @@ def _basis_config(scenario: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _configured_cecl_level_tags(scenario: Mapping[str, Any]) -> set[str]:
+    """Return nonblank scenario tag names marked as CECL-level."""
     tags = scenario.get("tags", {})
     if not isinstance(tags, Mapping):
         return set()
@@ -1153,15 +1185,18 @@ def _configured_cecl_level_tags(scenario: Mapping[str, Any]) -> set[str]:
 
 
 def _historical_config(basis: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the historical basis mapping, or an empty mapping."""
     historical = basis.get("historical", {})
     return historical if isinstance(historical, Mapping) else {}
 
 
 def _history_enabled(historical: Mapping[str, Any]) -> bool:
+    """Return whether historical CECL weighting is explicitly enabled."""
     return historical.get("enabled", False) is True
 
 
 def _validated_current_method(basis: Mapping[str, Any]) -> str:
+    """Return the current method after validating legacy/new settings."""
     legacy = basis.get("method")
     current = basis.get("current_method", legacy if legacy is not None else "in_place")
     if legacy is not None and "current_method" in basis and str(legacy) != str(current):
@@ -1178,11 +1213,13 @@ def _validated_current_method(basis: Mapping[str, Any]) -> str:
 
 
 def _current_method(basis: Mapping[str, Any]) -> str:
+    """Return a supported current method, defaulting to in-place."""
     method = basis.get("current_method", basis.get("method", "in_place"))
     return str(method) if str(method) in CURRENT_METHODS else "in_place"
 
 
 def _basis_label(current_method: str, history_enabled: bool) -> str:
+    """Compose the output label for a current-only or blended basis."""
     return (
         f"{current_method}+tag_bucket_history"
         if history_enabled
@@ -1193,6 +1230,7 @@ def _basis_label(current_method: str, history_enabled: bool) -> str:
 def _validate_current_reserve_wiring(
     scenario: Mapping[str, Any], cecl: Mapping[str, Any]
 ) -> None:
+    """Ensure the reserve field is a required numeric identity input."""
     field = str(cecl.get("reserve_field", "cecl_reserve"))
     identity = scenario.get("inputs", {}).get("identity", {})
     if not isinstance(identity, Mapping) or not identity:
@@ -1298,6 +1336,7 @@ def _validate_current_field_names(
 def _nonblank_setting(
     config: Mapping[str, Any], key: str, path: str
 ) -> str:
+    """Return a stripped required setting or raise with its config path."""
     value = str(config.get(key, "")).strip()
     if not value:
         raise ValueError(f"{path} must be nonblank.")
@@ -1307,6 +1346,7 @@ def _nonblank_setting(
 def _configured_field(
     config: Mapping[str, Any], key: str, default: str
 ) -> str:
+    """Return a nonblank historical field name with its default applied."""
     value = str(config.get(key, default)).strip()
     if not value:
         raise ValueError(f"cecl.reserve_basis.historical.{key} must be nonblank.")
@@ -1314,6 +1354,7 @@ def _configured_field(
 
 
 def _positive_weight(value: Any, path: str) -> float:
+    """Return a finite positive period weight or raise for its config path."""
     number = _finite_number(value, path)
     if number <= 0:
         raise ValueError(f"{path} must be greater than zero.")
@@ -1323,6 +1364,7 @@ def _positive_weight(value: Any, path: str) -> float:
 def _period_specs(
     historical: Mapping[str, Any], enabled: bool
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Return normalized current and historical period specifications."""
     if not enabled:
         return {"name": "current", "weight": 1.0}, []
     current = historical.get("current_period", {})
@@ -1348,6 +1390,7 @@ def _prepare_history(
     exceptions: List[Dict[str, Any]],
     commercial_tags: set[str],
 ) -> tuple[Dict[tuple[str, str, str], Dict[str, Any]], str]:
+    """Validate relevant history rows and index their ratio states."""
     if not enabled:
         return {}, ""
     if not commercial_tags:
@@ -1391,6 +1434,8 @@ def _prepare_history(
             )
         return {}, code
 
+    # Ignore unrelated rows from a shared history source, but normalize keys
+    # before validating uniqueness so cosmetic whitespace cannot hide clashes.
     configured_periods = {
         str(period.get("name", "")).strip()
         for period in config.get("periods", [])
@@ -1449,11 +1494,14 @@ def _prepare_history(
             "CECL tag history must contain one unique row per tag, period, "
             f"and risk bucket; duplicates: {', '.join(duplicate_keys)}."
         )
+    # Store explicit available/skipped/unavailable states. A skipped N/A cell
+    # can be reweighted later; an invalid ratio must make the basis unavailable.
     lookup: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     for key, group in work.groupby(
         ["_tag_key", "_bucket_key", "_period_key"],
         dropna=False,
         sort=False,
+        observed=True,
     ):
         raw_ratio = group[ratio_field].iloc[0]
         if _is_history_skip_token(raw_ratio):
@@ -1532,6 +1580,7 @@ def _historical_period_values(
     period: str,
     current_bucket_balance: float,
 ) -> Dict[str, Any]:
+    """Return one history period's ratio and reserve at current balance."""
     item = lookup.get(
         (
             _level_tag_key(cecl_level_tag),
@@ -1539,6 +1588,8 @@ def _historical_period_values(
             _period_key(period),
         )
     )
+    # A source-wide failure takes precedence; otherwise preserve missing,
+    # skipped, and invalid cell states so weighting and audit logic can differ.
     if global_code:
         return _unavailable_period(global_code, current_bucket_balance)
     if item is None:
@@ -1557,6 +1608,8 @@ def _historical_period_values(
         return _unavailable_period(
             "CECL_HISTORY_RATIO_INVALID", current_bucket_balance
         )
+    # Historical inputs supply ratios only. Apply them to the current bucket
+    # balance so periods share one allocation base and remain comparable.
     reserve = (
         current_bucket_balance * ratio
         if np.isfinite(current_bucket_balance)
@@ -1579,6 +1632,7 @@ def _historical_period_values(
 
 
 def _unavailable_period(code: str, balance: float) -> Dict[str, Any]:
+    """Return the standard audit payload for an unavailable period."""
     return {
         "observation_count": 0,
         "included_observation_count": 0,
@@ -1596,6 +1650,7 @@ def _unavailable_period(code: str, balance: float) -> Dict[str, Any]:
 
 
 def _skipped_period(balance: float) -> Dict[str, Any]:
+    """Return the standard audit payload for an explicit N/A period."""
     return {
         "observation_count": 1,
         "included_observation_count": 0,
@@ -1616,6 +1671,10 @@ def _apply_effective_period_weights(
     selected: List[tuple[Dict[str, Any], Dict[str, Any]]],
     audit_rows: List[Dict[str, Any]],
 ) -> None:
+    """Populate normalized period weights and weighted ratio components."""
+    # Explicitly skipped periods surrender their weight to available periods.
+    # Any unavailable period blocks normalization to avoid presenting a partial
+    # blend as complete.
     unavailable = any(
         values.get("status") == "unavailable" for _, values in selected
     )
@@ -1665,6 +1724,7 @@ def _audit_row(
     invalid_balance_count: int,
     values: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    """Build one period-level CECL reserve-basis audit row."""
     weight = float(period["weight"])
     ratio = values.get("period_reserve_ratio", np.nan)
     return {
@@ -1699,6 +1759,7 @@ def _borrower_observations(
     balance_field: str,
     reserve_field: str,
 ) -> pd.DataFrame:
+    """Aggregate loan balances and reserves to calibration borrowers."""
     work = pd.DataFrame(index=group.index)
     work["balance"] = pd.to_numeric(group[balance_field], errors="coerce")
     work["reserve_raw"] = _finite_numeric(group[reserve_field])
@@ -1713,6 +1774,8 @@ def _borrower_observations(
     if borrower_field in group.columns:
         borrower = group[borrower_field].astype(object)
         missing = borrower.isna() | borrower.astype(str).str.strip().eq("")
+        # Missing IDs must remain separate observations; grouping them together
+        # would invent one borrower and distort central-tendency filtering.
         fallback = pd.Series(group.index, index=group.index).map(
             lambda value: f"__row_{value}"
         )
@@ -1720,7 +1783,7 @@ def _borrower_observations(
     else:
         work["borrower"] = [f"__row_{index}" for index in group.index]
     return (
-        work.groupby("borrower", dropna=False)
+        work.groupby("borrower", dropna=False, observed=True)
         .agg(
             balance=("balance", "sum"),
             reserve=("reserve", "sum"),
@@ -1736,6 +1799,7 @@ def _calculate_current_period(
     threshold: float,
     group_balance: float,
 ) -> Dict[str, Any]:
+    """Calculate one current-period ratio and its observation diagnostics."""
     reserve = _finite_fsum(observations["reserve"])
     raw_ratio = pct(reserve, group_balance) if pd.notna(reserve) else np.nan
     valid = observations[
@@ -1747,6 +1811,8 @@ def _calculate_current_period(
     observation_count = int(len(valid))
     mean = float(valid["ratio"].mean()) if observation_count else np.nan
     std = float(valid["ratio"].std(ddof=0)) if observation_count else np.nan
+    # Central tendency removes borrower-ratio outliers only when dispersion is
+    # estimable; in-place retains the portfolio's aggregate reserve ratio.
     if method == "central_tendency":
         if observation_count == 0:
             included = valid
@@ -1786,6 +1852,7 @@ def _row_basis_methods(
     portfolio_field: str,
     commercial_method: str,
 ) -> pd.Series:
+    """Return each row's basis label, forcing Consumer rows to in-place."""
     methods = pd.Series(commercial_method, index=results.index, dtype=object)
     mask = _consumer_row_mask(results, scenario, portfolio_field)
     methods.loc[mask] = "in_place"
@@ -1797,6 +1864,7 @@ def _consumer_row_mask(
     scenario: Mapping[str, Any],
     portfolio_field: str,
 ) -> pd.Series:
+    """Identify Consumer rows from CECL configuration and module routing."""
     mask = pd.Series(False, index=frame.index)
     configured = scenario.get("cecl", {}).get("portfolios", {})
     expected_loss = {
@@ -1817,14 +1885,17 @@ def _consumer_row_mask(
 
 
 def _portfolio_key(value: Any) -> str:
+    """Normalize a portfolio value for configuration comparisons."""
     return "" if pd.isna(value) else str(value).strip()
 
 
 def _level_tag_key(value: Any) -> str:
+    """Normalize a CECL-level tag value for lookup keys."""
     return "" if pd.isna(value) else str(value).strip()
 
 
 def _bucket_key(value: Any) -> str:
+    """Normalize known risk-bucket spellings while preserving extensions."""
     if pd.isna(value):
         return ""
     text = str(value).strip()
@@ -1838,6 +1909,7 @@ def _bucket_key(value: Any) -> str:
 
 
 def _portfolio_label(values: pd.Series) -> str:
+    """Join the public portfolios represented by one calibration tag."""
     portfolios = sorted(
         {
             _portfolio_key(value)
@@ -1856,16 +1928,19 @@ def _normalized_portfolios(values: pd.Series) -> pd.Series:
 
 
 def _period_key(value: Any) -> str:
+    """Normalize a historical period value for lookup keys."""
     return "" if pd.isna(value) else str(value).strip()
 
 
 def _is_history_skip_token(value: Any) -> bool:
+    """Return whether a history cell explicitly requests period skipping."""
     if pd.isna(value):
         return False
     return str(value).strip().casefold() in HISTORY_SKIP_TOKENS
 
 
 def _finite_number(value: Any, path: str) -> float:
+    """Return a finite scalar or raise with its configuration path."""
     number = to_number(value, np.nan)
     if isinstance(value, (bool, np.bool_)) or not np.isfinite(number):
         raise ValueError(f"{path} must be numeric and finite.")
@@ -1873,11 +1948,13 @@ def _finite_number(value: Any, path: str) -> float:
 
 
 def _finite_numeric(values: pd.Series) -> pd.Series:
+    """Coerce a series to numeric values and replace infinities with missing."""
     numeric = pd.to_numeric(values, errors="coerce")
     return numeric.where(np.isfinite(numeric))
 
 
 def _finite_fsum(values: Iterable[float]) -> float:
+    """Sum numeric values accurately, returning NaN for invalid totals."""
     try:
         total = math.fsum(float(value) for value in values)
     except (OverflowError, TypeError, ValueError):
@@ -1888,6 +1965,7 @@ def _finite_fsum(values: Iterable[float]) -> float:
 def _exception_exists(
     exceptions: Iterable[Mapping[str, Any]], code: str, field: str
 ) -> bool:
+    """Return whether an exception code already exists for a field."""
     return any(
         str(item.get("code", "")) == code
         and str(item.get("field", "")) == field
@@ -1925,6 +2003,7 @@ def _unavailable_basis(
     required_fields: tuple[str, ...],
     code: str,
 ) -> CeclReserveBasis:
+    """Build an empty reserve basis carrying its terminal exception code."""
     return CeclReserveBasis(
         method=method,
         current_method=current_method,

@@ -43,6 +43,8 @@ def run_consumer(
     reserve_field_available = reserve_field in out.columns
     rushed_sale_discount = to_number(config.get("rushed_sale_discount"), np.nan)
     closing_costs = to_number(config.get("closing_costs"), np.nan)
+    # Treat the base liquidation assumptions as one unit: a bad component
+    # keeps the unstressed reserve bridge unavailable instead of partially set.
     liquidation_assumption_errors = []
     if is_missing(rushed_sale_discount) or not 0 <= rushed_sale_discount <= 1:
         liquidation_assumption_errors.append("rushed_sale_discount")
@@ -82,6 +84,8 @@ def run_consumer(
                 record_out_of_scope(out_scope, row, scenario, "Consumer", level, "PD", ["fico_pd_lookup"], "missing_pd_lookup")
             continue
 
+        # The unstressed reserve bridge uses the same liquidation mechanics as
+        # stress, before applying any scenario-specific collateral factor.
         unstressed_collateral_value = to_number(appraisal) * liquidation_factor
         unstressed_lgd = (
             max(balance - unstressed_collateral_value, 0.0)
@@ -270,6 +274,8 @@ def _validate_pd_lookup(table: pd.DataFrame, exceptions: List[Dict[str, Any]]) -
             field="fico_pd_lookup",
             details=f"invalid_row_count={len(invalid)}",
         )
+    # Bands are inclusive at both ends; the next valid integer band therefore
+    # starts at previous_hi + 1. Touching endpoints are overlaps, not gaps.
     previous_hi = None
     overlaps = 0
     gaps = 0

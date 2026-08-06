@@ -122,6 +122,8 @@ def apply_overlays(
                 }
             )
 
+        # Replace the portfolio's modeled rows rather than appending overlay
+        # rows, preserving one authoritative balance per level and bucket.
         summary = summary[summary["portfolio"] != portfolio]
         base_replacement = []
         for bucket in OVERLAY_OUTPUT_BUCKETS:
@@ -190,6 +192,8 @@ def _weighted_source_ratios(
     balance_field = scenario["borrower"]["balance_field"]
     weighted = {bucket: 0.0 for bucket in BUCKETS}
     total_weight = 0.0
+    # Normalize by usable weight only: an empty or unavailable source must not
+    # dilute the migration ratios contributed by valid source populations.
     for spec in source_specs:
         weight = to_number(spec.get("weight", 1.0), 1.0)
         if weight <= 0:

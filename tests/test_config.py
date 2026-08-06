@@ -10,7 +10,7 @@ import pandas as pd
 
 from stress_engine.borrower import build_borrowers, build_source_reconciliation, enrich_borrowers
 from stress_engine.config import load_scenario, validate_scenario
-from stress_engine.io import load_inputs, read_table
+from stress_engine.io import load_inputs, profile_frame, read_table
 from stress_engine.tagging import (
     CECL_LEVEL_TAG_FIELD,
     add_cecl_selection_summary,
@@ -36,6 +36,31 @@ class ScenarioConfigTest(unittest.TestCase):
             "tags": {},
             "modules": {},
         }
+
+    def test_input_profile_treats_datetime_columns_as_nonnumeric(self):
+        frame = pd.DataFrame(
+            {
+                "as_of_date": pd.to_datetime(["2026-06-30", None]),
+                "amount": ["10.5", "not numeric"],
+            }
+        )
+
+        profile = profile_frame("sample", frame, "sample.csv").set_index(
+            "field"
+        )
+
+        date = profile.loc["as_of_date"]
+        self.assertEqual(int(date["non_null_count"]), 1)
+        self.assertEqual(int(date["missing_count"]), 1)
+        self.assertEqual(int(date["unique_count"]), 1)
+        for field in (
+            "numeric_sum",
+            "numeric_mean",
+            "numeric_min",
+            "numeric_max",
+        ):
+            self.assertTrue(pd.isna(date[field]), field)
+        self.assertEqual(float(profile.at["amount", "numeric_sum"]), 10.5)
 
     def test_example_manifest_loads_all_fragments(self):
         scenario, base_dir = load_scenario(SCENARIO)
@@ -1600,6 +1625,38 @@ class ScenarioConfigTest(unittest.TestCase):
             self.assertNotIn("Unused Vendor Note", loaded.frame.columns)
             self.assertNotIn("Unused Vendor Note", loaded.profile["field"].tolist())
 
+    def test_default_na_tokens_are_stable_across_pandas_versions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "source.csv").write_text(
+                "Borrower Number,Status\n"
+                "001,None\n"
+                "002,NULL\n"
+                "003,\n"
+                "004,literal\n",
+                encoding="utf-8",
+            )
+
+            loaded = read_table(
+                "stable_na",
+                {
+                    "path": "source.csv",
+                    "column_aliases": {
+                        "borrower_id": "Borrower Number",
+                        "status": "Status",
+                    },
+                    "string_columns": ["borrower_id", "status"],
+                },
+                directory,
+            )
+
+            self.assertEqual(
+                loaded.frame["borrower_id"].tolist(),
+                ["001", "002", "003", "004"],
+            )
+            self.assertEqual(loaded.frame["status"].isna().tolist(), [True, True, True, False])
+            self.assertEqual(loaded.frame.at[3, "status"], "literal")
+
     def test_multi_file_input_source_concatenates_in_listed_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -1629,6 +1686,36 @@ class ScenarioConfigTest(unittest.TestCase):
             self.assertEqual(loaded.frame["_source_file_row"].tolist(), [1, 1])
             self.assertNotIn("First File Only", loaded.frame.columns)
             self.assertNotIn("Second File Only", loaded.frame.columns)
+
+    def test_multi_file_all_missing_numeric_column_has_stable_dtype(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "empty.csv").write_text(
+                "Borrower Number,Amount\n001,\n",
+                encoding="utf-8",
+            )
+            (directory / "valued.csv").write_text(
+                "Borrower Number,Amount\n002,10.5\n",
+                encoding="utf-8",
+            )
+
+            loaded = read_table(
+                "numeric_parts",
+                {
+                    "paths": ["empty.csv", "valued.csv"],
+                    "column_aliases": {
+                        "borrower_id": "Borrower Number",
+                        "amount": "Amount",
+                    },
+                    "string_columns": ["borrower_id"],
+                    "numeric_columns": ["amount"],
+                },
+                directory,
+            )
+
+            self.assertTrue(pd.isna(loaded.frame.at[0, "amount"]))
+            self.assertEqual(float(loaded.frame.at[1, "amount"]), 10.5)
+            self.assertTrue(pd.api.types.is_float_dtype(loaded.frame["amount"]))
 
     def test_unused_columns_are_ignored_across_identity_and_source_types(self):
         with tempfile.TemporaryDirectory() as tmp:

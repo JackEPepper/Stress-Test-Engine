@@ -61,6 +61,8 @@ def run_cre(
     out_scope: List[Dict[str, Any]] = []
     fallback_events: set[tuple[str, str, str]] = set()
 
+    # Maturity selects exactly one calculation path per borrower/level; running
+    # both would double-apply stress and make the migration origin ambiguous.
     for level in levels:
         for idx, row in out.loc[mask].iterrows():
             out.at[idx, "module_applied"] = append_module(out.at[idx, "module_applied"], "CRE")
@@ -138,6 +140,8 @@ def _run_dscr(
         return row.get("base_bucket", "Pass")
     dscr_field = dscr_cfg.get("field", "dscr")
     required = [dscr_field, subsector_field]
+    # Gate source-data quality before resolving scenario assumptions so the
+    # out-of-scope reason identifies data gaps rather than configuration.
     missing = missing_fields(row, required)
     if missing:
         _mark_out(out, idx, level, row, scenario, out_scope, "DSCR", missing, "missing_required_field")
@@ -146,6 +150,8 @@ def _run_dscr(
     if not _in_range(dscr, dscr_cfg.get("acceptable_range")):
         _mark_out(out, idx, level, row, scenario, out_scope, "DSCR", [dscr_field], "outside_acceptable_range")
         return None
+    # Resolve and audit the baseline sector/level value first. A targeted
+    # override changes only the effective loan-level assumption afterward.
     decline = _resolve_assumption(
         dscr_cfg.get("decline"),
         row.get(subsector_field),
@@ -157,6 +163,8 @@ def _run_dscr(
     decline = targeted_parameter(
         row, scenario, "CRE", "dscr_decline", level, decline
     )
+    # A fractional decline must stay within [0, 1]; otherwise this stress could
+    # increase DSCR or produce a negative ratio.
     if is_missing(decline) or not 0 <= decline <= 1:
         _mark_out(out, idx, level, row, scenario, out_scope, "DSCR", ["dscr_decline"], "missing_or_invalid_scenario_assumption")
         return None
@@ -231,6 +239,8 @@ def _run_refi_ltv(
         amort_years = targeted_parameter(
             row, scenario, "CRE", "amortization_years", level, amort_years
         )
+        # Validate the effective (including targeted) assumption set together
+        # so a partial refinance result is never published.
         invalid_assumptions = []
         if is_missing(noi_decline) or not 0 <= noi_decline <= 1:
             invalid_assumptions.append("refinance_noi_decline")

@@ -93,6 +93,8 @@ def _load_scenario_file(path: Path, stack: Tuple[Path, ...]) -> Tuple[Dict[str, 
 
 def validate_scenario(scenario: Dict[str, Any]) -> None:
     """Perform lightweight required-section validation after JSON merge."""
+    # Validate the minimum object graph first so later, domain-specific checks
+    # can produce precise messages instead of incidental KeyError failures.
     required = ["inputs", "borrower", "tags", "modules"]
     missing = [key for key in required if key not in scenario]
     if missing:
@@ -106,6 +108,7 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     from .cecl import validate_cecl_config
 
     validate_cecl_config(scenario)
+
     # Import locally to keep scenario loading independent from tagging's input
     # table types while still failing malformed tag flags before any data load.
     from .tagging import normalize_tag_defs
@@ -129,6 +132,10 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     cecl_portfolio_field = scenario.get("cecl", {}).get(
         "portfolio_field", "cecl_portfolio"
     )
+
+    # A global model-exclusion tag may describe or audit a population, but it
+    # cannot silently route that population back into a model. Overlay routes
+    # are the narrow exception and must keep model and CECL portfolios aligned.
     for tag in tag_defs:
         if tag.get("model_eligible", True):
             continue
@@ -170,6 +177,9 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     if any(not level.strip() for level in levels):
         raise ValueError("Scenario stress_levels cannot contain blank names.")
     modules = scenario.get("modules", {})
+
+    # Module order is executable configuration, not display order: every
+    # enabled module must run exactly once before overlays and reports consume it.
     _validate_module_order(scenario, modules)
     _validate_overlays(scenario.get("overlays", {}))
     cre = modules.get("CRE", {})
@@ -184,6 +194,9 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
         )
     if isinstance(ci, dict) and "cutoffs" in ci:
         nested_cutoff_paths.append("modules.C&I.cutoffs")
+
+    # Centralizing migration cutoffs prevents two modules from assigning
+    # different risk buckets to the same metric under one scenario.
     if nested_cutoff_paths:
         raise ValueError(
             "Migration cutoffs must be defined only in the master scenario's "
@@ -198,6 +211,8 @@ def validate_scenario(scenario: Dict[str, Any]) -> None:
     if ci and ci.get("enabled", True):
         get_metric_cutoffs(scenario, "fccr")
     if scenario.get("targeted_stress"):
+        # Targeted validation is deferred until the shared base scenario has
+        # passed, keeping variant errors focused on selectors and assumptions.
         from .targeted import validate_targeted_config
 
         validate_targeted_config(scenario)
@@ -211,6 +226,8 @@ def _validate_module_order(
     if not isinstance(modules, Mapping):
         raise ValueError("Scenario modules must be a JSON object.")
 
+    # Validate the configuration map before its execution list so errors point
+    # to the malformed declaration rather than a downstream ordering symptom.
     unsupported_configs = [module for module in modules if module not in _SUPPORTED_MODULES]
     if unsupported_configs:
         names = ", ".join(repr(module) for module in unsupported_configs)
@@ -243,6 +260,8 @@ def _validate_module_order(
             f"{', '.join(str(module) for module in invalid_enabled)}."
         )
 
+    # The order is an executable contract: it must be supported, unique, and
+    # exhaustive for every enabled configuration above.
     module_order = scenario.get("module_order", _DEFAULT_MODULE_ORDER)
     if not isinstance(module_order, list) or not module_order:
         raise ValueError("Scenario module_order must be a nonempty JSON list.")
@@ -302,6 +321,8 @@ def _validate_overlays(overlays: Any) -> None:
             raise ValueError(f"Overlay '{portfolio}' enabled must be a JSON boolean.")
         if not enabled:
             continue
+        # Source weights are additive. Zero-weight sources are permitted for
+        # reusable configurations, but an enabled overlay needs positive mass.
         sources = config.get("sources")
         if not isinstance(sources, list) or not sources:
             raise ValueError(

@@ -13,6 +13,7 @@ from stress_engine.batch import _base_cecl_lookup
 from stress_engine.comparison import _cecl_impact_rows
 from stress_engine.engine import StressEngine
 from stress_engine.targeted import (
+    _copy_rows,
     _evaluate_selector,
     _resolve_variant,
     validate_targeted_config,
@@ -60,6 +61,26 @@ def _targeted_validation_scenario(values):
 
 
 class TargetedStressTest(unittest.TestCase):
+    def test_copy_rows_preserves_new_nullable_and_datetime_columns(self):
+        target = pd.DataFrame({"amount": [1.0, 2.0]})
+        source = pd.DataFrame(
+            {
+                "amount": [10.0, 20.0],
+                "label": pd.Series(["copied", "not copied"], dtype="string"),
+                "as_of_date": pd.to_datetime(
+                    ["2026-01-31", "2026-02-28"]
+                ),
+            }
+        )
+
+        _copy_rows(target, source, pd.Series([True, False]))
+
+        self.assertEqual(target["amount"].tolist(), [10.0, 2.0])
+        self.assertEqual(target.at[0, "label"], "copied")
+        self.assertTrue(pd.isna(target.at[1, "label"]))
+        self.assertEqual(target.at[0, "as_of_date"], pd.Timestamp("2026-01-31"))
+        self.assertTrue(pd.isna(target.at[1, "as_of_date"]))
+
     def test_cecl_priority_overlap_is_logged_once_at_loan_grain(self):
         scenario, base_dir = load_scenario(
             ROOT / "examples" / "targeted_stress.json"

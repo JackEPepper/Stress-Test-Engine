@@ -38,6 +38,8 @@ def build_comparison_report(
 
     for previous_path in previous_paths:
         try:
+            # Re-running the preserved scenario creates reports under the same
+            # engine version and avoids comparing stale exported calculations.
             previous_scenario, previous_base_dir = load_scenario(previous_path)
             previous_scenario = _without_comparison(previous_scenario)
             previous_result = StressEngine(previous_scenario, previous_base_dir).run(write_outputs=False, run_comparison=False)
@@ -54,6 +56,9 @@ def build_comparison_report(
 
             diffs = _scenario_diffs(previous_scenario, current_scenario)
             variable_diffs = [item for item in diffs if not item["path"].startswith(DATA_PREFIXES)]
+
+            # Marginal impact is intentionally a one-variable-at-a-time rerun.
+            # The cap bounds runtime while skipped paths remain explicit audit rows.
             if max_variable_reruns is not None:
                 skipped = variable_diffs[max_variable_reruns:]
                 variable_diffs = variable_diffs[:max_variable_reruns]
@@ -90,6 +95,8 @@ def build_comparison_report(
                     )
                     rows.extend(impact_rows)
                 except Exception as exc:  # pragma: no cover - reportable audit artifact
+                    # Comparison failures do not discard the successful current
+                    # run; they become control rows promoted by the orchestrator.
                     rows.append(
                         {
                             "previous_scenario": str(previous_path),
@@ -107,6 +114,8 @@ def build_comparison_report(
                         }
                     )
         except Exception as exc:  # pragma: no cover - reportable audit artifact
+            # A missing or invalid prior package is data for the audit report,
+            # not a reason to lose the completed current-scenario results.
             rows.append(
                 {
                     "previous_scenario": str(previous_path),
@@ -160,6 +169,8 @@ def _data_change_rows(
         how="outer",
         suffixes=("_previous", "_current"),
     )
+    # Profile metrics describe what changed in the inputs. Their combined CECL
+    # effect is reported once because individual metrics are not causal levers.
     changes = []
     for _, row in merged.iterrows():
         for metric in ("row_count", "non_null_count", "missing_count", "unique_count", "numeric_sum"):
@@ -213,6 +224,8 @@ def _cecl_impact_rows(
     """Calculate CECL reserve/ratio deltas by portfolio and stress level."""
     if previous_cecl.empty or changed_cecl.empty:
         return []
+    # Total rows form a common comparison grain. Targeted scenarios extend that
+    # grain with variant so baseline and named shocks can never cross-match.
     prev = previous_cecl[previous_cecl["bucket"] == "Total"].copy()
     curr = changed_cecl[changed_cecl["bucket"] == "Total"].copy()
     variant_aware = "scenario_variant" in prev.columns or "scenario_variant" in curr.columns
@@ -227,6 +240,8 @@ def _cecl_impact_rows(
     merged = prev.merge(curr, on=keys, how="outer", suffixes=("_previous", "_changed"))
     rows = []
     for _, row in merged.iterrows():
+        # Availability transitions remain auditable even when a numeric delta
+        # cannot be computed; numeric metrics are emitted separately below.
         previous_status = row.get("cecl_reserve_status_previous", "")
         changed_status = row.get("cecl_reserve_status_changed", "")
         if _stringify(previous_status) != _stringify(changed_status):

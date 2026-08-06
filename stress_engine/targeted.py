@@ -15,6 +15,7 @@ from .modules.base import initialize_results, targeted_override_column
 from .modules.ci import _brg_key, _ebitda_reduction, run_ci
 from .modules.consumer import run_consumer
 from .modules.cre import run_cre
+from .progress import ProgressReporter
 from .reporting import build_out_of_scope_summary, build_reports
 from .tagging import (
     add_cecl_selection_summary,
@@ -72,6 +73,8 @@ def validate_targeted_config(scenario: Mapping[str, Any]) -> None:
     if not isinstance(variants, Mapping) or not variants:
         raise ValueError("targeted_stress.variants must be a nonempty JSON object.")
 
+    # Validate every reusable shock before checking which variants compose it.
+    # This keeps malformed but currently unreferenced definitions from lurking.
     for shock_name, shock in shocks.items():
         if not isinstance(shock, Mapping):
             raise ValueError(f"Targeted shock '{shock_name}' must be a JSON object.")
@@ -178,6 +181,9 @@ def validate_targeted_config(scenario: Mapping[str, Any]) -> None:
 
 
 def _validate_selector(selector: Any, path: str) -> None:
+    """Validate the recursive targeted-selector grammar at a scenario path."""
+    # Lists are implicit AND groups; explicit ``all`` and ``any`` groups recurse
+    # through the same grammar so nested selector precedence stays unambiguous.
     if isinstance(selector, list):
         for index, item in enumerate(selector):
             _validate_selector(item, f"{path}[{index}]")
@@ -194,6 +200,8 @@ def _validate_selector(selector: Any, path: str) -> None:
         for index, item in enumerate(items):
             _validate_selector(item, f"{path}.{key}[{index}]")
         return
+    # Leaves select exactly one specialized grammar. External lists validate
+    # only their static shape here because source columns are checked at runtime.
     selector_type = str(selector.get("type", "condition"))
     if selector_type == "naics_prefix":
         if not selector.get("field"):
@@ -271,6 +279,8 @@ def _validate_atomic_condition(condition: Mapping[str, Any], path: str) -> None:
         "not_null",
         "regex",
     }
+    # Reject unknown operators and absent operands before selector evaluation;
+    # otherwise malformed configuration could silently produce an empty mask.
     if operation not in supported:
         raise ValueError(f"{path} uses unsupported condition operator '{operation}'.")
     if operation not in {"is_null", "not_null"} and "value" not in condition:
@@ -287,6 +297,8 @@ def _validate_atomic_condition(condition: Mapping[str, Any], path: str) -> None:
         )
     ):
         raise ValueError(f"{path} condition operator '{operation}' requires a non-null value.")
+    # Operator-specific shape and numeric checks keep later vectorized
+    # comparisons deterministic rather than relying on pandas coercion quirks.
     if operation in {"gt", "gte", "lt", "lte"}:
         _finite_targeted_number(value, f"{path}.value")
     if operation == "between":
@@ -372,6 +384,8 @@ def build_loan_context(
         loaded["identity"].frame, scenario
     )
 
+    # Synthetic identity keys preserve every input row without letting blank or
+    # duplicate loan IDs masquerade as safe external-list selector matches.
     missing_borrower = loans[borrower_id].isna() | loans[borrower_id].astype(str).str.strip().eq("")
     for idx in loans.index[missing_borrower]:
         source_row = loans.at[idx, "_source_row"] if "_source_row" in loans.columns else idx + 1
@@ -390,6 +404,8 @@ def build_loan_context(
     ]
 
     loans, tag_summary = apply_tags(loans, scenario, loaded, exceptions)
+    # ``apply_tags`` reports its input grain as borrower counts. Targeted mode
+    # operates at loan grain, so recompute both borrower and loan populations.
     if not tag_summary.empty:
         tag_summary["loan_count"] = tag_summary["borrower_count"]
         tag_summary["not_model_excluded_loan_count"] = tag_summary[
@@ -470,8 +486,10 @@ def run_targeted_stress(
     loaded: Mapping[str, Any],
     exceptions: List[Dict[str, Any]],
     input_out_of_scope: pd.DataFrame | None = None,
+    progress: ProgressReporter | None = None,
 ) -> Dict[str, Any]:
     """Run baseline plus configured loan-level targeted variants."""
+    reporter = progress if progress is not None else ProgressReporter()
     validate_targeted_config(scenario)
     if isinstance(input_out_of_scope, pd.DataFrame):
         input_out_of_scope = input_out_of_scope.copy()
@@ -480,6 +498,8 @@ def run_targeted_stress(
             loaded["identity"].frame, scenario
         )
     context, tag_summary = build_loan_context(scenario, loaded, exceptions)
+    # Run the baseline once: it is both the comparison anchor and, when a
+    # variant requests it, the fallback result for loans no shock selects.
     baseline_scenario = _variant_scenario(scenario, "baseline")
     exception_start = len(exceptions)
     baseline_input, reserve_basis = attach_cecl_reserve_basis(
@@ -528,7 +548,15 @@ def run_targeted_stress(
     _collect_variant_reports(reports_by_name, baseline_reports, "baseline")
 
     config = scenario["targeted_stress"]
-    for variant_name, variant_spec in config["variants"].items():
+    variant_total = len(config["variants"]) + 1
+    reporter.update(
+        f"Completed targeted variant 1/{variant_total}: baseline.",
+        completed=1,
+        total=variant_total,
+    )
+    for variant_index, (variant_name, variant_spec) in enumerate(
+        config["variants"].items(), start=2
+    ):
         variant_name = str(variant_name)
         variant_scenario = _variant_scenario(scenario, variant_name)
         exception_start = len(exceptions)
@@ -548,13 +576,27 @@ def run_targeted_stress(
         active = resolved["_targeted_active"].fillna(False).astype(bool)
         selection_error = resolved["_targeted_error"].fillna(False).astype(bool)
         behavior = str(variant_spec.get("unmatched_behavior", "baseline_stress"))
+        # Start from unstressed level outputs, then selectively restore baseline
+        # stress for unmatched rows before rerunning active targeted loans.
         variant = base_template.drop(columns=["scenario_variant"], errors="ignore").copy()
         if behavior == "baseline_stress":
             inactive = ~(active | selection_error)
             _copy_rows(variant, baseline.drop(columns=["scenario_variant"]), inactive)
-        for column in resolved.columns:
-            if column.startswith("_targeted_"):
-                variant[column] = resolved[column]
+        targeted_columns = [
+            column
+            for column in resolved.columns
+            if column.startswith("_targeted_")
+        ]
+        if targeted_columns:
+            # Attach the complete audit block at once. Repeated column inserts
+            # fragment frames and emit PerformanceWarning on older pandas.
+            variant = pd.concat(
+                [
+                    variant.drop(columns=targeted_columns, errors="ignore"),
+                    resolved[targeted_columns],
+                ],
+                axis=1,
+            )
         variant["_targeted_active"] = active
         exception_start = len(exceptions)
         variant, out_scope = _run_modules(
@@ -595,6 +637,12 @@ def run_targeted_stress(
             exceptions, exception_start, variant_name, context, scenario
         )
         _collect_variant_reports(reports_by_name, reports, variant_name)
+        reporter.update(
+            f"Completed targeted variant {variant_index}/{variant_total}: "
+            f"{variant_name}.",
+            completed=variant_index,
+            total=variant_total,
+        )
 
     variant_results = pd.concat(variant_frames, ignore_index=True, sort=False)
     reports = {
@@ -645,6 +693,7 @@ def _run_modules(
     exceptions: List[Dict[str, Any]],
     return_out_of_scope: bool = False,
 ) -> Any:
+    """Run configured modules in order and optionally return combined scope detail."""
     out = results
     out_frames: List[pd.DataFrame] = []
     for module in scenario.get("module_order", ["CRE", "C&I", "Consumer"]):
@@ -674,7 +723,9 @@ def _annotate_exceptions(
     loan_id = scenario["borrower"].get("loan_id_field", "loan_id")
     unique: Dict[str, Any] = {}
     if borrower_id in loans.columns and loan_id in loans.columns:
-        for value, group in loans.groupby(borrower_id, dropna=False):
+        for value, group in loans.groupby(
+            borrower_id, dropna=False, observed=True
+        ):
             ids = group[loan_id].dropna().astype(str).unique()
             if len(ids) == 1:
                 unique[str(value)] = ids[0]
@@ -688,6 +739,7 @@ def _annotate_exceptions(
 
 
 def _variant_scenario(scenario: Mapping[str, Any], name: str) -> Dict[str, Any]:
+    """Return a shallow scenario copy annotated for one targeted variant."""
     result = dict(scenario)
     result["_targeted_mode"] = True
     result["_scenario_variant"] = name
@@ -721,10 +773,17 @@ def _base_template(baseline: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.Da
 
 
 def _copy_rows(target: pd.DataFrame, source: pd.DataFrame, mask: pd.Series) -> None:
+    """Copy masked rows and any missing columns from one result frame to another."""
     for column in source.columns:
         if column not in target.columns:
-            target[column] = np.nan
-        target.loc[mask, column] = source.loc[mask, column]
+            # ``where`` preserves object, datetime, and nullable dtypes while
+            # creating missing values for rows that should not be copied.
+            target[column] = source[column].where(mask)
+            continue
+        # Replace the complete column explicitly instead of assigning through
+        # ``.loc``. pandas 1.5 deprecated the latter's full-column dtype
+        # behavior, while newer releases already use the replacement semantics.
+        target[column] = target[column].where(~mask, source[column])
 
 
 def _resolve_variant(
@@ -737,9 +796,12 @@ def _resolve_variant(
     selection_rows: List[Dict[str, Any]],
     assumption_rows: List[Dict[str, Any]],
 ) -> pd.DataFrame:
+    """Resolve selections and compose loan-level overrides for one variant."""
     resolved = context.copy()
     resolved["_targeted_active"] = False
     resolved["_targeted_error"] = False
+    # Per-row keys keep the original module assumption separate from the
+    # effective value produced by each successive shock in variant order.
     effective: Dict[Tuple[int, str, str, str], float] = {}
     baseline_values: Dict[Tuple[int, str, str, str], float] = {}
 
@@ -767,6 +829,8 @@ def _resolve_variant(
         selected &= ~model_excluded
         tiers = _resolve_tiers(context, selected, external_tier, shock, loaded, exceptions, shock_name)
 
+        # Record every row, including nonmatches and exclusions, so the audit
+        # distinguishes selector behavior from downstream tier resolution.
         for idx, row in context.iterrows():
             is_selected = bool(selected.at[idx])
             was_selector_match = bool(selector_matched.at[idx])
@@ -836,6 +900,8 @@ def _resolve_variant(
                     details=f"loan_id={row.get(scenario['borrower'].get('loan_id_field', 'loan_id'))}; tier={tier_name}",
                 )
                 continue
+            # Add and multiply operations consume the prior effective value;
+            # replace starts a new value that later shocks may further modify.
             for level in get_levels(scenario):
                 for parameter, spec in module_specs.items():
                     operation, values = _operation_spec(spec)
@@ -937,6 +1003,7 @@ def _resolve_tiers(
     exceptions: List[Dict[str, Any]],
     shock_name: str,
 ) -> pd.Series:
+    """Resolve selected loans to external, rule-based, then default tiers."""
     tiers = external_tier.copy()
     for rule in as_list(shock.get("tier_rules")):
         if not isinstance(rule, Mapping) or not rule.get("tier"):
@@ -963,7 +1030,10 @@ def _evaluate_selector(
     exceptions: List[Dict[str, Any]],
     shock_name: str,
 ) -> tuple[pd.Series, pd.Series]:
+    """Evaluate a recursive selector and return its match mask and optional tiers."""
     empty_tier = pd.Series("", index=frame.index, dtype=object)
+    # A bare selector list is implicit AND. Tier values flow only across the
+    # rows still applicable to the combined branch, and conflicts fail closed.
     if isinstance(selector, list):
         mask = pd.Series(True, index=frame.index)
         tiers = empty_tier.copy()
@@ -1021,6 +1091,7 @@ def _external_list_selector(
     exceptions: List[Dict[str, Any]],
     shock_name: str,
 ) -> tuple[pd.Series, pd.Series]:
+    """Match loans to an external exact/prefix list and return assigned tiers."""
     source_name = str(selector["source"])
     source_field = str(selector["source_field"])
     exposure_field = str(selector["exposure_field"])
@@ -1033,6 +1104,8 @@ def _external_list_selector(
         )
     if exposure_field not in frame.columns:
         raise ValueError(f"Loan context is missing selector field '{exposure_field}'.")
+    # Filter and normalize the source before matching so blanks, spreadsheet
+    # numeric keys, and duplicate rows have deterministic audit treatment.
     work = source.copy()
     if selector.get("where"):
         missing_where_fields = sorted(
@@ -1066,7 +1139,11 @@ def _external_list_selector(
             f"Targeted selector source '{source_name}' is missing tier_field '{tier_field}'."
         )
     if tier_field:
-        conflicts = work.groupby("_match_key", dropna=False)[tier_field].apply(
+        # Exact-key source rows must never imply more than one tier. Prefix
+        # matching performs the analogous check per exposure below.
+        conflicts = work.groupby(
+            "_match_key", dropna=False, observed=True
+        )[tier_field].apply(
             lambda values: values.dropna().astype(str).nunique()
         )
         bad = conflicts[conflicts > 1]
@@ -1109,6 +1186,8 @@ def _external_list_selector(
         matched_source = {
             key for key in work["_match_key"] if exposure_values.apply(lambda value: bool(value and value.startswith(key))).any()
         }
+    # Orphan keys are valid input but important reconciliation evidence, while
+    # ambiguous identity loan IDs are unsafe to select and therefore excluded.
     orphan = set(work["_match_key"]) - matched_source
     if orphan:
         record_exception(
@@ -1145,6 +1224,7 @@ def _combine_tiers(
     applicable: pd.Series,
     shock_name: str,
 ) -> pd.Series:
+    """Merge applicable tier assignments and reject conflicting nonblank tiers."""
     out = left.copy()
     left_text = left.fillna("").astype(str)
     right_text = right.fillna("").astype(str)
@@ -1166,6 +1246,9 @@ def _baseline_parameter(
     parameter: str,
     level: str,
 ) -> float:
+    """Resolve a loan's baseline module assumption for one stress level."""
+    # Mirror each module's lookup hierarchy exactly so add/multiply operations
+    # start from the same assumption the untargeted module would consume.
     config = scenario.get("modules", {}).get(module, {})
     if module == "C&I":
         sector = row.get(config.get("sector_field", "ci_sector"))
@@ -1202,6 +1285,7 @@ def _baseline_parameter(
 
 
 def _operation_spec(spec: Any) -> tuple[str, Any]:
+    """Normalize scalar or object assumption syntax into operation and values."""
     if isinstance(spec, Mapping):
         operation = str(spec.get("operation", spec.get("op", "replace"))).lower()
         values = spec.get("values", spec.get("value"))
@@ -1210,6 +1294,7 @@ def _operation_spec(spec: Any) -> tuple[str, Any]:
 
 
 def _level_value(values: Any, level: str) -> Any:
+    """Select a stress-level value while honoring configured fallback keys."""
     if isinstance(values, Mapping):
         if level in values:
             return values[level]
@@ -1221,6 +1306,7 @@ def _level_value(values: Any, level: str) -> Any:
 
 
 def _apply_operation(baseline: float, value: float, operation: str) -> float:
+    """Apply a targeted replace, add, or multiply operation."""
     if operation == "replace":
         return value
     if operation == "add":
@@ -1231,6 +1317,7 @@ def _apply_operation(baseline: float, value: float, operation: str) -> float:
 
 
 def _normalize_key(value: Any) -> str:
+    """Normalize selector keys and integer-like spreadsheet numerics to text."""
     if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
         return ""
     text = str(value).strip()
@@ -1240,6 +1327,7 @@ def _normalize_key(value: Any) -> str:
 
 
 def _normalize_naics(value: Any) -> str | None:
+    """Return a normalized 2-6 digit NAICS code, or ``None`` if invalid."""
     text = _normalize_key(value)
     return text if re.fullmatch(r"\d{2,6}", text) else None
 
@@ -1249,6 +1337,7 @@ def _collect_variant_reports(
     reports: Mapping[str, pd.DataFrame],
     variant_name: str,
 ) -> None:
+    """Copy variant reports into their per-report accumulation lists."""
     for name, frame in reports.items():
         if not isinstance(frame, pd.DataFrame):
             continue
@@ -1258,6 +1347,7 @@ def _collect_variant_reports(
 
 
 def _selection_summary(detail: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.DataFrame:
+    """Aggregate selected loans by variant, shock, tier, and primary module."""
     if detail.empty:
         return pd.DataFrame()
     selected = detail[detail["selected"]].copy()
@@ -1278,7 +1368,9 @@ def _selection_summary(detail: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
         selected[borrower_id] = selected["borrower_id"]
     return (
         selected.groupby(
-            ["scenario_variant", "shock", "tier", "primary_module"], dropna=False
+            ["scenario_variant", "shock", "tier", "primary_module"],
+            dropna=False,
+            observed=True,
         )
         .agg(
             borrower_count=("borrower_id", "nunique"),
@@ -1290,6 +1382,7 @@ def _selection_summary(detail: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
 
 
 def _variant_comparison(reports: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+    """Compare each variant's total CECL metrics with the baseline."""
     cecl = reports.get("cecl_summary", pd.DataFrame())
     if cecl.empty or "scenario_variant" not in cecl.columns:
         return pd.DataFrame()

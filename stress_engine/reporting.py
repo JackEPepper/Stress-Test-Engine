@@ -11,6 +11,7 @@ from .cecl import (
     CECL_LEVEL_TAG_FIELD,
     CeclReserveBasis,
     build_cecl_reserve_basis,
+    coerced_numeric_values,
     invalid_balance_mask,
     normalized_balance_values,
 )
@@ -112,7 +113,11 @@ def build_bucket_summary(
         bucket_col = "base_bucket" if level == "Base" else f"stressed_bucket_{level}"
         if bucket_col not in results.columns:
             continue
-        for (portfolio, bucket), group in frame.groupby([portfolio_field, bucket_col], dropna=False):
+        for (portfolio, bucket), group in frame.groupby(
+            [portfolio_field, bucket_col],
+            dropna=False,
+            observed=True,
+        ):
             if bucket not in REPORT_BUCKETS:
                 continue
             rows.append(
@@ -269,6 +274,7 @@ def build_cecl_bucket_summary(
         grouped = frame.groupby(
             [portfolio_field, CECL_LEVEL_TAG_FIELD, bucket_field],
             dropna=False,
+            observed=True,
         )
         for (portfolio, cecl_level_tag, bucket), group in grouped:
             if bucket not in REPORT_BUCKETS:
@@ -300,6 +306,9 @@ def build_cecl_bucket_summary(
         internal_columns.append("loan_count")
     internal_columns.append("source")
     summary = pd.DataFrame(rows, columns=internal_columns)
+    # Overlays replace modeled migration rows at public portfolio grain. They
+    # can return to CECL tag grain only when that portfolio has exactly one tag;
+    # otherwise there is no defensible way to choose a calibration ratio.
     overlays = scenario.get("overlays", {})
     if isinstance(overlays, Mapping):
         overlay_portfolios = {
@@ -423,6 +432,8 @@ def build_cecl_summary(
     )
     ratio_df = reserve_basis.ratios
 
+    # Value commercial components at tag/bucket grain before any public rollup;
+    # Consumer portfolios take the separate expected-loss path.
     for portfolio in sorted(bucket_summary["portfolio"].dropna().unique()):
         method = method_by_portfolio.get(portfolio, "bucket_reserve_ratio")
         if method == "expected_loss":
@@ -682,6 +693,8 @@ def build_cecl_summary(
         rows.extend(portfolio_total_rows)
 
     total_df = pd.DataFrame(rows, columns=CECL_SUMMARY_COLUMNS)
+    # Aggregate reporting fails closed: if any portfolio total is unavailable,
+    # summing the remaining reserves would present an understated bank total.
     aggregate_rows = []
     for level in levels:
         totals = total_df[(total_df["stress_level"] == level) & (total_df["bucket"] == "Total")]
@@ -747,7 +760,11 @@ def build_cre_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
     frame = results[results.get("module_applied", "").astype(str).str.contains("CRE", na=False)] if "module_applied" in results.columns else results.iloc[0:0]
     if frame.empty:
         return pd.DataFrame()
-    for keys, group in frame.groupby([portfolio_field, subsector_field], dropna=False):
+    for keys, group in frame.groupby(
+        [portfolio_field, subsector_field],
+        dropna=False,
+        observed=True,
+    ):
         row = {
             "portfolio": keys[0],
             "subsector": keys[1],
@@ -777,7 +794,11 @@ def build_ci_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.D
     rows = []
     if frame.empty:
         return pd.DataFrame()
-    for keys, group in frame.groupby([portfolio_field, sector_field], dropna=False):
+    for keys, group in frame.groupby(
+        [portfolio_field, sector_field],
+        dropna=False,
+        observed=True,
+    ):
         row = {
             "portfolio": keys[0],
             "sector": keys[1],
@@ -815,6 +836,8 @@ def build_consumer_summary(
     rows = []
     if frame.empty:
         return pd.DataFrame()
+    # Reuse the basis resolved before stress whenever supplied; recalibrating
+    # from stressed results would allow scenario outputs to alter the Base input.
     reserve_basis = reserve_basis or build_cecl_reserve_basis(
         results, scenario, []
     )
@@ -824,7 +847,9 @@ def build_consumer_summary(
         .astype(str)
         .str.contains("Consumer", na=False)
     ]
-    for portfolio, group in frame.groupby(portfolio_field, dropna=False):
+    for portfolio, group in frame.groupby(
+        portfolio_field, dropna=False, observed=True
+    ):
         basis_values, reserve_field_available = _consumer_basis_values(
             group, scenario, reserve_basis
         )
@@ -846,6 +871,9 @@ def build_consumer_summary(
             el_field = f"consumer_el_{suffix}"
             balance = float(pd.to_numeric(group[balance_field], errors="coerce").sum())
             el_values = pd.to_numeric(group.get(el_field, _empty_series(group)), errors="coerce")
+            # Scope counts describe raw model coverage, not the effective CECL
+            # carry-forward. An unavailable borrower remains out of scope even
+            # though its prior reserve contribution is retained conservatively.
             scope_mask = el_values.notna()
             if level != "unstressed":
                 scope_mask &= ~group.get(
@@ -962,6 +990,8 @@ def _consumer_cecl_components(
         )
         if effective_proforma.isna().any():
             return {}
+    # The current in-place reserve is the authoritative Base total. Any portion
+    # not explained by quantitative EL is retained as qualitative reserve.
     base_el = pd.to_numeric(
         group.get("consumer_el_unstressed", _empty_series(group)),
         errors="coerce",
@@ -987,6 +1017,8 @@ def _consumer_cecl_components(
         }
     }
 
+    # Apply the ladder borrower by borrower so neither a missing stress result
+    # nor a lower calculated amount can reduce an earlier reserve contribution.
     for level in stress_levels:
         raw_el = pd.to_numeric(
             group.get(f"consumer_el_{level}", _empty_series(group)),
@@ -1028,7 +1060,11 @@ def build_out_of_scope_summary(out_of_scope: pd.DataFrame) -> pd.DataFrame:
     if out_of_scope is None or out_of_scope.empty:
         return pd.DataFrame(columns=["module", "stress_level", "test", "field", "reason", "count"])
     return (
-        out_of_scope.groupby(["module", "stress_level", "test", "field", "reason"], dropna=False)
+        out_of_scope.groupby(
+            ["module", "stress_level", "test", "field", "reason"],
+            dropna=False,
+            observed=True,
+        )
         .size()
         .rename("count")
         .reset_index()
@@ -1051,8 +1087,12 @@ def _cecl_methods(results: pd.DataFrame, scenario: Mapping[str, Any]) -> Dict[An
         methods[str(portfolio).strip()] = spec.get(
             "method", "bucket_reserve_ratio"
         )
+    # Validate the inferred routing at portfolio grain because a single public
+    # portfolio cannot combine incompatible commercial and Consumer methods.
     if "module_applied" in results.columns and portfolio_field in results.columns:
-        for portfolio, group in results.groupby(portfolio_field, dropna=False):
+        for portfolio, group in results.groupby(
+            portfolio_field, dropna=False, observed=True
+        ):
             consumer_rows = group["module_applied"].astype(str).str.contains(
                 "Consumer", na=False
             )
@@ -1130,6 +1170,8 @@ def _reserve_ratio_for(
             _normalized_cecl_key(cecl_level_tag)
         )
     ]
+    # Retain the tag's basis label even when this bucket ratio is absent so the
+    # unavailable output still identifies the calibration method attempted.
     basis_label = (
         str(ratio_match["reserve_basis"].iloc[0])
         if not ratio_match.empty and "reserve_basis" in ratio_match.columns
@@ -1180,6 +1222,8 @@ def _consumer_cecl_rows(
     """
     portfolio_field = _cecl_public_portfolio_field(scenario)
     balance_field = scenario["borrower"]["balance_field"]
+    # Attach the immutable basis before filtering the portfolio so positional
+    # alignment remains valid even when caller indexes contain duplicate labels.
     positioned_results = _with_consumer_basis_values(
         results, reserve_basis
     )
@@ -1189,6 +1233,8 @@ def _consumer_cecl_rows(
     basis_values, reserve_field_available = _consumer_basis_values(
         group, scenario, reserve_basis
     )
+    # Build the complete borrower-level ladder once, then aggregate each level
+    # into the single Total row required by the Consumer expected-loss method.
     effective_components = (
         _consumer_cecl_components(
             group,
@@ -1277,10 +1323,8 @@ def _consumer_basis_values(
 ) -> tuple[pd.Series, bool]:
     """Use the immutable current in-place Consumer basis resolved pre-stress."""
     balance_field = scenario["borrower"]["balance_field"]
-    tolerance = to_number(
-        scenario.get("cecl", {}).get("zero_balance_tolerance", 1e-9),
-        1e-9,
-    )
+    # Prefer the positional attachment because source row labels may repeat;
+    # label-based reindexing is safe only when both sides are unique.
     if _CONSUMER_BASIS_VALUE_FIELD in group.columns:
         values = pd.to_numeric(
             group[_CONSUMER_BASIS_VALUE_FIELD], errors="coerce"
@@ -1301,9 +1345,10 @@ def _consumer_basis_values(
         )
     else:
         values = pd.Series(np.nan, index=group.index, dtype=float)
-    values = values.where(np.isfinite(values))
-    balances = pd.to_numeric(group[balance_field], errors="coerce")
-    invalid_balance = (~np.isfinite(balances)) | balances.lt(-tolerance)
+    values = coerced_numeric_values(values).where(
+        lambda numeric: np.isfinite(numeric)
+    )
+    invalid_balance = invalid_balance_mask(group, scenario)
     basis_unavailable = values.isna().any()
     return values.fillna(0.0), not bool(
         invalid_balance.any() or basis_unavailable

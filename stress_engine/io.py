@@ -10,11 +10,42 @@ from typing import Any, Dict, List, Mapping
 import numpy as np
 import pandas as pd
 
-from .utils import coerce_numeric_frame, hash_file, json_safe, resolve_path, sort_frame
+from .utils import (
+    coerce_numeric_frame,
+    hash_file,
+    json_safe,
+    parse_date_series,
+    resolve_path,
+    sort_frame,
+)
 
 
 _PRESERVED_NUMERIC_TOKEN = object()
 RAW_INVALID_NUMERIC_PREFIX = "_raw_invalid_numeric__"
+# pandas has changed its built-in NA vocabulary across releases (notably by
+# adding ``None`` in 2.0). Own the default set so identical extracts load the
+# same way in legacy Anaconda and current environments.
+DEFAULT_NA_VALUES = (
+    "",
+    "#N/A",
+    "#N/A N/A",
+    "#NA",
+    "-1.#IND",
+    "-1.#QNAN",
+    "-NaN",
+    "-nan",
+    "1.#IND",
+    "1.#QNAN",
+    "<NA>",
+    "N/A",
+    "NA",
+    "NULL",
+    "NaN",
+    "None",
+    "n/a",
+    "nan",
+    "null",
+)
 
 
 @dataclass
@@ -40,6 +71,19 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
     rename = _column_rename_map(name, spec)
     if not rename:
         raise ValueError(f"Input source '{name}' must define column_aliases for the columns it imports.")
+    if read_options.get("keep_default_na", True) is not False:
+        configured_na = read_options.get("na_values")
+        read_options["keep_default_na"] = False
+        if isinstance(configured_na, Mapping):
+            # A pandas per-column mapping replaces global custom tokens. Expand
+            # it to every imported source field so the stable defaults remain
+            # global while retaining each field's configured additions.
+            read_options["na_values"] = {
+                field: _merged_na_values(configured_na.get(field))
+                for field in rename
+            }
+        else:
+            read_options["na_values"] = _merged_na_values(configured_na)
     source_for_canonical = {canonical: source for source, canonical in rename.items()}
     raw_preserved_numeric_tokens = spec.get(
         "_preserve_numeric_tokens", {}
@@ -123,6 +167,8 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
             for field in rename
             if field not in preserved_source_fields
         }
+    # Normalize every physical file before concatenation so schema failures
+    # remain attributable to a specific file and provenance stays row-exact.
     frames: List[pd.DataFrame] = []
     file_row_counts: List[int] = []
     for path in paths:
@@ -145,11 +191,13 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
         file_row_counts.append(len(frame))
     df = pd.concat(frames, ignore_index=True)
 
+    # Audit coercion against the original cells before replacing them. This
+    # distinguishes source data-quality failures from genuinely blank values.
     coercion_issues: List[Dict[str, Any]] = []
     for field in spec.get("date_columns", []):
         if field in df.columns:
             original = df[field]
-            converted = pd.to_datetime(original, errors="coerce")
+            converted = parse_date_series(original)
             invalid = original.notna() & original.astype(str).str.strip().ne("") & converted.isna()
             if invalid.any():
                 coercion_issues.extend(
@@ -234,12 +282,24 @@ def _preserved_numeric_token_converter(
     """Keep configured raw numeric sentinels ahead of pandas NA parsing."""
 
     def convert(value: Any) -> Any:
+        """Preserve recognized sentinels and delegate every other raw cell."""
         text = str(value).strip()
         if text.casefold() in tokens:
             return _PRESERVED_NUMERIC_TOKEN
         return downstream(value) if downstream is not None else value
 
     return convert
+
+
+def _merged_na_values(configured: Any) -> List[Any]:
+    """Merge custom NA tokens into the engine's version-stable defaults."""
+    if configured is None:
+        additions: List[Any] = []
+    elif isinstance(configured, (list, tuple, set)):
+        additions = list(configured)
+    else:
+        additions = [configured]
+    return list(dict.fromkeys([*DEFAULT_NA_VALUES, *additions]))
 
 
 def _input_paths(name: str, spec: Mapping[str, Any], base_dir: Path) -> List[Path]:
@@ -337,6 +397,7 @@ def _column_rename_map(name: str, spec: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def _add_column_rename(name: str, rename: Dict[str, str], source: Any, canonical: Any) -> None:
+    """Add one unambiguous, nonblank source-to-canonical column alias."""
     source_name = str(source).strip()
     canonical_name = str(canonical).strip()
     if not source_name or not canonical_name:
@@ -421,7 +482,14 @@ def profile_frame(name: str, df: pd.DataFrame, path: str) -> pd.DataFrame:
         if str(column).startswith(("_source_", RAW_INVALID_NUMERIC_PREFIX)):
             continue
         series = df[column]
-        numeric = pd.to_numeric(series, errors="coerce")
+        # Dates are audit dimensions, not numeric measures. Coercing parsed
+        # datetimes produces version-dependent epoch units and turns ``NaT``
+        # into the minimum int64 sentinel on older pandas releases.
+        numeric = (
+            None
+            if pd.api.types.is_datetime64_any_dtype(series.dtype)
+            else pd.to_numeric(series, errors="coerce")
+        )
         row: Dict[str, Any] = {
             "dataset": name,
             "path": path,
@@ -435,7 +503,7 @@ def profile_frame(name: str, df: pd.DataFrame, path: str) -> pd.DataFrame:
             "numeric_min": np.nan,
             "numeric_max": np.nan,
         }
-        if numeric.notna().any():
+        if numeric is not None and numeric.notna().any():
             row.update(
                 {
                     "numeric_sum": float(numeric.sum()),
@@ -474,6 +542,8 @@ def write_csv(df: pd.DataFrame, path: Path, sort_by: List[str] | None = None) ->
     """Write one CSV output with optional stable sorting."""
     path.parent.mkdir(parents=True, exist_ok=True)
     frame = _spreadsheet_safe_frame(sort_frame(df, sort_by or []))
+    # A sibling temporary keeps readers from observing a partially written
+    # report while preserving an atomic replace on the destination volume.
     temporary = path.with_name(f".{path.name}.tmp")
     frame.to_csv(temporary, index=False)
     temporary.replace(path)
@@ -506,6 +576,7 @@ def _neutralize_spreadsheet_formula(value: Any) -> Any:
 def write_json(data: Mapping[str, Any], path: Path) -> None:
     """Write JSON output after converting pandas/numpy values."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Match CSV's atomic-publication contract for audit metadata as well.
     temporary = path.with_name(f".{path.name}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(json_safe(dict(data)), handle, indent=2, sort_keys=True, default=str)

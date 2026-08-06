@@ -64,6 +64,8 @@ def module_population(df: pd.DataFrame, scenario: Mapping[str, Any], module_conf
     Called inside each module. It checks model-eligible tags and the resolved
     ``primary_module`` field.
     """
+    # Every rule only narrows eligibility. No tag or targeted selector may
+    # reinstate a model-excluded borrower or an invalid-balance exposure.
     mask = pd.Series(True, index=df.index)
     if "model_excluded" in df.columns:
         mask &= ~df["model_excluded"].fillna(False).astype(bool)

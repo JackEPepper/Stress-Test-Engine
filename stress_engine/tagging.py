@@ -209,7 +209,7 @@ def apply_tags(
 
 
 def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
-    """Convert the required object-style tag definitions to a list."""
+    """Validate and normalize object-style tag definitions into a list."""
     if not isinstance(tags, Mapping):
         raise ValueError("Scenario tags must be a JSON object keyed by tag name.")
     out = []
@@ -285,6 +285,8 @@ def normalize_tag_defs(tags: Any) -> List[Dict[str, Any]]:
                 )
             item["model_eligible"] = False
         out.append(item)
+    # CECL resolution addresses generated tag columns, so normalized-name
+    # collisions must be rejected even when the display names differ.
     cecl_columns: Dict[str, str] = {}
     for tag in out:
         if not tag.get("cecl_level", False):
@@ -305,6 +307,8 @@ def _validate_condition_block(conditions: Any, path: str) -> bool:
     if conditions is None or conditions == [] or conditions == {}:
         return False
     if isinstance(conditions, Mapping):
+        # A logical block cannot also be atomic: requiring one shape removes
+        # precedence ambiguity before recursive evaluation begins.
         logical_keys = [key for key in ("all", "any") if key in conditions]
         if logical_keys:
             if len(logical_keys) != 1 or set(conditions) != {logical_keys[0]}:
@@ -327,6 +331,8 @@ def _validate_condition_block(conditions: Any, path: str) -> bool:
                         "condition."
                     )
             return True
+        # Atomic operands are checked by operator so runtime evaluation can
+        # assume validated shapes and avoid silently broad or empty matches.
         field = conditions.get("field")
         if not isinstance(field, str) or not field.strip():
             raise ValueError(f"{path} atomic condition requires a nonblank field.")
@@ -438,6 +444,8 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
         return pd.Series(False, index=df.index, dtype=bool)
     series = df[field]
 
+    # Keep operator semantics centralized: callers can compose masks without
+    # reproducing numeric coercion, case handling, or token normalization.
     if op == "eq":
         return series.apply(lambda item: compare_values(item, value))
     if op == "ne":
@@ -461,7 +469,7 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
         numeric = pd.to_numeric(series, errors="coerce")
         return (numeric >= to_number(lower)) & (numeric <= to_number(upper))
     if op == "contains":
-        return series.astype(str).str.contains(
+        return series.astype("string").str.contains(
             str(value), case=bool(condition.get("case", False)), regex=False, na=False
         )
     if op == "has_token":
@@ -476,14 +484,14 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
             return pd.Series(False, index=df.index)
         return series.apply(lambda item: values.issubset(set(_split_tokens(item, condition))))
     if op == "startswith":
-        left = series.astype(str)
+        left = series.astype("string")
         right = str(value)
         if not bool(condition.get("case", False)):
             left = left.str.lower()
             right = right.lower()
         return left.str.startswith(right, na=False)
     if op == "endswith":
-        left = series.astype(str)
+        left = series.astype("string")
         right = str(value)
         if not bool(condition.get("case", False)):
             left = left.str.lower()
@@ -494,7 +502,7 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
     if op == "not_null":
         return series.notna()
     if op == "regex":
-        return series.astype(str).str.contains(
+        return series.astype("string").str.contains(
             str(value), regex=True, case=bool(condition.get("case", True)), na=False
         )
     raise ValueError(f"Unsupported tag condition operator: {op}")
@@ -525,6 +533,8 @@ def _apply_assignments(
             values = pd.Series(value_spec, index=df.index)
         candidate = values if isinstance(values, pd.Series) else pd.Series(values, index=df.index)
         existing = df[field]
+        # Assignments are first-writer-wins. Later disagreements are retained as
+        # audit events instead of making tag declaration order overwrite data.
         comparable_existing = existing.astype(str)
         comparable_candidate = candidate.astype(str)
         conflict = mask & existing.notna() & candidate.notna() & comparable_existing.ne(comparable_candidate)
@@ -543,6 +553,8 @@ def _apply_assignments(
                 exceptions[-1]["_conflict_indices"] = list(
                     df.index[conflict]
                 )
+        # Only empty destinations are writable; matching equal values need no
+        # write and conflicting nonempty values have already been recorded.
         write_mask = mask & existing.isna()
         df.loc[write_mask, field] = candidate.loc[write_mask]
 
@@ -590,6 +602,8 @@ def _evaluate_tieout(
     actual = float(pd.to_numeric(borrowers.loc[borrowers[tag_col], actual_field], errors="coerce").sum())
     expected = tieout.get("expected")
     expected_match_count = np.nan
+    # An inline expected amount is authoritative. Otherwise build the expected
+    # side by filtering the configured external source and summing its matches.
     if expected is None:
         if source_name not in loaded:
             raise ValueError(f"Tie-out for tag '{tag_name}' references unknown source '{source_name}'.")
@@ -608,6 +622,8 @@ def _evaluate_tieout(
             filtered = filtered[filtered[key_field] == match_value]
         expected_match_count = int(len(filtered))
         expected = float(pd.to_numeric(filtered[amount_field], errors="coerce").sum())
+    # Zero source matches intentionally sum to zero for display; the match count
+    # lets the caller distinguish that case and emit a reconciliation warning.
     expected = float(expected)
     difference = actual - expected
     return {
@@ -628,7 +644,11 @@ def _evaluate_tieout(
     }
 
 
-def _tag_list(df: pd.DataFrame, tag_defs: List[Mapping[str, Any]], include_internal: bool) -> pd.Series:
+def _tag_list(
+    df: pd.DataFrame,
+    tag_defs: List[Mapping[str, Any]],
+    include_internal: bool,
+) -> pd.Series:
     """Build semicolon-delimited tag audit columns."""
     values: List[str] = []
     for _, row in df.iterrows():
@@ -640,7 +660,7 @@ def _tag_list(df: pd.DataFrame, tag_defs: List[Mapping[str, Any]], include_inter
             if col in df.columns and bool(row.get(col, False)):
                 active.append(str(tag["name"]))
         values.append(";".join(active))
-    return pd.Series(values, index=df.index)
+    return pd.Series(values, index=df.index, dtype="object")
 
 
 def _add_model_exclusion_breakdown(
@@ -765,6 +785,8 @@ def assign_primary_modules(
             if any(bool(row.get(f"tag_{stable_name(tag)}", False)) for tag in spec["eligible_tags"]):
                 active.append(spec)
         if not active:
+            # Explicit input routing is a fallback only when no eligible tag
+            # selects a module; validate it before allowing it downstream.
             existing_module = row.get(module_field)
             if not is_missing(existing_module) and str(existing_module).strip():
                 existing_name = str(existing_module).strip()
@@ -815,6 +837,8 @@ def assign_primary_modules(
         result.at[idx, "primary_module"] = selected["name"]
         result.at[idx, module_field] = selected["name"]
         result.at[idx, portfolio_field] = selected["name"]
+        # CECL routing prefers an explicit module rollup, then a row-level
+        # source field, and finally the selected module name.
         selected_module_config = modules.get(selected["name"], {})
         cecl_rollup = selected_module_config.get("cecl_portfolio_rollup")
         cecl_source_field = selected_module_config.get("cecl_portfolio_field")
@@ -894,6 +918,8 @@ def resolve_cecl_level_tags(
         if module not in CECL_LEVEL_MODULES:
             continue
 
+        # Resolve within the primary module only. Cross-module raw tag overlap
+        # is intentional and must not make this calibration choice ambiguous.
         candidates: List[Dict[str, Any]] = []
         for tag in cecl_tags:
             if tag.get("cecl_module") != module:
@@ -914,6 +940,8 @@ def resolve_cecl_level_tags(
                 f"primary module '{module}' (borrower_id={borrower_id})."
             )
         priority_resolved = False
+        # Lowest numeric priority wins; a tie fails closed so declaration order
+        # can never silently decide a CECL calibration population.
         if len(candidates) > 1:
             selected_priority = min(
                 int(tag.get("cecl_priority", 0)) for tag in candidates
@@ -977,6 +1005,8 @@ def resolve_cecl_level_tags(
                     ),
                 )
 
+    # Only a deterministic priority winner may supersede earlier Overlay
+    # routing-assignment conflicts, and only for the exact rows it resolved.
     _reconcile_priority_resolved_assignment_conflicts(
         exceptions, priority_resolved_indices, cecl_tags, scenario
     )
@@ -1001,6 +1031,8 @@ def _apply_selected_overlay_route(
         if isinstance(cecl, Mapping)
         else "cecl_portfolio"
     )
+    # ``apply_tags`` retained the first assignment during overlap. Once
+    # priority selects a winner, that tag's route becomes authoritative.
     assignments = selected_tag.get("assign", {})
     if not isinstance(assignments, Mapping):
         raise ValueError(
@@ -1067,6 +1099,7 @@ def _apply_selected_overlay_route(
 
 
 def _route_audit_value(value: Any) -> str:
+    """Format a routing value for exception audit details."""
     if is_missing(value) or not str(value).strip():
         return "<blank>"
     return str(value).strip()
@@ -1095,6 +1128,8 @@ def _reconcile_priority_resolved_assignment_conflicts(
             else "cecl_portfolio"
         ),
     }
+    # Assignment tracking adds private row indices only to conflicts that may
+    # later be resolved here; remove that metadata from every emitted event.
     retained: List[Dict[str, Any]] = []
     for event in exceptions:
         conflict_indices = event.pop("_conflict_indices", None)
@@ -1129,6 +1164,7 @@ def _reconcile_priority_resolved_assignment_conflicts(
 def _resolved_assignment_value(
     row: Mapping[str, Any], value_spec: Any
 ) -> Any:
+    """Resolve a literal assignment or copy its value from a row field."""
     if isinstance(value_spec, Mapping) and "from_field" in value_spec:
         return row.get(value_spec["from_field"], pd.NA)
     return value_spec
@@ -1153,6 +1189,8 @@ def add_cecl_selection_summary(
     borrower_id_field = borrower.get("borrower_id_field", "borrower_id")
     balance_field = borrower.get("balance_field", "outstanding_balance")
     cecl_rows = summary["cecl_level"].fillna(False).astype(bool)
+    # Tie-out rows share tag names with population rows but must not receive
+    # resolved-population counts or balances.
     population_cecl_rows = cecl_rows.copy()
     if "tie_out_name" in summary.columns:
         population_cecl_rows &= summary["tie_out_name"].isna()
@@ -1178,6 +1216,8 @@ def add_cecl_selection_summary(
             selected_mask &= ~resolved["model_excluded"].fillna(False).astype(
                 bool
             )
+        # Tag names are expected to be unique, but retain the module constraint
+        # when available so summary logic stays safe for legacy report frames.
         if "cecl_module" in summary.columns and "primary_module" in resolved.columns:
             modules = {
                 str(value).strip()
@@ -1233,6 +1273,8 @@ def _validate_repeated_commercial_cecl_rows(
     if work.empty:
         return
 
+    # Prefer the module-derived bucket when available; the rating fallback
+    # mirrors normal routing so validation remains useful before module output.
     if "base_bucket" in work.columns:
         work["_cecl_bucket_check"] = work["base_bucket"].map(
             lambda value: (
@@ -1250,8 +1292,13 @@ def _validate_repeated_commercial_cecl_rows(
         else:
             work["_cecl_bucket_check"] = "Unknown"
 
+    # Commercial CECL calibration is borrower-grain even in loan-grain targeted
+    # mode, so repeated rows must share both their selected tag and risk bucket.
     for borrower_id, group in work.groupby(
-        borrower_id_field, dropna=False, sort=False
+        borrower_id_field,
+        dropna=False,
+        sort=False,
+        observed=True,
     ):
         if len(group) < 2:
             continue

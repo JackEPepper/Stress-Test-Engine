@@ -1,3 +1,5 @@
+"""Execute the Credit Stress Engine through ``python -m stress_engine``."""
+
 from .cli import main
 
 

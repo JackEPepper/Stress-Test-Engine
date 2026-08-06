@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+import openpyxl
 import pandas as pd
 
 from stress_engine.comparison import build_comparison_report
@@ -19,6 +21,14 @@ class SampleScenarioRunTest(unittest.TestCase):
     def _run(self, write_outputs: bool = False):
         scenario, base_dir = load_scenario(SCENARIO)
         return StressEngine(scenario, base_dir).run(write_outputs=write_outputs, run_comparison=False)
+
+    def test_metadata_records_runtime_dependency_versions(self):
+        """Preserve the numerical-library versions needed to reproduce a run."""
+        metadata = self._run()["metadata"]
+
+        self.assertEqual(metadata["pandas_version"], pd.__version__)
+        self.assertEqual(metadata["numpy_version"], np.__version__)
+        self.assertEqual(metadata["openpyxl_version"], openpyxl.__version__)
 
     def test_sample_run_outputs_expected_controls(self):
         with tempfile.TemporaryDirectory() as tmp:

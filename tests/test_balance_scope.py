@@ -15,6 +15,7 @@ from stress_engine.cecl import (
     INVALID_BALANCE_COUNT_FIELD,
     attach_cecl_reserve_basis,
     build_cecl_reserve_basis,
+    reserve_missing_count_field,
     validate_cecl_config,
 )
 from stress_engine.config import load_scenario
@@ -54,6 +55,59 @@ def _scenario(
 
 
 class IdentityBalanceScopeTest(unittest.TestCase):
+    def test_nullable_reserves_are_counted_without_three_value_masks(self):
+        scenario = _scenario()
+        identity = pd.DataFrame(
+            {
+                "loan_id": ["L1", "L2"],
+                "borrower_id": ["B1", "B2"],
+                "balance": pd.Series([100.0, 200.0], dtype="Float64"),
+                "cecl_reserve": pd.Series([5.0, pd.NA], dtype="Float64"),
+                "_source_row": [1, 2],
+            }
+        )
+
+        borrowers = build_borrowers(identity, scenario, []).set_index(
+            "borrower_id"
+        )
+
+        count_field = reserve_missing_count_field("cecl_reserve")
+        self.assertEqual(int(borrowers.at["B1", count_field]), 0)
+        self.assertEqual(int(borrowers.at["B2", count_field]), 1)
+        self.assertTrue(pd.isna(borrowers.at["B2", "cecl_reserve"]))
+
+    def test_missing_ids_with_duplicate_labels_remain_separate_exposures(self):
+        scenario = _scenario()
+        identity = pd.DataFrame(
+            {
+                "loan_id": ["L1", "L2"],
+                "borrower_id": [pd.NA, ""],
+                "balance": [100.0, 200.0],
+                "cecl_reserve": [5.0, 10.0],
+                "_source_row": [11, 12],
+            },
+            index=[7, 7],
+        )
+        exceptions = []
+
+        borrowers = build_borrowers(identity, scenario, exceptions)
+
+        self.assertEqual(
+            borrowers["borrower_id"].tolist(),
+            [
+                "__MISSING_BORROWER_ID_ROW_11",
+                "__MISSING_BORROWER_ID_ROW_12",
+            ],
+        )
+        self.assertEqual(borrowers["balance"].tolist(), [100.0, 200.0])
+        self.assertEqual(
+            sum(
+                event["code"] == "IDENTITY_BORROWER_ID_MISSING"
+                for event in exceptions
+            ),
+            2,
+        )
+
     def test_zero_balance_tolerance_must_be_finite_and_nonnegative(self):
         for value in (-0.01, np.inf, "not-a-number"):
             with self.subTest(value=value):

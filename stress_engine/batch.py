@@ -16,7 +16,16 @@ import pandas as pd
 from .config import output_dir_for
 from .engine import OUTPUT_MANIFEST_KIND, StressEngine
 from .io import write_csv, write_json
-from .utils import get_json_path, hash_json, json_safe, resolve_path, set_json_path_in_place, stable_name, to_number
+from .progress import ProgressReporter, ProgressStep
+from .utils import (
+    get_json_path,
+    hash_json,
+    json_safe,
+    resolve_path,
+    set_json_path_in_place,
+    stable_name,
+    to_number,
+)
 from .version import VERSION
 
 
@@ -33,6 +42,7 @@ def run_batch_scenarios(
     max_scenarios: int | None = None,
     mode_override: str | None = None,
     write_child_outputs: bool = True,
+    progress: ProgressReporter | None = None,
 ) -> Dict[str, Any]:
     """Run a base scenario plus optional generated sensitivity scenarios.
 
@@ -45,15 +55,47 @@ def run_batch_scenarios(
     batch_config = _batch_config(base_scenario)
     if mode_override:
         batch_config["mode"] = mode_override
-    expanded = expand_batch_scenarios(base_scenario, max_scenarios=max_scenarios, mode_override=mode_override)
-    batch_dir = _batch_output_dir(base_scenario, base_dir, output_dir)
 
-    base_output = batch_dir / "scenarios" / "base" if write_child_outputs else None
-    base_result = StressEngine(base_scenario, base_dir).run(
-        output_dir=base_output,
-        write_outputs=write_outputs and write_child_outputs,
-        run_comparison=run_comparison,
+    # Expansion validates cardinality and numeric bounds before any expensive
+    # child run starts, so an unsafe grid fails without partial model outputs.
+    expanded = expand_batch_scenarios(
+        base_scenario,
+        max_scenarios=max_scenarios,
+        mode_override=mode_override,
     )
+    batch_dir = _batch_output_dir(base_scenario, base_dir, output_dir)
+    reporter = progress if progress is not None else ProgressReporter()
+    mode = str(mode_override or batch_config.get("mode", "grid")).lower()
+    steps = [
+        ProgressStep("base", "Run base scenario", 3.0),
+        ProgressStep(
+            "generated",
+            f"Run {len(expanded)} generated scenarios",
+            max(len(expanded), 1) * 3.0,
+        ),
+        ProgressStep("reports", "Aggregate batch reports", 2.0),
+        ProgressStep("metadata", "Finalize batch audit metadata", 1.0),
+    ]
+    if write_outputs:
+        steps.append(ProgressStep("outputs", "Write batch output artifacts", 2.5))
+    reporter.start(
+        f"{base_scenario.get('scenario_id', 'unnamed scenario')} | "
+        f"{mode} batch | {len(expanded)} generated scenarios",
+        steps,
+    )
+    reporter.update(
+        f"Prepared {len(expanded):,} generated scenarios within the configured guardrail."
+    )
+
+    # The unmodified base run is retained as the common delta anchor for every
+    # generated scenario, including targeted variant-aware CECL comparisons.
+    base_output = batch_dir / "scenarios" / "base" if write_child_outputs else None
+    with reporter.step("base"):
+        base_result = StressEngine(base_scenario, base_dir).run(
+            output_dir=base_output,
+            write_outputs=write_outputs and write_child_outputs,
+            run_comparison=run_comparison,
+        )
 
     run_records: List[Dict[str, Any]] = []
     result_records: List[Dict[str, Any]] = []
@@ -70,39 +112,68 @@ def run_batch_scenarios(
         }
     )
 
-    for record in expanded:
-        child_output = batch_dir / "scenarios" / record["run_id"] if write_child_outputs else None
-        result = StressEngine(record["scenario"], base_dir).run(
-            output_dir=child_output,
-            write_outputs=write_outputs and write_child_outputs,
-            run_comparison=run_comparison,
-        )
-        run_record = dict(record)
-        run_record.pop("scenario", None)
-        run_records.append(run_record)
-        result_records.append(
-            {
-                "run_id": record["run_id"],
-                "scenario_id": record["scenario_id"],
-                "scenario_label": record["scenario_label"],
-                "is_base": False,
-                "variables": record["variables"],
-                "variable_rows": record["variable_rows"],
-                "output_dir": str(child_output) if child_output is not None else "",
-                "result": result,
-            }
-        )
+    # Child engines stay silent because the batch reporter owns user-facing
+    # progress; their full in-memory results remain available for aggregation.
+    with reporter.step("generated"):
+        for index, record in enumerate(expanded, start=1):
+            child_output = (
+                batch_dir / "scenarios" / record["run_id"]
+                if write_child_outputs
+                else None
+            )
+            result = StressEngine(record["scenario"], base_dir).run(
+                output_dir=child_output,
+                write_outputs=write_outputs and write_child_outputs,
+                run_comparison=run_comparison,
+            )
+            run_record = dict(record)
+            run_record.pop("scenario", None)
+            run_records.append(run_record)
+            result_records.append(
+                {
+                    "run_id": record["run_id"],
+                    "scenario_id": record["scenario_id"],
+                    "scenario_label": record["scenario_label"],
+                    "is_base": False,
+                    "variables": record["variables"],
+                    "variable_rows": record["variable_rows"],
+                    "output_dir": (
+                        str(child_output) if child_output is not None else ""
+                    ),
+                    "result": result,
+                }
+            )
+            reporter.update(
+                f"Completed scenario {index}/{len(expanded)}: {record['run_id']}.",
+                completed=index,
+                total=len(expanded),
+            )
 
-    reports = _batch_reports(result_records, base_result)
-    metadata = _batch_metadata(base_scenario, batch_config, expanded, reports, result_records, base_result)
+    # Batch reports are derived only after every child succeeds, preventing a
+    # partial sensitivity table from looking like a complete population.
+    with reporter.step("reports"):
+        reports = _batch_reports(result_records, base_result)
+        reporter.update(f"Built {len(reports):,} batch report tables.")
+    with reporter.step("metadata"):
+        metadata = _batch_metadata(
+            base_scenario,
+            batch_config,
+            expanded,
+            reports,
+            result_records,
+            base_result,
+        )
     if write_outputs:
-        child_directories = (
-            [Path("scenarios") / record["run_id"] for record in result_records]
-            if write_child_outputs
-            else []
-        )
-        _write_batch_outputs(batch_dir, reports, metadata, child_directories)
+        with reporter.step("outputs"):
+            child_directories = (
+                [Path("scenarios") / record["run_id"] for record in result_records]
+                if write_child_outputs
+                else []
+            )
+            _write_batch_outputs(batch_dir, reports, metadata, child_directories)
+            reporter.update("Wrote batch reports and audit metadata.")
 
+    reporter.finish("Batch run complete")
     return {
         "batch_config": batch_config,
         "batch_runs": pd.DataFrame(run_records),
@@ -431,6 +502,8 @@ def _scenario_record(
     child = copy.deepcopy(dict(base))
     variable_values: Dict[str, Any] = {}
     variable_rows = []
+    # Validate paths against the untouched child as each override is applied;
+    # the parallel rows preserve both machine-readable and report-friendly audit forms.
     for override in overrides:
         if not override.get("allow_create", False):
             get_json_path(child, override["path"])
@@ -450,6 +523,8 @@ def _scenario_record(
             }
         )
 
+    # Give every child a stable identity and hash after all overrides so its
+    # reports can be traced back to the exact generated scenario.
     base_id = str(base.get("scenario_id", "scenario"))
     scenario_id = f"{base_id}__{run_id}"
     child["scenario_id"] = scenario_id
@@ -480,6 +555,8 @@ def _batch_reports(records: Sequence[Mapping[str, Any]], base_result: Mapping[st
     cecl_rows: List[Dict[str, Any]] = []
     exception_rows: List[Dict[str, Any]] = []
 
+    # Preserve full CECL and exception detail, but restrict the compact summary
+    # to aggregate-total rows so one child has one headline result per level.
     for record in records:
         variable_columns = _variable_columns(record["variables"])
         for row in record.get("variable_rows", []):
@@ -585,6 +662,14 @@ def _batch_metadata(
 ) -> Dict[str, Any]:
     """Build metadata for the batch wrapper outputs."""
     metadata_source = base_result or (result_records[0]["result"] if result_records else {})
+    exception_report = reports.get("batch_exceptions", pd.DataFrame())
+    # Batch controls need both a portfolio-wide severity rollup and child-level
+    # hashes/counts for drill-through to the scenario that produced an issue.
+    severity_counts = (
+        exception_report["severity"].value_counts().sort_index().to_dict()
+        if "severity" in exception_report.columns
+        else {}
+    )
     run_metadata = []
     for record in result_records:
         child_metadata = record["result"].get("metadata", {})
@@ -608,6 +693,10 @@ def _batch_metadata(
         "batch_mode": batch_config.get("mode", "grid"),
         "generated_scenario_count": len(expanded),
         "input_files": metadata_source.get("metadata", {}).get("input_files", []),
+        "exception_count": int(len(exception_report)),
+        "exception_counts_by_severity": {
+            str(key): int(value) for key, value in severity_counts.items()
+        },
         "runs": run_metadata,
         "report_hashes": {
             name: hash_json(frame.fillna("").to_dict(orient="records"))

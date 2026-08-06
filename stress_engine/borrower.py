@@ -9,6 +9,7 @@ import pandas as pd
 
 from .cecl import (
     INVALID_BALANCE_COUNT_FIELD,
+    coerced_numeric_values,
     invalid_balance_mask,
     normalized_balance_values,
     reserve_basis_fields,
@@ -70,6 +71,8 @@ def split_identity_balance_scope(
     numeric_balances = normalized_balance_values(identity, scenario)
     tolerance = zero_balance_tolerance(scenario)
 
+    # Use physical positions rather than index labels: vendor extracts can
+    # contain duplicate indexes, while each excluded exposure must stay unique.
     rows: List[Dict[str, Any]] = []
     invalid_positions = np.flatnonzero(invalid.to_numpy(dtype=bool))
     for position in invalid_positions:
@@ -139,7 +142,7 @@ def build_borrowers(
         if reserve_field not in identity.columns:
             continue
         count_field = reserve_missing_count_field(reserve_field)
-        reserve_values = pd.to_numeric(identity[reserve_field], errors="coerce")
+        reserve_values = coerced_numeric_values(identity[reserve_field])
         finite = np.isfinite(reserve_values)
         identity[reserve_field] = reserve_values.where(
             finite & valid_balance
@@ -162,6 +165,8 @@ def build_borrowers(
     if loan_id_field and loan_id_field in identity.columns:
         aggregations.setdefault(loan_id_field, "list_unique")
 
+    # Provenance is loan-grain and representative-loan fields must remain
+    # coherent, so neither belongs in the independent borrower aggregations.
     agg_map: Dict[str, Any] = {}
     for column in identity.columns:
         if column == borrower_id or str(column).startswith("_source_") or column in largest_fields:
@@ -171,11 +176,13 @@ def build_borrowers(
 
     borrowers = (
         identity.sort_values([borrower_id, "_source_row"], kind="mergesort")
-        .groupby(borrower_id, dropna=False)
+        .groupby(borrower_id, dropna=False, observed=True)
         .agg(agg_map)
         .reset_index()
     )
-    loan_counts = identity.groupby(borrower_id, dropna=False).size().rename("loan_count").reset_index()
+    loan_counts = identity.groupby(
+        borrower_id, dropna=False, observed=True
+    ).size().rename("loan_count").reset_index()
     borrowers = borrowers.merge(loan_counts, on=borrower_id, how="left")
     # Rating, maturity, and every tag-driving attribute must come from the same
     # loan. The largest balance is the deterministic representative loan.
@@ -201,10 +208,19 @@ def _separate_missing_borrower_ids(
 ) -> None:
     """Give null borrower IDs deterministic placeholders so rows never coalesce."""
     missing = identity[borrower_id].isna() | identity[borrower_id].astype(str).str.strip().eq("")
-    for idx in identity.index[missing]:
-        source_row = identity.at[idx, "_source_row"] if "_source_row" in identity.columns else idx + 1
+    # Work positionally because programmatic callers can supply duplicate index
+    # labels; label-based ``.at`` would read or overwrite multiple exposures.
+    positions = np.flatnonzero(missing.to_numpy(dtype=bool))
+    borrower_column = identity.columns.get_loc(borrower_id)
+    source_rows = (
+        identity["_source_row"].to_numpy()
+        if "_source_row" in identity.columns
+        else np.arange(1, len(identity) + 1)
+    )
+    for position in positions:
+        source_row = source_rows[position]
         placeholder = f"__MISSING_BORROWER_ID_ROW_{source_row}"
-        identity.at[idx, borrower_id] = placeholder
+        identity.iat[position, borrower_column] = placeholder
         record_exception(
             exceptions,
             "ERROR",
@@ -318,7 +334,9 @@ def _record_largest_loan_conflicts(
         balance_field,
         list(dict.fromkeys([*fields, *([loan_id_field] if loan_id_field and loan_id_field in identity.columns else [])])),
     ).set_index(borrower_id)
-    for value, group in identity.groupby(borrower_id, dropna=False, sort=True):
+    for value, group in identity.groupby(
+        borrower_id, dropna=False, sort=True, observed=True
+    ):
         if len(group) < 2:
             continue
         conflicting = [field for field in fields if group[field].dropna().astype(str).nunique() > 1]
@@ -392,6 +410,8 @@ def build_source_reconciliation(
     identity_table = loaded.get("identity")
     rows: List[Dict[str, Any]] = []
 
+    # Promote loader diagnostics into the shared exception log so input
+    # profiling and downstream control reporting tell the same story.
     for loaded_name, table in loaded.items():
         for issue in table.coercion_issues:
             record_exception(
@@ -415,6 +435,8 @@ def build_source_reconciliation(
         merge_enabled = spec.get("merge", True) is not False
         key = spec.get("key", borrower_id) if merge_enabled else ""
         identity_key = spec.get("identity_key") if merge_enabled else None
+        # Emit an inventory row even when a source is not merged or cannot be
+        # reconciled; omissions here would make control totals look complete.
         base_row: Dict[str, Any] = {
             "source": name,
             "path": ";".join(str(path) for path in table.paths),
@@ -461,6 +483,8 @@ def build_source_reconciliation(
         duplicate = source_key_text.duplicated(keep=False)
         source_keys = set(source_key_text)
         if identity_key:
+            # Account-key coverage is measured before and after the identity
+            # crosswalk so orphan accounts do not masquerade as borrowers.
             if identity_table is None:
                 raise ValueError(f"Source '{name}' requires the identity input for account linkage.")
             linked = _link_source_to_identity(
@@ -487,6 +511,8 @@ def build_source_reconciliation(
             conflicts = _source_entity_value_conflicts(frame, key, spec)
         orphan_rows = int(source_key_text.isin(orphan_keys).sum())
         matched_borrower = borrowers[borrower_id].astype(str).isin(matched_borrower_ids)
+        # Borrower counts and balances use the post-crosswalk population,
+        # while source key counts retain the original source cardinality.
         base_row.update(
             {
                 "nonnull_key_row_count": int((~null_key).sum()),
@@ -567,6 +593,8 @@ def record_identity_data_issues(
     borrower = scenario.get("borrower", {})
     balance_field = borrower.get("balance_field", "outstanding_balance")
     reserve_field = scenario.get("cecl", {}).get("reserve_field", "cecl_reserve")
+    # Invalid balances leave the model population; missing reserves remain in
+    # scope and are handled by CECL's explicit zero/substitution controls.
     if balance_field not in identity.columns:
         record_exception(
             exceptions,
@@ -612,7 +640,7 @@ def record_identity_data_issues(
             field=reserve_field,
         )
         return
-    reserve_values = pd.to_numeric(identity[reserve_field], errors="coerce")
+    reserve_values = coerced_numeric_values(identity[reserve_field])
     missing_reserve = (
         ~np.isfinite(reserve_values)
     ) & ~invalid_balance_mask(identity, scenario)
@@ -719,7 +747,18 @@ def _source_entity_value_conflicts(frame: pd.DataFrame, key: str, spec: Mapping[
             # conflict exists only when the same entity/date disagrees.
             if date_field and date_field in frame.columns:
                 group_fields.append(date_field)
-            for group_key, group in frame.groupby(group_fields, dropna=False, sort=True):
+            # pandas 1.x warns that iterating over a one-item list grouper will
+            # change from scalar to tuple keys. Use a scalar in that case so
+            # key shape is stable across older Anaconda and current releases.
+            grouper: str | List[str] = (
+                group_fields[0] if len(group_fields) == 1 else group_fields
+            )
+            for group_key, group in frame.groupby(
+                grouper,
+                dropna=False,
+                sort=True,
+                observed=True,
+            ):
                 if len(group) > 1 and group[value_field].dropna().astype(str).nunique() > 1:
                     conflict_groups.add(group_key if isinstance(group_key, tuple) else (group_key,))
     return len(conflict_groups)
@@ -748,6 +787,8 @@ def _link_source_to_identity(
             f"Source '{name}' uses identity_key and must not also supply '{borrower_id}'."
         )
 
+    # Drop unusable and exact-duplicate links before enforcing the many-to-one
+    # invariant; one account mapping to two borrowers is never safe to guess.
     crosswalk = identity[[identity_key, borrower_id]].copy()
     valid_identity_key = (
         crosswalk[identity_key].notna()
@@ -758,7 +799,9 @@ def _link_source_to_identity(
         & crosswalk[borrower_id].astype(str).str.strip().ne("")
     )
     crosswalk = crosswalk.loc[valid_identity_key & valid_borrower].drop_duplicates()
-    borrower_counts = crosswalk.groupby(identity_key, dropna=False)[borrower_id].nunique()
+    borrower_counts = crosswalk.groupby(
+        identity_key, dropna=False, observed=True
+    )[borrower_id].nunique()
     ambiguous = borrower_counts[borrower_counts > 1]
     if not ambiguous.empty:
         examples = ", ".join(str(value) for value in ambiguous.index[:5])
@@ -789,6 +832,8 @@ def aggregate_source(name: str, df: pd.DataFrame, spec: Mapping[str, Any], key: 
             if column not in {key, source_key} and not str(column).startswith("_source_")
         }
 
+    # Each output may choose a different source row. Aggregate independently,
+    # then outer-join so a key supported by any configured output is retained.
     pieces: List[pd.DataFrame] = []
     for output_field, method_spec in aggregation.items():
         piece = _aggregate_field(frame, key, output_field, method_spec)
@@ -833,7 +878,9 @@ def _aggregate_field(df: pd.DataFrame, key: str, output_field: str, method_spec:
         # Mergesort preserves source order for equal dates, making latest-row
         # ties deterministic and auditable.
         work = work.sort_values(sort_cols, kind="mergesort")
-        values = work.dropna(subset=[field]).groupby(key, dropna=False).tail(1)
+        values = work.dropna(subset=[field]).groupby(
+            key, dropna=False, observed=True
+        ).tail(1)
         return values[[key, field]].rename(columns={field: output_field})
 
     if method == "best_available":
@@ -851,11 +898,15 @@ def _aggregate_field(df: pd.DataFrame, key: str, output_field: str, method_spec:
         # inflating borrower value.
         work = df[required].drop_duplicates([key] + unique_fields)
         work[field] = pd.to_numeric(work[field], errors="coerce")
-        return work.groupby(key, dropna=False)[field].sum(min_count=1).reset_index(name=output_field)
+        return work.groupby(key, dropna=False, observed=True)[field].sum(
+            min_count=1
+        ).reset_index(name=output_field)
 
     ensure_columns(df, [key, field], f"Aggregation for '{output_field}'")
     func = _aggregation_callable(method)
-    return df.groupby(key, dropna=False)[field].agg(func).reset_index(name=output_field)
+    return df.groupby(key, dropna=False, observed=True)[field].agg(
+        func
+    ).reset_index(name=output_field)
 
 
 def _best_available_field(
@@ -907,6 +958,8 @@ def _best_available_field(
     if not parts:
         return pd.DataFrame(columns=[key, output_field])
 
+    # Candidate fields become one ranking table so value and provenance are
+    # selected together rather than reconstructed after the fact.
     work = pd.concat(parts, ignore_index=True, sort=False)
     valid = _valid_best_available_values(work["_candidate_value"], treat_zero_as_missing)
     work = work.loc[valid].copy()
@@ -920,7 +973,11 @@ def _best_available_field(
     else:
         sort_cols = [key, "_candidate_date", "_candidate_order", "_source_row"]
         ascending = [True, False, True, False]
-    chosen = work.sort_values(sort_cols, ascending=ascending, kind="mergesort").groupby(key, dropna=False).head(1)
+    # Stable sorting plus source-row order makes equal-date/equal-priority
+    # choices reproducible across runs.
+    chosen = work.sort_values(
+        sort_cols, ascending=ascending, kind="mergesort"
+    ).groupby(key, dropna=False, observed=True).head(1)
     chosen = chosen.reset_index(drop=True)
 
     result = chosen[[key, "_candidate_value"]].rename(columns={"_candidate_value": output_field})
@@ -981,6 +1038,8 @@ def _best_available_unique_sum(
         part["_source_record"] = _source_record_series(part)
         parts.append(part)
 
+    # Select within each collateral/entity before summing by borrower; summing
+    # first could double count competing valuations for the same asset.
     work = pd.concat(parts, ignore_index=True, sort=False)
     work = work.loc[
         _valid_best_available_values(
@@ -1000,24 +1059,34 @@ def _best_available_unique_sum(
         sort_cols = [*group_fields, "_candidate_order", "_candidate_date", "_source_row"]
         ascending = [*[True] * len(group_fields), True, False, False]
     chosen = work.sort_values(sort_cols, ascending=ascending, kind="mergesort").groupby(
-        group_fields, dropna=False, sort=True
+        group_fields, dropna=False, sort=True, observed=True
     ).head(1)
-    result = chosen.groupby(key, dropna=False)["_candidate_value"].sum(min_count=1).reset_index(name=output_field)
+    result = chosen.groupby(key, dropna=False, observed=True)[
+        "_candidate_value"
+    ].sum(min_count=1).reset_index(name=output_field)
     date_output = options.get("date_output")
     if date_output:
-        dates = chosen.groupby(key, dropna=False)["_selected_date"].max().reset_index(name=date_output)
+        dates = chosen.groupby(key, dropna=False, observed=True)[
+            "_selected_date"
+        ].max().reset_index(name=date_output)
         result = result.merge(dates, on=key, how="left")
     source_field_output = options.get("source_field_output")
     if source_field_output:
-        sources = chosen.groupby(key, dropna=False)["_candidate_field"].agg(join_unique).reset_index(name=source_field_output)
+        sources = chosen.groupby(key, dropna=False, observed=True)[
+            "_candidate_field"
+        ].agg(join_unique).reset_index(name=source_field_output)
         result = result.merge(sources, on=key, how="left")
     candidate_output = options.get("candidate_output")
     if candidate_output:
-        labels = chosen.groupby(key, dropna=False)["_candidate_label"].agg(join_unique).reset_index(name=candidate_output)
+        labels = chosen.groupby(key, dropna=False, observed=True)[
+            "_candidate_label"
+        ].agg(join_unique).reset_index(name=candidate_output)
         result = result.merge(labels, on=key, how="left")
     source_record_output = options.get("source_record_output")
     if source_record_output:
-        records = chosen.groupby(key, dropna=False)["_source_record"].agg(join_unique).reset_index(
+        records = chosen.groupby(key, dropna=False, observed=True)[
+            "_source_record"
+        ].agg(join_unique).reset_index(
             name=source_record_output
         )
         result = result.merge(records, on=key, how="left")
@@ -1119,7 +1188,7 @@ def _max_value(values: pd.Series) -> Any:
     numeric = pd.to_numeric(clean, errors="coerce")
     if numeric.notna().all():
         return numeric.max()
-    dates = pd.to_datetime(clean, errors="coerce")
+    dates = parse_date_series(clean)
     if dates.notna().all():
         return dates.max()
     if numeric.notna().any():
@@ -1137,7 +1206,7 @@ def _min_value(values: pd.Series) -> Any:
     numeric = pd.to_numeric(clean, errors="coerce")
     if numeric.notna().all():
         return numeric.min()
-    dates = pd.to_datetime(clean, errors="coerce")
+    dates = parse_date_series(clean)
     if dates.notna().all():
         return dates.min()
     if numeric.notna().any():

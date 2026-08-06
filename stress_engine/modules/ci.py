@@ -131,6 +131,9 @@ def run_ci(
                     ),
                 )
                 continue
+            # Resolve and audit the effective assumptions before calculating;
+            # invalid configuration fails this borrower/level closed instead
+            # of allowing NaNs to leak into a migration bucket.
             reduction, reduction_source = _ebitda_reduction(
                 config,
                 sector,

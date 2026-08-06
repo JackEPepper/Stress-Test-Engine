@@ -22,7 +22,7 @@ from stress_engine.reporting import (
     build_reports,
 )
 from stress_engine.tagging import evaluate_conditions
-from stress_engine.utils import to_number
+from stress_engine.utils import compare_values, parse_date_series, to_number
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1368,6 +1368,78 @@ class HardeningRegressionTest(unittest.TestCase):
         mask = evaluate_conditions(frame, [{"field": "value", "op": "contains", "value": "."}])
         self.assertEqual(mask.tolist(), [False, True])
         self.assertEqual(to_number("2%"), 0.02)
+
+    def test_mixed_date_formats_and_timezones_parse_consistently(self):
+        values = pd.Series(
+            [
+                "2024-01-31",
+                "02/15/2024",
+                "2024-03-01T00:00:00-05:00",
+                "not-a-date",
+            ]
+        )
+
+        parsed = parse_date_series(values)
+
+        self.assertEqual(parsed.iloc[0], pd.Timestamp("2024-01-31"))
+        self.assertEqual(parsed.iloc[1], pd.Timestamp("2024-02-15"))
+        self.assertEqual(parsed.iloc[2], pd.Timestamp("2024-03-01 05:00:00"))
+        self.assertTrue(pd.isna(parsed.iloc[3]))
+
+    def test_nullable_string_equality_masks_are_boolean(self):
+        frame = pd.DataFrame(
+            {"value": pd.Series([pd.NA, "equal", "different"], dtype="string")}
+        )
+
+        equal = evaluate_conditions(
+            frame, {"field": "value", "op": "eq", "value": "equal"}
+        )
+        not_equal = evaluate_conditions(
+            frame, {"field": "value", "op": "ne", "value": "equal"}
+        )
+
+        self.assertEqual(equal.tolist(), [False, True, False])
+        self.assertEqual(not_equal.tolist(), [True, False, True])
+        self.assertEqual(equal.dtype, bool)
+        self.assertEqual(not_equal.dtype, bool)
+
+    def test_compare_values_always_returns_bool_for_missing_scalars(self):
+        cases = [
+            (pd.NA, "value", False),
+            ("value", pd.NA, False),
+            (pd.NA, pd.NA, True),
+            (np.nan, None, True),
+            ("value", "value", True),
+        ]
+        for left, right, expected in cases:
+            with self.subTest(left=left, right=right):
+                result = compare_values(left, right)
+                self.assertIs(type(result), bool)
+                self.assertEqual(result, expected)
+
+    def test_nullable_string_text_predicates_never_match_missing_values(self):
+        frame = pd.DataFrame(
+            {
+                "value": pd.Series(
+                    [pd.NA, "banana", "<literal", "literal>"],
+                    dtype="string",
+                )
+            }
+        )
+        cases = [
+            ("contains", "na", [False, True, False, False]),
+            ("startswith", "<", [False, False, True, False]),
+            ("endswith", ">", [False, False, False, True]),
+            ("regex", r"^<", [False, False, True, False]),
+        ]
+        for operation, value, expected in cases:
+            with self.subTest(operation=operation):
+                mask = evaluate_conditions(
+                    frame,
+                    {"field": "value", "op": operation, "value": value},
+                )
+                self.assertEqual(mask.tolist(), expected)
+                self.assertEqual(mask.dtype, bool)
 
 
 if __name__ == "__main__":
