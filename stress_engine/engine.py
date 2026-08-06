@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import platform
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping
@@ -16,6 +17,7 @@ from .borrower import (
     enrich_borrowers,
     record_best_available_fallbacks,
     record_identity_data_issues,
+    split_identity_balance_scope,
 )
 from .cecl import attach_cecl_reserve_basis, cecl_history_frame
 from .comparison import build_comparison_report
@@ -64,13 +66,22 @@ class StressEngine:
 
         # 1. Load every configured CSV/XLSX once. `load_inputs` also profiles
         # each table so input statistics can be reported without re-reading.
-        loaded = load_inputs(self.scenario, self.base_dir)
-        input_summary = pd.concat([item.profile for item in loaded.values()], ignore_index=True)
+        raw_loaded = load_inputs(self.scenario, self.base_dir)
+        input_summary = pd.concat(
+            [item.profile for item in raw_loaded.values()], ignore_index=True
+        )
 
         # 2. Build the borrower universe from the identity file, then use tags
         # to derive model populations, CECL portfolios, and reconciliation tags.
-        identity = loaded["identity"].frame
+        identity = raw_loaded["identity"].frame
         record_identity_data_issues(identity, self.scenario, exceptions)
+        identity, input_balance_out_of_scope = split_identity_balance_scope(
+            identity, self.scenario
+        )
+        loaded = dict(raw_loaded)
+        loaded["identity"] = replace(
+            raw_loaded["identity"], frame=identity
+        )
         borrowers = build_borrowers(identity, self.scenario, exceptions)
         borrowers, tag_summary = apply_tags(borrowers, self.scenario, loaded, exceptions)
         borrowers = assign_primary_modules(borrowers, self.scenario, exceptions)
@@ -93,7 +104,12 @@ class StressEngine:
         audit_borrowers = borrowers.copy()
 
         if targeted_enabled(self.scenario):
-            targeted = run_targeted_stress(self.scenario, loaded, exceptions)
+            targeted = run_targeted_stress(
+                self.scenario,
+                loaded,
+                exceptions,
+                input_out_of_scope=input_balance_out_of_scope,
+            )
             reports = targeted["reports"]
             reports["input_summary"] = input_summary
             reports["tag_summary"] = targeted["tag_summary"]
@@ -113,7 +129,7 @@ class StressEngine:
                             "max_variable_reruns"
                         ),
                     )
-            metadata = self._metadata(loaded, reports)
+            metadata = self._metadata(raw_loaded, reports)
             metadata["targeted_stress"] = {
                 "enabled": True,
                 "primary_variant": targeted["primary_variant"],
@@ -153,7 +169,11 @@ class StressEngine:
             exceptions,
             history=cecl_history_frame(self.scenario, loaded),
         )
-        out_of_scope_frames = []
+        out_of_scope_frames = (
+            [input_balance_out_of_scope]
+            if not input_balance_out_of_scope.empty
+            else []
+        )
         module_order = self.scenario.get("module_order", ["CRE", "C&I", "Consumer"])
         for module_name in module_order:
             if module_name == "CRE":
@@ -196,7 +216,7 @@ class StressEngine:
                     max_variable_reruns=self.scenario.get("comparison", {}).get("max_variable_reruns"),
                 )
 
-        metadata = self._metadata(loaded, reports)
+        metadata = self._metadata(raw_loaded, reports)
         if write_outputs:
             destination = output_dir_for(self.scenario, self.base_dir, output_dir)
             self._write_outputs(destination, audit_borrowers, results, reports, metadata)

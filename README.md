@@ -873,12 +873,24 @@ higher-precedence tags have been selected in every historical period.
 Missing, invalid, or nonfinite values in the current loan-level
 `cecl.reserve_field` are treated as zero and recorded in the exception report.
 
-Negative, invalid, or nonfinite balance observations are never treated as
-zero-balance CECL rows. Their count is carried through borrower aggregation,
-every bucket basis for the affected CECL-level tag is marked unavailable, and
-the condition is recorded in both the basis audit and exception report. Only a
-finite balance whose absolute value is within `zero_balance_tolerance` is
-eligible for zero-balance not-applicable treatment.
+Missing, nonnumeric, nonfinite, or materially negative identity balances are
+excluded at physical-loan grain before borrower aggregation, tagging,
+enrichment, stress formulas, or CECL calibration. The excluded exposure is
+written once to `out_of_scope_detail.csv` as an `Input` / `All` model-population
+issue, with borrower, loan, and source-row traceability when available. A valid
+sibling loan for the same borrower continues using only its own balance,
+reserve, and attributes; one bad loan therefore cannot make a borrower,
+CECL-level tag, portfolio, or Aggregate CECL unavailable. The raw input profile
+and warning log retain the data-quality evidence. Defensive direct calls to the
+CECL resolver apply the same row-level filter and emit
+`CECL_BALANCE_EXCLUDED` instead of propagating `CECL_BALANCE_INVALID` across a
+tag. A malformed balance component supplied directly to CECL reporting is
+skipped with `CECL_BUCKET_BALANCE_EXCLUDED`, while valid components continue.
+
+`cecl.zero_balance_tolerance` must be finite and nonnegative. A finite balance
+whose absolute value is within that tolerance is normalized to exact zero and
+remains eligible for zero-balance not-applicable treatment; only a balance
+below the negative tolerance is excluded as negative.
 
 Each commercial tag/bucket cell blends the selected current-quarter ratio with
 the historical ratios supplied for that exact tag and bucket:
@@ -992,6 +1004,10 @@ remain in `consumer_summary.csv` and the out-of-scope reports.
 
 Commercial and Consumer treatment differs:
 
+- An identity exposure with a missing, malformed, nonfinite, or materially
+  negative balance is excluded from the model population at loan grain and
+  appears once under `Input`, stress level `All`, in the out-of-scope reports.
+  Other valid loans for that borrower remain modeled.
 - A CRE or C&I borrower that cannot be stressed generally remains in its base
   commercial bucket. Its balance stays visible in migration and CECL reports,
   and the reason appears in out-of-scope reports.
@@ -1085,7 +1101,9 @@ are populated only on population rows; tie-out rows leave them blank.
 ### 4. Out-of-scope reports
 
 `out_of_scope_summary.csv` counts issues by module, stress level, test, field,
-and reason. `out_of_scope_detail.csv` identifies affected borrowers.
+and reason. `out_of_scope_detail.csv` identifies affected borrowers and, for
+input population exclusions and targeted runs, the physical loan and source
+row when available.
 
 ### 5. Results
 
@@ -1104,7 +1122,7 @@ files' aggregate balances are not expected to match.
 | `source_reconciliation.csv` | Key cardinality, coverage, unmatched balances, and source-data controls |
 | `tag_summary.csv` | Tag populations, balances, and external tie-outs |
 | `out_of_scope_summary.csv` | Aggregated missing/invalid calculation reasons |
-| `out_of_scope_detail.csv` | Borrower-level out-of-scope reasons |
+| `out_of_scope_detail.csv` | Borrower/loan-level out-of-scope reasons and input source-row traceability where available |
 | `exception_log.csv` | INFO, WARNING, and ERROR events |
 | `cre_summary.csv` | CRE DSCR/LTV and stressed-balance summary by subsector |
 | `ci_summary.csv` | Calculated stressed FCCR and stressed-balance summary by sector |

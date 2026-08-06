@@ -11,12 +11,15 @@ from .cecl import (
     CECL_LEVEL_TAG_FIELD,
     CeclReserveBasis,
     build_cecl_reserve_basis,
+    invalid_balance_mask,
+    normalized_balance_values,
 )
 from .modules.overlay import BUCKETS, apply_overlays
 from .exceptions import record_exception
 from .utils import get_levels, pct, to_number, weighted_average
 
 REPORT_BUCKETS = [*BUCKETS, "Unknown"]
+_CONSUMER_BASIS_VALUE_FIELD = "_cecl_consumer_basis_value"
 BUCKET_SUMMARY_COLUMNS = [
     "portfolio",
     "stress_level",
@@ -53,7 +56,7 @@ def build_reports(
     also where overlays and CECL summaries are calculated.
     """
     exceptions = exceptions if exceptions is not None else []
-    modeled_results = _model_included_rows(results)
+    modeled_results = _model_included_rows(results, scenario)
     bucket_summary = build_bucket_summary(modeled_results, scenario)
     bucket_summary, overlay_summary = apply_overlays(
         bucket_summary, modeled_results, scenario, exceptions
@@ -98,7 +101,7 @@ def build_bucket_summary(
     portfolio_field = portfolio_field or scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
     rows: List[Dict[str, Any]] = []
-    frame = _model_included_rows(results)
+    frame = _model_included_rows(results, scenario)
     if not include_consumer:
         if "primary_module" in frame.columns:
             frame = frame[frame["primary_module"].astype(str).str.lower() != "consumer"]
@@ -128,12 +131,27 @@ def build_bucket_summary(
     return pd.DataFrame(rows, columns=columns)
 
 
-def _model_included_rows(frame: pd.DataFrame) -> pd.DataFrame:
+def _model_included_rows(
+    frame: pd.DataFrame,
+    scenario: Mapping[str, Any] | None = None,
+) -> pd.DataFrame:
     """Return rows that remain eligible for modeled reports."""
-    if "model_excluded" not in frame.columns:
-        return frame
-    included = ~frame["model_excluded"].fillna(False).astype(bool)
-    return frame.loc[included]
+    included = pd.Series(True, index=frame.index)
+    if "model_excluded" in frame.columns:
+        included &= ~frame["model_excluded"].fillna(False).astype(bool)
+    if scenario is not None:
+        included &= ~invalid_balance_mask(frame, scenario)
+    out = frame.loc[included]
+    if scenario is not None:
+        balance_field = str(
+            scenario.get("borrower", {}).get(
+                "balance_field", "outstanding_balance"
+            )
+        )
+        if balance_field in out.columns:
+            out = out.copy()
+            out[balance_field] = normalized_balance_values(out, scenario)
+    return out
 
 
 def _cecl_public_portfolio_field(scenario: Mapping[str, Any]) -> str:
@@ -211,7 +229,7 @@ def build_cecl_bucket_summary(
     reinserted only after their public portfolio resolves to one CECL tag.
     """
     portfolio_field = _cecl_public_portfolio_field(scenario)
-    frame = _model_included_rows(results).copy()
+    frame = _model_included_rows(results, scenario).copy()
     if portfolio_field not in frame.columns:
         raise ValueError(
             f"CECL public portfolio field '{portfolio_field}' is missing."
@@ -358,7 +376,7 @@ def build_cecl_summary(
     reserve_field = cecl.get("reserve_field", "cecl_reserve")
     portfolio_field = _cecl_public_portfolio_field(scenario)
     balance_field = scenario["borrower"]["balance_field"]
-    results = results.copy()
+    results = _model_included_rows(results, scenario).copy()
     if portfolio_field in results.columns:
         results[portfolio_field] = results[portfolio_field].map(
             _normalized_cecl_key
@@ -432,27 +450,36 @@ def build_cecl_summary(
                     ratio_df,
                     reserve_basis.method,
                 )
+                if np.isfinite(balance) and abs(balance) <= zero_balance_tolerance:
+                    balance = 0.0
                 invalid_balance = (
                     not np.isfinite(balance)
                     or balance < -zero_balance_tolerance
                 )
-                if invalid_balance:
-                    status = "unavailable"
-                    exception_code = "CECL_BALANCE_INVALID"
+                basis_balance_invalid = (
+                    status == "unavailable"
+                    and exception_code == "CECL_BALANCE_INVALID"
+                )
+                if invalid_balance or basis_balance_invalid:
+                    record_exception(
+                        exceptions,
+                        "WARNING",
+                        "cecl",
+                        "CECL_BUCKET_BALANCE_EXCLUDED",
+                        "A malformed CECL bucket balance component was excluded; remaining valid components continued reporting.",
+                        portfolio=portfolio,
+                        stress_level=level,
+                        bucket=bucket,
+                        field=balance_field,
+                        cecl_level_tag=cecl_level_tag,
+                    )
+                    continue
                 if (
                     status == "unavailable"
                     and reserve_basis.exception_code
                 ):
                     exception_code = reserve_basis.exception_code
-                basis_balance_invalid = (
-                    status == "unavailable"
-                    and exception_code == "CECL_BALANCE_INVALID"
-                )
-                balance_issue = invalid_balance or basis_balance_invalid
-                is_positive_balance = (
-                    balance_issue
-                    or balance > zero_balance_tolerance
-                )
+                is_positive_balance = balance > zero_balance_tolerance
                 if status == "available":
                     # Proforma reserve = stressed bucket balance times the
                     # selected ratio for this CECL tag/bucket component.
@@ -468,15 +495,11 @@ def build_cecl_summary(
                         "ERROR",
                         "cecl",
                         exception_code,
-                        (
-                            "CECL bucket balance is negative or nonfinite; proforma CECL reserve was not calculated."
-                            if balance_issue
-                            else "CECL reserve ratio is unavailable for a required bucket calculation; proforma CECL reserve was not calculated."
-                        ),
+                        "CECL reserve ratio is unavailable for a required bucket calculation; proforma CECL reserve was not calculated.",
                         portfolio=portfolio,
                         stress_level=level,
                         bucket=bucket,
-                        field=balance_field if balance_issue else reserve_field,
+                        field=reserve_field,
                         cecl_level_tag=cecl_level_tag,
                     )
                 else:
@@ -709,6 +732,7 @@ def build_cre_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
 
     Called by `build_reports`; values are weighted by borrower balance.
     """
+    results = _model_included_rows(results, scenario)
     config = scenario.get("modules", {}).get("CRE", {})
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
@@ -739,6 +763,7 @@ def build_cre_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.
 
 def build_ci_summary(results: pd.DataFrame, scenario: Mapping[str, Any]) -> pd.DataFrame:
     """Build weighted C&I FCCR and migration summary rows."""
+    results = _model_included_rows(results, scenario)
     config = scenario.get("modules", {}).get("C&I", {})
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
@@ -777,6 +802,7 @@ def build_consumer_summary(
     lower. This keeps the reported decomposition and CECL reserve aligned while
     preserving raw scope diagnostics from the modeled expected-loss columns.
     """
+    results = _model_included_rows(results, scenario)
     portfolio_field = scenario["borrower"].get("portfolio_field", "portfolio")
     balance_field = scenario["borrower"]["balance_field"]
     stress_levels = get_levels(scenario)
@@ -788,6 +814,12 @@ def build_consumer_summary(
     reserve_basis = reserve_basis or build_cecl_reserve_basis(
         results, scenario, []
     )
+    results = _with_consumer_basis_values(results, reserve_basis)
+    frame = results[
+        results.get("module_applied", "")
+        .astype(str)
+        .str.contains("Consumer", na=False)
+    ]
     for portfolio, group in frame.groupby(portfolio_field, dropna=False):
         basis_values, reserve_field_available = _consumer_basis_values(
             group, scenario, reserve_basis
@@ -1144,7 +1176,12 @@ def _consumer_cecl_rows(
     """
     portfolio_field = _cecl_public_portfolio_field(scenario)
     balance_field = scenario["borrower"]["balance_field"]
-    group = results[results[portfolio_field] == portfolio]
+    positioned_results = _with_consumer_basis_values(
+        results, reserve_basis
+    )
+    group = positioned_results[
+        positioned_results[portfolio_field] == portfolio
+    ]
     basis_values, reserve_field_available = _consumer_basis_values(
         group, scenario, reserve_basis
     )
@@ -1240,10 +1277,26 @@ def _consumer_basis_values(
         scenario.get("cecl", {}).get("zero_balance_tolerance", 1e-9),
         1e-9,
     )
-    values = pd.to_numeric(
-        reserve_basis.effective_reserve.reindex(group.index),
-        errors="coerce",
-    )
+    if _CONSUMER_BASIS_VALUE_FIELD in group.columns:
+        values = pd.to_numeric(
+            group[_CONSUMER_BASIS_VALUE_FIELD], errors="coerce"
+        )
+    elif len(reserve_basis.effective_reserve) == len(group):
+        values = pd.Series(
+            reserve_basis.effective_reserve.to_numpy(),
+            index=group.index,
+            dtype=float,
+        )
+    elif (
+        reserve_basis.effective_reserve.index.is_unique
+        and group.index.is_unique
+    ):
+        values = pd.to_numeric(
+            reserve_basis.effective_reserve.reindex(group.index),
+            errors="coerce",
+        )
+    else:
+        values = pd.Series(np.nan, index=group.index, dtype=float)
     values = values.where(np.isfinite(values))
     balances = pd.to_numeric(group[balance_field], errors="coerce")
     invalid_balance = (~np.isfinite(balances)) | balances.lt(-tolerance)
@@ -1251,6 +1304,27 @@ def _consumer_basis_values(
     return values.fillna(0.0), not bool(
         invalid_balance.any() or basis_unavailable
     )
+
+
+def _with_consumer_basis_values(
+    frame: pd.DataFrame, reserve_basis: CeclReserveBasis
+) -> pd.DataFrame:
+    """Attach basis amounts positionally before duplicate-label grouping."""
+    out = frame.copy()
+    if len(reserve_basis.effective_reserve) == len(out):
+        out[_CONSUMER_BASIS_VALUE_FIELD] = (
+            reserve_basis.effective_reserve.to_numpy()
+        )
+    elif (
+        reserve_basis.effective_reserve.index.is_unique
+        and out.index.is_unique
+    ):
+        out[_CONSUMER_BASIS_VALUE_FIELD] = (
+            reserve_basis.effective_reserve.reindex(out.index).to_numpy()
+        )
+    else:
+        out[_CONSUMER_BASIS_VALUE_FIELD] = np.nan
+    return out
 
 
 def _combined_basis(labels: set[str]) -> str:

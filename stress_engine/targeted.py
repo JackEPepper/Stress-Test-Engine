@@ -8,14 +8,14 @@ from typing import Any, Dict, List, Mapping, Tuple
 import numpy as np
 import pandas as pd
 
-from .borrower import aggregate_source
+from .borrower import aggregate_source, split_identity_balance_scope
 from .cecl import attach_cecl_reserve_basis, cecl_history_frame
 from .exceptions import record_exception
 from .modules.base import initialize_results, targeted_override_column
 from .modules.ci import _brg_key, _ebitda_reduction, run_ci
 from .modules.consumer import run_consumer
 from .modules.cre import run_cre
-from .reporting import build_reports
+from .reporting import build_out_of_scope_summary, build_reports
 from .tagging import (
     add_cecl_selection_summary,
     apply_tags,
@@ -368,7 +368,9 @@ def build_loan_context(
     borrower = scenario["borrower"]
     borrower_id = borrower["borrower_id_field"]
     loan_id = borrower.get("loan_id_field", "loan_id")
-    loans = loaded["identity"].frame.copy()
+    loans, _ = split_identity_balance_scope(
+        loaded["identity"].frame, scenario
+    )
 
     missing_borrower = loans[borrower_id].isna() | loans[borrower_id].astype(str).str.strip().eq("")
     for idx in loans.index[missing_borrower]:
@@ -467,9 +469,16 @@ def run_targeted_stress(
     scenario: Mapping[str, Any],
     loaded: Mapping[str, Any],
     exceptions: List[Dict[str, Any]],
+    input_out_of_scope: pd.DataFrame | None = None,
 ) -> Dict[str, Any]:
     """Run baseline plus configured loan-level targeted variants."""
     validate_targeted_config(scenario)
+    if isinstance(input_out_of_scope, pd.DataFrame):
+        input_out_of_scope = input_out_of_scope.copy()
+    else:
+        _, input_out_of_scope = split_identity_balance_scope(
+            loaded["identity"].frame, scenario
+        )
     context, tag_summary = build_loan_context(scenario, loaded, exceptions)
     baseline_scenario = _variant_scenario(scenario, "baseline")
     exception_start = len(exceptions)
@@ -493,9 +502,13 @@ def run_targeted_stress(
     base_template = _base_template(baseline, baseline_scenario)
 
     variant_frames = [baseline]
-    out_scope_frames: List[pd.DataFrame] = (
-        [baseline_out_scope] if not baseline_out_scope.empty else []
-    )
+    out_scope_frames: List[pd.DataFrame] = []
+    if not input_out_of_scope.empty:
+        global_input_scope = input_out_of_scope.copy()
+        global_input_scope["scenario_variant"] = "all"
+        out_scope_frames.append(global_input_scope)
+    if not baseline_out_scope.empty:
+        out_scope_frames.append(baseline_out_scope)
     selection_rows: List[Dict[str, Any]] = []
     assumption_rows: List[Dict[str, Any]] = []
     reports_by_name: Dict[str, List[pd.DataFrame]] = {}
@@ -588,6 +601,19 @@ def run_targeted_stress(
         name: pd.concat(frames, ignore_index=True, sort=False)
         for name, frames in reports_by_name.items()
     }
+    if not input_out_of_scope.empty:
+        input_scope_summary = build_out_of_scope_summary(
+            input_out_of_scope
+        )
+        input_scope_summary.insert(0, "scenario_variant", "all")
+        reports["out_of_scope_summary"] = pd.concat(
+            [
+                reports.get("out_of_scope_summary", pd.DataFrame()),
+                input_scope_summary,
+            ],
+            ignore_index=True,
+            sort=False,
+        )
     selection_detail = pd.DataFrame(selection_rows)
     assumption_audit = pd.DataFrame(assumption_rows)
     reports["targeted_selection_detail"] = selection_detail

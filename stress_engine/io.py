@@ -14,6 +14,7 @@ from .utils import coerce_numeric_frame, hash_file, json_safe, resolve_path, sor
 
 
 _PRESERVED_NUMERIC_TOKEN = object()
+RAW_INVALID_NUMERIC_PREFIX = "_raw_invalid_numeric__"
 
 
 @dataclass
@@ -163,6 +164,9 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
             df[field] = converted
 
     numeric_fields = set(spec.get("numeric_columns", []))
+    preserved_invalid_fields = set(
+        spec.get("_preserve_invalid_numeric_values", [])
+    )
     preserved_masks: Dict[str, pd.Series] = {}
     for field in sorted(numeric_fields):
         if field not in df.columns:
@@ -191,6 +195,12 @@ def read_table(name: str, spec: Mapping[str, Any], base_dir: Path) -> LoadedTabl
                     "invalid_numeric_coerced_to_missing",
                 )
             )
+            if field in preserved_invalid_fields:
+                raw_field = f"{RAW_INVALID_NUMERIC_PREFIX}{field}"
+                df[raw_field] = pd.Series(
+                    pd.NA, index=df.index, dtype=object
+                )
+                df.loc[invalid, raw_field] = original.loc[invalid]
     df = coerce_numeric_frame(df, numeric_fields)
     for field, preserve_mask in preserved_masks.items():
         if not preserve_mask.any():
@@ -357,6 +367,16 @@ def load_inputs(scenario: Mapping[str, Any], base_dir: Path) -> Dict[str, Loaded
         if spec.get("identity_key")
     )
     identity_spec["string_columns"] = list(dict.fromkeys(identity_strings))
+    balance_field = borrower.get("balance_field")
+    if balance_field:
+        identity_spec["numeric_columns"] = list(
+            dict.fromkeys(
+                [*identity_spec.get("numeric_columns", []), balance_field]
+            )
+        )
+        identity_spec["_preserve_invalid_numeric_values"] = [
+            balance_field
+        ]
     loaded["identity"] = read_table("identity", identity_spec, base_dir)
     cecl = scenario.get("cecl", {})
     basis = cecl.get("reserve_basis", {}) if isinstance(cecl, Mapping) else {}
@@ -398,7 +418,7 @@ def profile_frame(name: str, df: pd.DataFrame, path: str) -> pd.DataFrame:
     """Build field-level counts and numeric stats for input reporting."""
     rows: List[Dict[str, Any]] = []
     for column in sorted(df.columns):
-        if str(column).startswith("_source_"):
+        if str(column).startswith(("_source_", RAW_INVALID_NUMERIC_PREFIX)):
             continue
         series = df[column]
         numeric = pd.to_numeric(series, errors="coerce")
@@ -433,7 +453,10 @@ def metadata_for_inputs(loaded: Mapping[str, LoadedTable]) -> List[Dict[str, Any
     rows: List[Dict[str, Any]] = []
     for name in sorted(loaded):
         item = loaded[name]
-        column_count = sum(not str(column).startswith("_source_") for column in item.frame.columns)
+        column_count = sum(
+            not str(column).startswith(("_source_", RAW_INVALID_NUMERIC_PREFIX))
+            for column in item.frame.columns
+        )
         for path, file_hash, row_count in zip(item.paths, item.file_hashes, item.file_row_counts):
             rows.append(
                 {

@@ -411,20 +411,20 @@ def evaluate_conditions(df: pd.DataFrame, conditions: Any) -> pd.Series:
             mask = pd.Series(True, index=df.index)
             for item in conditions["all"]:
                 mask &= evaluate_conditions(df, item)
-            return mask.fillna(False)
+            return mask.fillna(False).astype(bool)
         if "any" in conditions:
             mask = pd.Series(False, index=df.index)
             for item in conditions["any"]:
                 mask |= evaluate_conditions(df, item)
-            return mask.fillna(False)
-        return _evaluate_condition(df, conditions).fillna(False)
+            return mask.fillna(False).astype(bool)
+        return _evaluate_condition(df, conditions).fillna(False).astype(bool)
 
     if not isinstance(conditions, (list, tuple)):
         raise ValueError("Tag conditions must be an object or list.")
     mask = pd.Series(True, index=df.index)
     for condition in conditions:
         mask &= evaluate_conditions(df, condition)
-    return mask.fillna(False)
+    return mask.fillna(False).astype(bool)
 
 
 def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Series:
@@ -434,6 +434,8 @@ def _evaluate_condition(df: pd.DataFrame, condition: Mapping[str, Any]) -> pd.Se
     value = condition.get("value")
     if field not in df.columns:
         return pd.Series(False, index=df.index)
+    if df.empty:
+        return pd.Series(False, index=df.index, dtype=bool)
     series = df[field]
 
     if op == "eq":

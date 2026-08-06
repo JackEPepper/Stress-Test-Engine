@@ -1323,18 +1323,32 @@ class CeclReserveBasisTest(unittest.TestCase):
 
         borrowers = build_borrowers(identity, scenario, [])
         standard = build_cecl_reserve_basis(borrowers, scenario, [])
-        targeted = build_cecl_reserve_basis(identity, scenario, [])
+        targeted_exceptions: list[dict] = []
+        targeted = build_cecl_reserve_basis(
+            identity, scenario, targeted_exceptions
+        )
 
+        self.assertEqual(float(borrowers.iloc[0]["balance"]), 100.0)
+        self.assertEqual(float(borrowers.iloc[0]["cecl_reserve"]), 5.0)
         for basis in (standard, targeted):
-            self.assertEqual(basis.ratios.iloc[0]["status"], "unavailable")
-            self.assertEqual(
-                basis.ratios.iloc[0]["exception_code"],
-                "CECL_BALANCE_INVALID",
+            self.assertEqual(basis.ratios.iloc[0]["status"], "available")
+            self.assertAlmostEqual(
+                float(basis.ratios.iloc[0]["reserve_ratio"]), 0.05
             )
             self.assertEqual(
-                int(basis.ratios.iloc[0]["invalid_balance_count"]), 1
+                int(basis.ratios.iloc[0]["invalid_balance_count"]), 0
             )
-            self.assertTrue(basis.effective_reserve.isna().all())
+        self.assertAlmostEqual(float(standard.effective_reserve.sum()), 5.0)
+        self.assertTrue(pd.isna(targeted.effective_reserve.iloc[0]))
+        self.assertAlmostEqual(float(targeted.effective_reserve.iloc[1]), 5.0)
+        self.assertIn(
+            "CECL_BALANCE_EXCLUDED",
+            {row["code"] for row in targeted_exceptions},
+        )
+        self.assertNotIn(
+            "CECL_BALANCE_INVALID",
+            {row["code"] for row in targeted_exceptions},
+        )
 
     def test_engine_rejects_null_cecl_object_before_execution(self):
         scenario = _scenario()
@@ -1586,7 +1600,7 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
                         float(row["proforma_cecl_reserve"]), 20.0
                     )
 
-    def test_aggregated_invalid_balance_cannot_become_zero_balance_cecl(self):
+    def test_all_invalid_balances_are_excluded_without_fake_zero_cecl(self):
         scenario = _scenario(_weighted_basis())
         identity = pd.DataFrame(
             [
@@ -1617,26 +1631,16 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
         cecl = build_cecl_summary(
             borrowers, bucket_summary, scenario, [], basis
         )
-        base = cecl[
-            (cecl["portfolio"] == "CRE")
-            & (cecl["stress_level"] == "Base")
-            & (cecl["bucket"] == "Total")
-        ].iloc[0]
-        aggregate = cecl[
-            (cecl["portfolio"] == "Aggregate")
-            & (cecl["stress_level"] == "Base")
-        ].iloc[0]
+        self.assertTrue(borrowers.empty)
+        self.assertTrue(basis.ratios.empty)
+        self.assertTrue(bucket_summary.empty)
+        self.assertTrue(cecl["portfolio"].eq("Aggregate").all())
+        self.assertTrue(cecl["balance"].eq(0.0).all())
+        self.assertTrue(cecl["proforma_cecl_reserve"].eq(0.0).all())
+        self.assertTrue(cecl["cecl_reserve_status"].eq("available").all())
+        self.assertTrue(cecl["exception_code"].eq("").all())
 
-        self.assertTrue(pd.isna(borrowers.iloc[0]["balance"]))
-        self.assertEqual(
-            float(bucket_summary.iloc[0]["balance"]), 0.0
-        )
-        self.assertEqual(base["cecl_reserve_status"], "unavailable")
-        self.assertEqual(base["exception_code"], "CECL_BALANCE_INVALID")
-        self.assertTrue(pd.isna(base["proforma_cecl_reserve"]))
-        self.assertEqual(aggregate["cecl_reserve_status"], "unavailable")
-
-    def test_nonfinite_commercial_balance_cannot_report_available_cecl(self):
+    def test_nonfinite_bucket_component_is_excluded_from_cecl(self):
         scenario = _scenario(
             {
                 "current_method": "central_tendency",
@@ -1655,7 +1659,10 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             ]
         )
 
-        cecl = build_cecl_summary(results, bucket_summary, scenario, [])
+        exceptions: list[dict] = []
+        cecl = build_cecl_summary(
+            results, bucket_summary, scenario, exceptions
+        )
         base = cecl[
             (cecl["portfolio"] == "CRE")
             & (cecl["stress_level"] == "Base")
@@ -1666,9 +1673,59 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             & (cecl["stress_level"] == "Base")
         ].iloc[0]
 
-        self.assertEqual(base["cecl_reserve_status"], "unavailable")
-        self.assertTrue(pd.isna(base["proforma_cecl_reserve"]))
-        self.assertEqual(aggregate["cecl_reserve_status"], "unavailable")
+        for row in (base, aggregate):
+            self.assertEqual(row["cecl_reserve_status"], "available")
+            self.assertEqual(row["exception_code"], "")
+            self.assertEqual(float(row["balance"]), 0.0)
+            self.assertEqual(float(row["proforma_cecl_reserve"]), 0.0)
+        self.assertIn(
+            "CECL_BUCKET_BALANCE_EXCLUDED",
+            {row["code"] for row in exceptions},
+        )
+
+    def test_tolerance_sized_bucket_balance_is_normalized_to_zero(self):
+        scenario = _scenario()
+        scenario["cecl"]["zero_balance_tolerance"] = 1e-9
+        results = _commercial_frame([100.0], [10.0])
+        bucket_summary = pd.DataFrame(
+            [
+                {
+                    "portfolio": "CRE",
+                    "cecl_level_tag": "CRE",
+                    "stress_level": "Base",
+                    "bucket": "Pass",
+                    "balance": -5e-10,
+                }
+            ]
+        )
+        exceptions: list[dict] = []
+
+        cecl = build_cecl_summary(
+            results, bucket_summary, scenario, exceptions
+        )
+        base_pass = cecl[
+            (cecl["portfolio"] == "CRE")
+            & (cecl["stress_level"] == "Base")
+            & (cecl["bucket"] == "Pass")
+        ].iloc[0]
+        aggregate = cecl[
+            (cecl["portfolio"] == "Aggregate")
+            & (cecl["stress_level"] == "Base")
+        ].iloc[0]
+
+        for row in (base_pass, aggregate):
+            self.assertEqual(float(row["balance"]), 0.0)
+            self.assertEqual(float(row["proforma_cecl_reserve"]), 0.0)
+            self.assertEqual(row["exception_code"], "")
+        self.assertEqual(
+            base_pass["cecl_reserve_status"],
+            "not_applicable_zero_balance",
+        )
+        self.assertEqual(aggregate["cecl_reserve_status"], "available")
+        self.assertNotIn(
+            "CECL_BUCKET_BALANCE_EXCLUDED",
+            {row["code"] for row in exceptions},
+        )
 
     def test_empty_current_bucket_only_blocks_a_positive_stressed_balance(self):
         scenario = _scenario(_weighted_basis())
@@ -1723,7 +1780,7 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             stressed["exception_code"], "CECL_BASIS_PERIOD_UNAVAILABLE"
         )
 
-    def test_invalid_base_bucket_balance_blocks_all_stressed_buckets(self):
+    def test_invalid_base_bucket_balance_does_not_block_valid_population(self):
         scenario = _scenario(_weighted_basis())
         identity = pd.DataFrame(
             [
@@ -1772,13 +1829,17 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
                 & (cecl["stress_level"] == level)
                 & (cecl["bucket"] == "Total")
             ].iloc[0]
-            self.assertEqual(total["cecl_reserve_status"], "unavailable")
-            self.assertIn("CECL_BALANCE_INVALID", total["exception_code"])
+            self.assertEqual(total["cecl_reserve_status"], "available")
+            self.assertEqual(total["exception_code"], "")
+            self.assertEqual(float(total["balance"]), 100.0)
+            self.assertAlmostEqual(
+                float(total["proforma_cecl_reserve"]), 10.0
+            )
         history_audit = basis.audit[
             basis.audit["period_method"] == "tag_bucket_history"
         ]
         self.assertFalse(history_audit.empty)
-        self.assertTrue(history_audit["invalid_balance_count"].eq(1).all())
+        self.assertTrue(history_audit["invalid_balance_count"].eq(0).all())
 
     def test_unavailable_commercial_rows_retain_configured_basis_label(self):
         scenario = _scenario(_weighted_basis())
@@ -1814,7 +1875,7 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
         )
         self.assertEqual(base["cecl_reserve_status"], "unavailable")
 
-    def test_negative_commercial_and_consumer_balances_are_unavailable(self):
+    def test_negative_rows_and_bucket_components_are_excluded(self):
         scenario = _scenario({"current_method": "central_tendency"})
         commercial = _commercial_frame([-100.0], [10.0])
         commercial_buckets = pd.DataFrame(
@@ -1827,8 +1888,9 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
                 }
             ]
         )
+        exceptions: list[dict] = []
         commercial_cecl = build_cecl_summary(
-            commercial, commercial_buckets, scenario, []
+            commercial, commercial_buckets, scenario, exceptions
         )
         commercial_total = commercial_cecl[
             (commercial_cecl["portfolio"] == "CRE")
@@ -1856,10 +1918,24 @@ class CeclReserveBasisReportingTest(unittest.TestCase):
             & (consumer_cecl["stress_level"] == "Base")
         ].iloc[0]
 
-        for row in (commercial_total, consumer_total):
-            self.assertEqual(row["cecl_reserve_status"], "unavailable")
-            self.assertEqual(row["exception_code"], "CECL_BALANCE_INVALID")
-            self.assertTrue(pd.isna(row["proforma_cecl_reserve"]))
+        self.assertEqual(
+            commercial_total["cecl_reserve_status"], "available"
+        )
+        self.assertEqual(commercial_total["exception_code"], "")
+        self.assertEqual(float(commercial_total["balance"]), 0.0)
+        self.assertEqual(
+            float(commercial_total["proforma_cecl_reserve"]), 0.0
+        )
+        self.assertEqual(consumer_total["cecl_reserve_status"], "available")
+        self.assertEqual(consumer_total["exception_code"], "")
+        self.assertEqual(float(consumer_total["balance"]), 0.0)
+        self.assertEqual(
+            float(consumer_total["proforma_cecl_reserve"]), 0.0
+        )
+        self.assertIn(
+            "CECL_BUCKET_BALANCE_EXCLUDED",
+            {row["code"] for row in exceptions},
+        )
 
     def test_zero_balance_consumer_bucket_does_not_block_valid_portfolio(self):
         scenario = _scenario(

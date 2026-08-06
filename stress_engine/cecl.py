@@ -15,6 +15,7 @@ from .utils import pct, to_number
 
 CURRENT_METHODS = {"in_place", "central_tendency"}
 WEIGHT_TOLERANCE = 1e-9
+DEFAULT_ZERO_BALANCE_TOLERANCE = 1e-9
 DEFAULT_Z_SCORE_THRESHOLD = 2.0
 CECL_LEVEL_TAG_FIELD = "cecl_level_tag"
 CANONICAL_BUCKETS = ("Pass", "Special Mention", "Substandard")
@@ -62,6 +63,7 @@ CURRENT_CECL_RESERVED_FIELDS = RESERVED_INPUT_FIELDS | {
 CURRENT_CECL_RESERVED_PREFIXES = (
     "_cecl_",
     "_cecl_reserve_missing_count__",
+    "_raw_invalid_numeric__",
     "_source_",
     "_targeted_",
     "ci_available_cash_flow_",
@@ -164,8 +166,8 @@ def attach_cecl_reserve_basis(
     basis = build_cecl_reserve_basis(
         out, scenario, exceptions, history=history
     )
-    out[EFFECTIVE_RESERVE_FIELD] = basis.effective_reserve.reindex(out.index)
-    out[RESERVE_BASIS_METHOD_FIELD] = basis.method_by_row.reindex(out.index)
+    out[EFFECTIVE_RESERVE_FIELD] = basis.effective_reserve.to_numpy()
+    out[RESERVE_BASIS_METHOD_FIELD] = basis.method_by_row.to_numpy()
     return out, basis
 
 
@@ -196,6 +198,16 @@ def validate_cecl_config(scenario: Mapping[str, Any]) -> None:
     portfolio_field = _exact_field_setting(
         cecl, "portfolio_field", "cecl_portfolio", "cecl.portfolio_field"
     )
+    zero_balance_tolerance = _finite_number(
+        cecl.get(
+            "zero_balance_tolerance", DEFAULT_ZERO_BALANCE_TOLERANCE
+        ),
+        "cecl.zero_balance_tolerance",
+    )
+    if zero_balance_tolerance < 0:
+        raise ValueError(
+            "cecl.zero_balance_tolerance must be greater than or equal to zero."
+        )
     _validate_current_field_names(
         scenario, current_field, portfolio_field
     )
@@ -414,6 +426,78 @@ def reserve_missing_count_field(reserve_field: str) -> str:
     return f"_cecl_reserve_missing_count__{reserve_field}"
 
 
+def zero_balance_tolerance(scenario: Mapping[str, Any]) -> float:
+    """Return the validated CECL/model balance rounding tolerance.
+
+    Scenario validation rejects malformed values during normal engine runs.
+    The defensive fallback keeps lower-level programmatic callers from
+    crashing if they bypass that validation.
+    """
+    cecl = scenario.get("cecl", {})
+    if not isinstance(cecl, Mapping):
+        return DEFAULT_ZERO_BALANCE_TOLERANCE
+    tolerance = to_number(
+        cecl.get(
+            "zero_balance_tolerance", DEFAULT_ZERO_BALANCE_TOLERANCE
+        ),
+        DEFAULT_ZERO_BALANCE_TOLERANCE,
+    )
+    if not np.isfinite(tolerance) or tolerance < 0:
+        return DEFAULT_ZERO_BALANCE_TOLERANCE
+    return float(tolerance)
+
+
+def normalized_balance_values(
+    frame: pd.DataFrame, scenario: Mapping[str, Any]
+) -> pd.Series:
+    """Coerce balances and normalize rounding-size values to exact zero."""
+    balance_field = str(
+        scenario.get("borrower", {}).get(
+            "balance_field", "outstanding_balance"
+        )
+    )
+    if balance_field not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    balances = _coerced_balance_values(frame[balance_field])
+    balances = balances.where(np.isfinite(balances))
+    tolerance = zero_balance_tolerance(scenario)
+    return balances.mask(balances.abs().le(tolerance), 0.0)
+
+
+def invalid_balance_mask(
+    frame: pd.DataFrame, scenario: Mapping[str, Any]
+) -> pd.Series:
+    """Identify exposure rows whose balance cannot enter the model."""
+    balance_field = str(
+        scenario.get("borrower", {}).get(
+            "balance_field", "outstanding_balance"
+        )
+    )
+    if balance_field not in frame.columns:
+        return pd.Series(False, index=frame.index, dtype=bool)
+    balances = _coerced_balance_values(frame[balance_field])
+    tolerance = zero_balance_tolerance(scenario)
+    return pd.Series(
+        (~np.isfinite(balances)) | balances.lt(-tolerance),
+        index=frame.index,
+        dtype=bool,
+    )
+
+
+def _coerced_balance_values(values: pd.Series) -> pd.Series:
+    """Return ordinary float values for NumPy and nullable pandas inputs."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    try:
+        array = numeric.to_numpy(dtype=float, na_value=np.nan)
+    except (AttributeError, TypeError, ValueError):
+        array = np.asarray(numeric, dtype=float)
+    result = pd.Series(array, index=values.index, dtype=float)
+    boolean_values = values.map(
+        lambda value: isinstance(value, (bool, np.bool_))
+    )
+    return result.mask(boolean_values)
+
+
 def build_cecl_reserve_basis(
     results: pd.DataFrame,
     scenario: Mapping[str, Any],
@@ -441,7 +525,8 @@ def build_cecl_reserve_basis(
     balance_field = str(
         scenario.get("borrower", {}).get("balance_field", "outstanding_balance")
     )
-    basis_results = results.copy()
+    output_index = results.index.copy()
+    basis_results = results.reset_index(drop=True).copy()
     if portfolio_field in basis_results.columns:
         basis_results[portfolio_field] = _normalized_portfolios(
             basis_results[portfolio_field]
@@ -450,7 +535,7 @@ def build_cecl_reserve_basis(
         basis_results[CECL_LEVEL_TAG_FIELD] = _normalized_portfolios(
             basis_results[CECL_LEVEL_TAG_FIELD]
         )
-    effective = pd.Series(np.nan, index=results.index, dtype=float)
+    effective = pd.Series(np.nan, index=basis_results.index, dtype=float)
     method_by_row = _row_basis_methods(
         basis_results, scenario, portfolio_field, method
     )
@@ -466,14 +551,17 @@ def build_cecl_reserve_basis(
             "Historical CECL ratios require at least one configured CECL-level tag.",
             field=CECL_LEVEL_TAG_FIELD,
         )
-        return _unavailable_basis(
-            method,
-            current_method,
-            history_enabled,
-            effective,
-            method_by_row,
-            required_fields,
-            code,
+        return _basis_with_output_index(
+            _unavailable_basis(
+                method,
+                current_method,
+                history_enabled,
+                effective,
+                method_by_row,
+                required_fields,
+                code,
+            ),
+            output_index,
         )
 
     if current_field not in basis_results.columns:
@@ -485,18 +573,30 @@ def build_cecl_reserve_basis(
             "The configured current CECL reserve field is missing; CECL is unavailable.",
             field=current_field,
         )
-        return _unavailable_basis(
-            method,
-            current_method,
-            history_enabled,
-            effective,
-            method_by_row,
-            required_fields,
-            "CECL_RESERVE_FIELD_MISSING",
+        return _basis_with_output_index(
+            _unavailable_basis(
+                method,
+                current_method,
+                history_enabled,
+                effective,
+                method_by_row,
+                required_fields,
+                "CECL_RESERVE_FIELD_MISSING",
+            ),
+            output_index,
         )
 
+    reserve_scope = pd.Series(True, index=basis_results.index)
+    if "model_excluded" in basis_results.columns:
+        reserve_scope &= ~basis_results["model_excluded"].fillna(False).astype(
+            bool
+        )
+    reserve_scope &= ~invalid_balance_mask(basis_results, scenario)
     missing_count = int(
-        _finite_numeric(basis_results[current_field]).isna().sum()
+        _finite_numeric(basis_results[current_field])
+        .isna()
+        .loc[reserve_scope]
+        .sum()
     )
     if missing_count and not _exception_exists(
         exceptions,
@@ -530,19 +630,35 @@ def build_cecl_reserve_basis(
             "A grouping field required by CECL is missing; CECL is unavailable.",
             field=missing,
         )
-        return _unavailable_basis(
-            method,
-            current_method,
-            history_enabled,
-            effective,
-            method_by_row,
-            required_fields,
-            "CECL_BASIS_GROUP_FIELD_MISSING",
+        return _basis_with_output_index(
+            _unavailable_basis(
+                method,
+                current_method,
+                history_enabled,
+                effective,
+                method_by_row,
+                required_fields,
+                "CECL_BASIS_GROUP_FIELD_MISSING",
+            ),
+            output_index,
         )
 
     frame = basis_results.copy()
     if "model_excluded" in frame.columns:
         frame = frame[~frame["model_excluded"].fillna(False).astype(bool)].copy()
+    invalid_balances = invalid_balance_mask(frame, scenario)
+    if invalid_balances.any():
+        record_exception(
+            exceptions,
+            "WARNING",
+            "cecl",
+            "CECL_BALANCE_EXCLUDED",
+            "Rows with missing, invalid, nonfinite, or materially negative balances were excluded from CECL reserve-basis calibration.",
+            field=balance_field,
+            details=f"excluded_row_count={int(invalid_balances.sum())}",
+        )
+        frame = frame.loc[~invalid_balances].copy()
+    frame[balance_field] = normalized_balance_values(frame, scenario)
     missing_portfolio = frame[portfolio_field].isna() | frame[
         portfolio_field
     ].astype(str).str.strip().eq("")
@@ -581,14 +697,17 @@ def build_cecl_reserve_basis(
                 "The resolved CECL-level tag field is missing; reserve-basis calibration is unavailable.",
                 field=CECL_LEVEL_TAG_FIELD,
             )
-            return _unavailable_basis(
-                method,
-                current_method,
-                history_enabled,
-                effective,
-                method_by_row,
-                required_fields,
-                code,
+            return _basis_with_output_index(
+                _unavailable_basis(
+                    method,
+                    current_method,
+                    history_enabled,
+                    effective,
+                    method_by_row,
+                    required_fields,
+                    code,
+                ),
+                output_index,
             )
         frame[CECL_LEVEL_TAG_FIELD] = frame[portfolio_field]
     if CECL_LEVEL_TAG_FIELD not in frame.columns:
@@ -626,27 +745,6 @@ def build_cecl_reserve_basis(
         for value in commercial_frame[CECL_LEVEL_TAG_FIELD]
         if _level_tag_key(value)
     }
-    tag_invalid: Dict[str, int] = {}
-    for tag, tag_group in commercial_frame.groupby(
-        CECL_LEVEL_TAG_FIELD, dropna=False, sort=False
-    ):
-        tag_key = _level_tag_key(tag)
-        invalid_count = _invalid_balance_count(tag_group, balance_field)
-        tag_invalid[tag_key] = invalid_count
-        if invalid_count:
-            record_exception(
-                exceptions,
-                "ERROR",
-                "cecl",
-                "CECL_BALANCE_INVALID",
-                "A CECL-level tag contains negative, invalid, or nonfinite balances; every bucket ratio for that tag is unavailable.",
-                field=balance_field,
-                details=(
-                    f"cecl_level_tag={tag_key}; "
-                    f"invalid_balance_count={invalid_count}"
-                ),
-            )
-
     history_lookup, history_global_code = _prepare_history(
         history,
         historical,
@@ -694,19 +792,6 @@ def build_cecl_reserve_basis(
         finite_balances = _finite_numeric(group[balance_field])
         eligible_group = group.loc[finite_balances.notna()]
         group_balance = float(finite_balances.sum())
-        invalid_balance_count = _invalid_balance_count(group, balance_field)
-        if is_consumer and invalid_balance_count:
-            record_exception(
-                exceptions,
-                "ERROR",
-                "cecl",
-                "CECL_BALANCE_INVALID",
-                "A CECL group contains negative, invalid, or nonfinite balances; its reserve basis is unavailable.",
-                portfolio=portfolio,
-                bucket=bucket_text,
-                field=balance_field,
-                details=f"invalid_balance_count={invalid_balance_count}",
-            )
 
         observations = _borrower_observations(
             eligible_group, borrower_field, balance_field, current_field
@@ -822,13 +907,7 @@ def build_cecl_reserve_basis(
             for period, values in selected
             if values["status"] == "skipped"
         ]
-        if basis_invalid_balance_count:
-            ratio = np.nan
-            reserve = np.nan
-            status = "unavailable"
-            code = "CECL_BALANCE_INVALID"
-            effective.loc[group.index] = np.nan
-        elif unavailable:
+        if unavailable:
             ratio = np.nan
             reserve = np.nan
             status = "unavailable"
@@ -934,15 +1013,12 @@ def build_cecl_reserve_basis(
             bucket_text,
             group,
             is_consumer=True,
-            basis_invalid_balance_count=_invalid_balance_count(
-                group, balance_field
-            ),
+            basis_invalid_balance_count=0,
         )
 
     for cecl_level_tag, tag_group in commercial_frame.groupby(
         CECL_LEVEL_TAG_FIELD, dropna=False, sort=False
     ):
-        tag_key = _level_tag_key(cecl_level_tag)
         portfolio = _portfolio_label(tag_group[portfolio_field])
         observed_buckets = [
             bucket
@@ -962,7 +1038,7 @@ def build_cecl_reserve_basis(
                 bucket_text,
                 group,
                 is_consumer=False,
-                basis_invalid_balance_count=tag_invalid.get(tag_key, 0),
+                basis_invalid_balance_count=0,
             )
 
     _invalidate_decreasing_effective_ladders(
@@ -973,15 +1049,18 @@ def build_cecl_reserve_basis(
         exceptions,
     )
 
-    return CeclReserveBasis(
-        method=method,
-        current_method=current_method,
-        history_enabled=history_enabled,
-        effective_reserve=effective,
-        method_by_row=method_by_row,
-        ratios=pd.DataFrame(ratio_rows, columns=RATIO_COLUMNS),
-        audit=pd.DataFrame(audit_rows, columns=AUDIT_COLUMNS),
-        required_fields=required_fields,
+    return _basis_with_output_index(
+        CeclReserveBasis(
+            method=method,
+            current_method=current_method,
+            history_enabled=history_enabled,
+            effective_reserve=effective,
+            method_by_row=method_by_row,
+            ratios=pd.DataFrame(ratio_rows, columns=RATIO_COLUMNS),
+            audit=pd.DataFrame(audit_rows, columns=AUDIT_COLUMNS),
+            required_fields=required_fields,
+        ),
+        output_index,
     )
 
 
@@ -1806,18 +1885,6 @@ def _finite_fsum(values: Iterable[float]) -> float:
     return total if np.isfinite(total) else np.nan
 
 
-def _invalid_balance_count(group: pd.DataFrame, balance_field: str) -> int:
-    balances = pd.to_numeric(group[balance_field], errors="coerce")
-    direct_count = int(((~np.isfinite(balances)) | balances.lt(0)).sum())
-    if INVALID_BALANCE_COUNT_FIELD not in group.columns:
-        return direct_count
-    carried = pd.to_numeric(
-        group[INVALID_BALANCE_COUNT_FIELD], errors="coerce"
-    )
-    carried = carried.where(np.isfinite(carried), 0.0).clip(lower=0.0)
-    return max(direct_count, int(carried.sum()))
-
-
 def _exception_exists(
     exceptions: Iterable[Mapping[str, Any]], code: str, field: str
 ) -> bool:
@@ -1825,6 +1892,27 @@ def _exception_exists(
         str(item.get("code", "")) == code
         and str(item.get("field", "")) == field
         for item in exceptions
+    )
+
+
+def _basis_with_output_index(
+    basis: CeclReserveBasis, output_index: pd.Index
+) -> CeclReserveBasis:
+    """Restore caller row labels after position-safe internal calculations."""
+    return CeclReserveBasis(
+        method=basis.method,
+        current_method=basis.current_method,
+        history_enabled=basis.history_enabled,
+        effective_reserve=pd.Series(
+            basis.effective_reserve.to_numpy(), index=output_index, dtype=float
+        ),
+        method_by_row=pd.Series(
+            basis.method_by_row.to_numpy(), index=output_index, dtype=object
+        ),
+        ratios=basis.ratios,
+        audit=basis.audit,
+        required_fields=basis.required_fields,
+        exception_code=basis.exception_code,
     )
 
 

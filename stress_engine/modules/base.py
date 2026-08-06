@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Mapping
 import numpy as np
 import pandas as pd
 
+from ..cecl import invalid_balance_mask
 from ..exceptions import record_exception
 from ..tagging import model_eligible_tag_names
 from ..utils import as_list, is_missing, risk_bucket_from_rating, stable_name, to_number
@@ -66,6 +67,7 @@ def module_population(df: pd.DataFrame, scenario: Mapping[str, Any], module_conf
     mask = pd.Series(True, index=df.index)
     if "model_excluded" in df.columns:
         mask &= ~df["model_excluded"].fillna(False).astype(bool)
+    mask &= ~invalid_balance_mask(df, scenario)
     eligible_tags = as_list(module_config.get("eligible_tags"))
     if eligible_tags:
         allowed = model_eligible_tag_names(scenario)

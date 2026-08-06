@@ -9,12 +9,102 @@ import pandas as pd
 
 from .cecl import (
     INVALID_BALANCE_COUNT_FIELD,
+    invalid_balance_mask,
+    normalized_balance_values,
     reserve_basis_fields,
     reserve_missing_count_field,
+    zero_balance_tolerance,
 )
 from .exceptions import record_exception
-from .io import LoadedTable
+from .io import LoadedTable, RAW_INVALID_NUMERIC_PREFIX
 from .utils import as_list, condition_fields, ensure_columns, first_non_null, join_unique, parse_date_series
+
+
+def split_identity_balance_scope(
+    identity: pd.DataFrame,
+    scenario: Mapping[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Separate invalid loan balances before any model aggregation or tagging.
+
+    The returned detail has one row per excluded physical exposure. Its
+    ``stress_level`` is ``All`` because this is a population-level exclusion,
+    not a scenario-specific formula failure.
+    """
+    borrower = scenario.get("borrower", {})
+    balance_field = str(
+        borrower.get("balance_field", "outstanding_balance")
+    )
+    ensure_columns(identity, [balance_field], "Identity input")
+
+    invalid = invalid_balance_mask(identity, scenario)
+    valid_identity = identity.loc[~invalid].copy()
+    raw_balance_field = f"{RAW_INVALID_NUMERIC_PREFIX}{balance_field}"
+    valid_identity[balance_field] = normalized_balance_values(
+        valid_identity, scenario
+    )
+    valid_identity = valid_identity.drop(
+        columns=[raw_balance_field], errors="ignore"
+    )
+    if not invalid.any():
+        return valid_identity, pd.DataFrame()
+
+    borrower_id = str(
+        borrower.get("borrower_id_field", "borrower_id")
+    )
+    loan_id = str(borrower.get("loan_id_field", "loan_id"))
+    portfolio_field = str(
+        borrower.get("portfolio_field", "portfolio")
+    )
+    cecl = scenario.get("cecl", {})
+    cecl_portfolio_field = (
+        str(cecl.get("portfolio_field", "cecl_portfolio"))
+        if isinstance(cecl, Mapping)
+        else "cecl_portfolio"
+    )
+    raw_balances = identity[balance_field].astype(object).copy()
+    if raw_balance_field in identity.columns:
+        preserved = identity[raw_balance_field]
+        raw_balances.loc[preserved.notna()] = preserved.loc[
+            preserved.notna()
+        ]
+    numeric_balances = normalized_balance_values(identity, scenario)
+    tolerance = zero_balance_tolerance(scenario)
+
+    rows: List[Dict[str, Any]] = []
+    invalid_positions = np.flatnonzero(invalid.to_numpy(dtype=bool))
+    for position in invalid_positions:
+        row = identity.iloc[position]
+        numeric = numeric_balances.iloc[position]
+        raw_balance = raw_balances.iloc[position]
+        issue = (
+            "negative_below_tolerance"
+            if np.isfinite(numeric) and numeric < -tolerance
+            else "missing_invalid_or_nonfinite"
+        )
+        portfolio = row.get(portfolio_field, np.nan)
+        if pd.isna(portfolio) or str(portfolio).strip() == "":
+            portfolio = row.get(cecl_portfolio_field, np.nan)
+        detail: Dict[str, Any] = {
+            "borrower_id": row.get(borrower_id, np.nan),
+            "loan_id": row.get(loan_id, np.nan),
+            "portfolio": portfolio,
+            "module": "Input",
+            "stress_level": "All",
+            "test": "Model population",
+            "field": balance_field,
+            "reason": "invalid_balance",
+            "balance_issue": issue,
+            "input_value": raw_balance,
+        }
+        for source_field in (
+            "_source_file",
+            "_source_file_row",
+            "_source_row",
+        ):
+            if source_field in identity.columns:
+                detail[source_field] = row.get(source_field, np.nan)
+        rows.append(detail)
+    return valid_identity, pd.DataFrame(rows)
 
 
 def build_borrowers(
@@ -40,21 +130,10 @@ def build_borrowers(
     loan_id_field = config.get("loan_id_field")
 
     ensure_columns(identity, [borrower_id], "Identity input")
-    identity = identity.copy()
+    identity, _ = split_identity_balance_scope(identity, scenario)
     valid_balance = pd.Series(True, index=identity.index)
-    if balance_field in identity.columns:
-        balance_values = pd.to_numeric(identity[balance_field], errors="coerce")
-        valid_balance = pd.Series(
-            np.isfinite(balance_values), index=identity.index
-        )
-        identity[balance_field] = balance_values.where(valid_balance)
-        # Keep negative balances visible in reported totals, but carry an
-        # explicit counter so CECL never treats them as a valid zero balance
-        # after borrower aggregation.
-        identity[INVALID_BALANCE_COUNT_FIELD] = (
-            (~valid_balance) | balance_values.lt(0)
-        ).astype(int)
-        balance_fields.add(INVALID_BALANCE_COUNT_FIELD)
+    identity[INVALID_BALANCE_COUNT_FIELD] = 0
+    balance_fields.add(INVALID_BALANCE_COUNT_FIELD)
     reserve_fields = set(reserve_basis_fields(scenario))
     for reserve_field in reserve_fields:
         if reserve_field not in identity.columns:
@@ -101,7 +180,7 @@ def build_borrowers(
     # Rating, maturity, and every tag-driving attribute must come from the same
     # loan. The largest balance is the deterministic representative loan.
     largest_rows = _largest_loan_rows(identity, borrower_id, balance_field, largest_fields)
-    if not largest_rows.empty:
+    if largest_fields:
         borrowers = borrowers.merge(largest_rows, on=borrower_id, how="left")
     _record_largest_loan_conflicts(
         identity,
@@ -498,27 +577,30 @@ def record_identity_data_issues(
             field=balance_field,
         )
     else:
-        balances = pd.to_numeric(identity[balance_field], errors="coerce")
-        invalid_balances = ~np.isfinite(balances)
+        balances = normalized_balance_values(identity, scenario)
+        invalid_balances = balances.isna()
         if invalid_balances.any():
             record_exception(
                 exceptions,
                 "WARNING",
                 "identity",
                 "IDENTITY_BALANCE_MISSING",
-                "Identity rows had missing, invalid, or nonfinite balances and remain visible with unavailable dollar calculations.",
+                "Identity rows with missing, invalid, or nonfinite balances were excluded from the modeled population and recorded as out of scope.",
                 field=balance_field,
                 details=f"missing_count={int(invalid_balances.sum())}",
             )
-        if (balances < 0).any():
+        negative_balances = balances.lt(
+            -zero_balance_tolerance(scenario)
+        )
+        if negative_balances.any():
             record_exception(
                 exceptions,
                 "WARNING",
                 "identity",
                 "IDENTITY_BALANCE_NEGATIVE",
-                "Identity rows contained negative balances; values were retained for review.",
+                "Identity rows with materially negative balances were excluded from the modeled population and recorded as out of scope.",
                 field=balance_field,
-                details=f"negative_count={int((balances < 0).sum())}",
+                details=f"negative_count={int(negative_balances.sum())}",
             )
     if reserve_field not in identity.columns:
         record_exception(
@@ -531,7 +613,9 @@ def record_identity_data_issues(
         )
         return
     reserve_values = pd.to_numeric(identity[reserve_field], errors="coerce")
-    missing_reserve = ~np.isfinite(reserve_values)
+    missing_reserve = (
+        ~np.isfinite(reserve_values)
+    ) & ~invalid_balance_mask(identity, scenario)
     if missing_reserve.any():
         record_exception(
             exceptions,
