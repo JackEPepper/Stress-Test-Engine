@@ -856,10 +856,15 @@ Each successfully reweighted CECL tag/bucket produces one `WARNING` with code
 for that cell. This makes intentional skip-and-reweight decisions visible in
 `exception_log.csv` without marking the resulting basis unavailable.
 
-Within each tag and period, supplied ratios must not decrease from `Pass` to
-`Special Mention` to `Substandard`. The final applied ratios are checked again
-after blending; a decreasing commercial ladder is marked unavailable so an
-increasing-stress migration cannot silently reduce reported CECL.
+Historical and final applied ratios are checked for decreases from `Pass` to
+`Special Mention` to `Substandard`. A decrease no longer makes the CECL basis
+unavailable: the supplied or calculated ratios are retained unchanged and the
+run emits `CECL_HISTORY_RATIO_LADDER_INVALID` or
+`CECL_RESERVE_RATIO_LADDER_INVALID` as a `WARNING` for case-by-case review. The
+exception details show the tag, period when applicable, observed ratios, and
+each decreasing bucket transition. Because no automatic adjustment is made, a
+worsening commercial migration can reduce reported CECL when one of these
+warnings is present.
 
 Historical ratios must represent the same CECL-level tag, risk-bucket
 definition, and model-included commercial population used by the current run.
@@ -920,8 +925,10 @@ unavailable.
 
 `Unknown` is intentionally outside the supplied historical risk ladder. A
 commercial row with an unknown base risk bucket keeps its current in-place
-reserve and does not use central tendency or history; this preserves visibility
-and current CECL while the missing rating remains separately reported.
+reserve and does not use central tendency or history. `Unknown` is omitted from
+the public `cecl_summary.csv` bucket rows, but its balance and reserve remain in
+portfolio and Aggregate totals; the missing rating and internal basis remain
+visible in the migration, exception, and CECL-basis audit reports.
 
 The current `cecl.reserve_field` must use the same identity and borrower wiring
 when `current_method` is `central_tendency`, because the estimator is
@@ -987,13 +994,15 @@ missing configured reserve field remains a CECL data error and makes Consumer
 CECL unavailable.
 
 The Aggregate row also remains monotonic when the commercial CECL portfolio
-totals are non-decreasing. Commercial portfolios continue to use their separate
-bucket-reserve-ratio method; Consumer carry-forward does not override that
-method. A CECL portfolio must not mix Consumer and commercial rows because one
-portfolio cannot use both expected-loss and bucket-reserve-ratio methods; the
-run stops with a configuration error if such a mix is detected. Consumer CECL
-portfolios must use `expected_loss`, and non-Consumer portfolios cannot use
-that method.
+totals are non-decreasing. A warn-only decreasing commercial ratio ladder can
+make a commercial portfolio and Aggregate total non-monotonic and must be
+reviewed case by case in the exception log. Commercial portfolios continue to
+use their separate bucket-reserve-ratio method; Consumer carry-forward does not
+override that method. A CECL portfolio must not mix Consumer and commercial
+rows because one portfolio cannot use both expected-loss and
+bucket-reserve-ratio methods; the run stops with a configuration error if such
+a mix is detected. Consumer CECL portfolios must use `expected_loss`, and
+non-Consumer portfolios cannot use that method.
 
 `cecl_summary.csv` identifies the selected basis in `reserve_basis`, uses one
 common schema across portfolios, and does not add Consumer-only in-scope or

@@ -1026,7 +1026,7 @@ def build_cecl_reserve_basis(
             if tag_group["base_bucket"].eq(bucket).any()
         ]
         buckets = list(CANONICAL_BUCKETS) if history_enabled else observed_buckets
-        if "Unknown" in observed_buckets:
+        if "Unknown" in observed_buckets and "Unknown" not in buckets:
             buckets.append("Unknown")
         for bucket_text in buckets:
             group = tag_group.loc[
@@ -1041,11 +1041,9 @@ def build_cecl_reserve_basis(
                 basis_invalid_balance_count=0,
             )
 
-    _invalidate_decreasing_effective_ladders(
+    _warn_decreasing_effective_ladders(
         ratio_rows,
-        audit_rows,
         commercial_frame,
-        effective,
         exceptions,
     )
 
@@ -1064,14 +1062,12 @@ def build_cecl_reserve_basis(
     )
 
 
-def _invalidate_decreasing_effective_ladders(
+def _warn_decreasing_effective_ladders(
     ratio_rows: List[Dict[str, Any]],
-    audit_rows: List[Dict[str, Any]],
     commercial_frame: pd.DataFrame,
-    effective: pd.Series,
     exceptions: List[Dict[str, Any]],
 ) -> None:
-    """Fail closed when an applied commercial CECL risk ladder decreases."""
+    """Warn without changing results when an applied CECL ladder decreases."""
     commercial_tags = {
         _level_tag_key(value)
         for value in commercial_frame.get(
@@ -1092,47 +1088,46 @@ def _invalidate_decreasing_effective_ladders(
         ):
             by_tag.setdefault(tag, {})[bucket] = float(ratio)
 
-    invalid_tags: set[str] = set()
+    decreasing_ladders: Dict[
+        str, tuple[List[tuple[str, float]], List[tuple[str, str]]]
+    ] = {}
     for tag, ratios in by_tag.items():
         ordered = [
-            ratios[bucket]
+            (bucket, ratios[bucket])
             for bucket in CANONICAL_BUCKETS
             if bucket in ratios
         ]
-        if any(
-            later + WEIGHT_TOLERANCE < earlier
-            for earlier, later in zip(ordered, ordered[1:])
-        ):
-            invalid_tags.add(tag)
-    if not invalid_tags:
+        decreases = [
+            (earlier_bucket, later_bucket)
+            for (earlier_bucket, earlier), (later_bucket, later) in zip(
+                ordered, ordered[1:]
+            )
+            if later + WEIGHT_TOLERANCE < earlier
+        ]
+        if decreases:
+            decreasing_ladders[tag] = (ordered, decreases)
+    if not decreasing_ladders:
         return
 
     code = "CECL_RESERVE_RATIO_LADDER_INVALID"
-    for row in ratio_rows:
-        if _level_tag_key(row.get(CECL_LEVEL_TAG_FIELD)) not in invalid_tags:
-            continue
-        row["base_reserve"] = np.nan
-        row["reserve_ratio"] = np.nan
-        row["status"] = "unavailable"
-        row["exception_code"] = code
-    for row in audit_rows:
-        if _level_tag_key(row.get(CECL_LEVEL_TAG_FIELD)) not in invalid_tags:
-            continue
-        row["effective_reserve_ratio"] = np.nan
-        row["basis_status"] = "unavailable"
-        row["basis_exception_code"] = code
-    tag_keys = commercial_frame[CECL_LEVEL_TAG_FIELD].map(_level_tag_key)
-    effective.loc[
-        commercial_frame.index[tag_keys.isin(invalid_tags)]
-    ] = np.nan
-    for tag in sorted(invalid_tags):
+    for tag in sorted(decreasing_ladders):
+        ordered, decreases = decreasing_ladders[tag]
+        ratio_details = ", ".join(
+            f"{bucket}={ratio:.12g}" for bucket, ratio in ordered
+        )
+        decrease_details = ", ".join(
+            f"{earlier}>{later}" for earlier, later in decreases
+        )
         record_exception(
             exceptions,
-            "ERROR",
+            "WARNING",
             "cecl",
             code,
-            "Applied commercial CECL ratios must not decrease from Pass to Special Mention to Substandard.",
-            details=f"cecl_level_tag={tag}",
+            "The applied commercial CECL ratio ladder decreases as credit quality worsens; calculated ratios were retained for case-by-case review.",
+            details=(
+                f"cecl_level_tag={tag}; ratios={ratio_details}; "
+                f"decreases={decrease_details}"
+            ),
         )
 
 
@@ -1485,8 +1480,8 @@ def _prepare_history(
             "ratio": float(ratio),
         }
 
-    # A historical risk ladder that falls as credit quality worsens would
-    # undermine scenario monotonicity. Invalidate only the affected tag-period.
+    # Preserve decreasing historical ladders for case-by-case review, but make
+    # the exact source values and transitions visible in the exception audit.
     grouped_keys: Dict[tuple[str, str], Dict[str, float]] = {}
     for (tag, bucket, period), item in lookup.items():
         if item.get("status") == "available":
@@ -1499,27 +1494,32 @@ def _prepare_history(
             for bucket in CANONICAL_BUCKETS
             if bucket in ratios
         ]
-        if any(
-            later_ratio < earlier_ratio
-            for (_, earlier_ratio), (_, later_ratio) in zip(
-                ordered, ordered[1:]
+        decreases = [
+            (earlier_bucket, later_bucket)
+            for (earlier_bucket, earlier_ratio), (
+                later_bucket,
+                later_ratio,
+            ) in zip(ordered, ordered[1:])
+            if later_ratio + WEIGHT_TOLERANCE < earlier_ratio
+        ]
+        if decreases:
+            ratio_details = ", ".join(
+                f"{bucket}={ratio:.12g}" for bucket, ratio in ordered
             )
-        ):
-            for bucket in CANONICAL_BUCKETS:
-                key = (tag, bucket, period)
-                if key in lookup:
-                    lookup[key] = {
-                        "status": "unavailable",
-                        "exception_code": "CECL_HISTORY_RATIO_LADDER_INVALID",
-                    }
+            decrease_details = ", ".join(
+                f"{earlier}>{later}" for earlier, later in decreases
+            )
             record_exception(
                 exceptions,
-                "ERROR",
+                "WARNING",
                 "cecl",
                 "CECL_HISTORY_RATIO_LADDER_INVALID",
-                "Historical CECL ratios must not decrease from Pass to Special Mention to Substandard.",
+                "A historical CECL ratio ladder decreases as credit quality worsens; supplied ratios were retained for case-by-case review.",
                 source=source,
-                details=f"cecl_level_tag={tag}; period={period}",
+                details=(
+                    f"cecl_level_tag={tag}; period={period}; "
+                    f"ratios={ratio_details}; decreases={decrease_details}"
+                ),
             )
     return lookup, ""
 

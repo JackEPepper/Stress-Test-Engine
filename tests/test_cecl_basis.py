@@ -712,9 +712,21 @@ class CeclReserveBasisTest(unittest.TestCase):
         self.assertEqual(float(audit.at["2026Q1", "effective_weight"]), 0.0)
         self.assertEqual(float(audit.at["2025Q4", "effective_weight"]), 0.0)
 
-    def test_history_risk_ladder_must_not_decrease(self):
+    def test_decreasing_history_ladder_warns_and_remains_available(self):
         scenario = _with_history_source(_scenario(_weighted_basis()))
-        results = _commercial_frame([100.0], [10.0])
+        results = pd.concat(
+            [
+                _commercial_frame([100.0], [1.0], bucket="Pass"),
+                _commercial_frame(
+                    [100.0], [2.0], bucket="Special Mention"
+                ),
+                _commercial_frame(
+                    [100.0], [3.0], bucket="Substandard"
+                ),
+            ],
+            ignore_index=True,
+        )
+        results["borrower_id"] = ["P1", "SM1", "SS1"]
         exceptions: list[dict] = []
 
         basis = _build_basis(
@@ -725,15 +737,46 @@ class CeclReserveBasisTest(unittest.TestCase):
             exceptions,
         )
 
-        self.assertTrue(basis.ratios["status"].eq("unavailable").all())
-        self.assertIn(
-            "CECL_HISTORY_RATIO_LADDER_INVALID",
-            {row["code"] for row in exceptions},
+        ratios = basis.ratios.set_index("bucket")
+        self.assertTrue(ratios["status"].eq("available").all())
+        self.assertTrue(ratios["exception_code"].eq("").all())
+        self.assertTrue(basis.audit["basis_status"].eq("available").all())
+        self.assertTrue(basis.audit["basis_exception_code"].eq("").all())
+        self.assertAlmostEqual(
+            float(ratios.at["Pass", "reserve_ratio"]), 0.08 / 3
         )
+        self.assertAlmostEqual(
+            float(ratios.at["Special Mention", "reserve_ratio"]), 0.03
+        )
+        self.assertAlmostEqual(
+            float(ratios.at["Substandard", "reserve_ratio"]), 0.13 / 3
+        )
+        event = next(
+            row
+            for row in exceptions
+            if row["code"] == "CECL_HISTORY_RATIO_LADDER_INVALID"
+        )
+        self.assertEqual(event["severity"], "WARNING")
+        self.assertIn("period=2026Q1", event["details"])
+        self.assertIn("Pass=0.03", event["details"])
+        self.assertIn("Special Mention=0.02", event["details"])
+        self.assertIn("decreases=Pass>Special Mention", event["details"])
 
-    def test_skipped_ladder_cell_does_not_hide_a_decrease(self):
+    def test_skipped_ladder_cell_still_warns_without_blocking(self):
         scenario = _with_history_source(_scenario(_weighted_basis()))
-        results = _commercial_frame([100.0], [10.0])
+        results = pd.concat(
+            [
+                _commercial_frame([100.0], [1.0], bucket="Pass"),
+                _commercial_frame(
+                    [100.0], [2.0], bucket="Special Mention"
+                ),
+                _commercial_frame(
+                    [100.0], [3.0], bucket="Substandard"
+                ),
+            ],
+            ignore_index=True,
+        )
+        results["borrower_id"] = ["P1", "SM1", "SS1"]
         exceptions: list[dict] = []
 
         basis = _build_basis(
@@ -744,13 +787,24 @@ class CeclReserveBasisTest(unittest.TestCase):
             exceptions,
         )
 
-        self.assertTrue(basis.ratios["status"].eq("unavailable").all())
+        ratios = basis.ratios.set_index("bucket")
+        self.assertTrue(ratios["status"].eq("available").all())
+        self.assertAlmostEqual(
+            float(ratios.at["Special Mention", "reserve_ratio"]), 0.035
+        )
+        event = next(
+            row
+            for row in exceptions
+            if row["code"] == "CECL_HISTORY_RATIO_LADDER_INVALID"
+        )
+        self.assertEqual(event["severity"], "WARNING")
+        self.assertIn("decreases=Pass>Substandard", event["details"])
         self.assertIn(
-            "CECL_HISTORY_RATIO_LADDER_INVALID",
+            "CECL_HISTORY_RATIO_SKIPPED_REWEIGHTED",
             {row["code"] for row in exceptions},
         )
 
-    def test_final_applied_risk_ladder_must_not_decrease(self):
+    def test_decreasing_final_ladder_warns_and_remains_available(self):
         results = pd.concat(
             [
                 _commercial_frame(
@@ -763,15 +817,41 @@ class CeclReserveBasisTest(unittest.TestCase):
             ignore_index=True,
         )
         results["borrower_id"] = ["B1", "B2"]
+        results["stressed_bucket_S1"] = "Substandard"
+        results["stressed_bucket_S2"] = "Substandard"
         exceptions: list[dict] = []
 
         basis = build_cecl_reserve_basis(results, _scenario(), exceptions)
+        buckets = build_cecl_bucket_summary(
+            results, pd.DataFrame(), _scenario()
+        )
+        cecl = build_cecl_summary(
+            results, buckets, _scenario(), exceptions, basis
+        )
 
-        self.assertTrue(basis.ratios["status"].eq("unavailable").all())
-        self.assertTrue(basis.effective_reserve.isna().all())
-        self.assertIn(
-            "CECL_RESERVE_RATIO_LADDER_INVALID",
-            {row["code"] for row in exceptions},
+        self.assertTrue(basis.ratios["status"].eq("available").all())
+        self.assertTrue(basis.ratios["exception_code"].eq("").all())
+        self.assertTrue(basis.audit["basis_status"].eq("available").all())
+        self.assertTrue(basis.audit["basis_exception_code"].eq("").all())
+        self.assertEqual(list(basis.effective_reserve), [10.0, 1.0])
+        event = next(
+            row
+            for row in exceptions
+            if row["code"] == "CECL_RESERVE_RATIO_LADDER_INVALID"
+        )
+        self.assertEqual(event["severity"], "WARNING")
+        self.assertIn("Pass=0.1", event["details"])
+        self.assertIn("Substandard=0.01", event["details"])
+        self.assertIn("decreases=Pass>Substandard", event["details"])
+        totals = cecl[
+            cecl["portfolio"].eq("CRE") & cecl["bucket"].eq("Total")
+        ].set_index("stress_level")
+        self.assertTrue(totals["cecl_reserve_status"].eq("available").all())
+        self.assertTrue(totals["exception_code"].eq("").all())
+        self.assertTrue(totals["balance"].eq(200.0).all())
+        self.assertEqual(
+            list(totals.loc[["Base", "S1", "S2"], "proforma_cecl_reserve"]),
+            [11.0, 2.0, 2.0],
         )
 
     def test_invalid_reserve_basis_configuration_is_rejected(self):
@@ -1514,6 +1594,55 @@ class CeclReserveBasisTest(unittest.TestCase):
 
 
 class CeclReserveBasisReportingTest(unittest.TestCase):
+    def test_unknown_basis_is_unique_hidden_and_included_in_totals(self):
+        scenario = _scenario()
+        results = pd.concat(
+            [
+                _commercial_frame([100.0], [1.0], bucket="Pass"),
+                _commercial_frame([50.0], [2.0], bucket="Unknown"),
+            ],
+            ignore_index=True,
+        )
+        results["borrower_id"] = ["P1", "U1"]
+        exceptions: list[dict] = []
+        basis = build_cecl_reserve_basis(results, scenario, exceptions)
+        buckets = build_cecl_bucket_summary(
+            results, pd.DataFrame(), scenario
+        )
+
+        cecl = build_cecl_summary(
+            results, buckets, scenario, exceptions, basis
+        )
+
+        unknown_basis = basis.ratios[basis.ratios["bucket"].eq("Unknown")]
+        self.assertEqual(len(unknown_basis), 1)
+        self.assertFalse(cecl["bucket"].eq("Unknown").any())
+        for level in ("Base", "S1", "S2"):
+            with self.subTest(level=level):
+                portfolio_total = cecl[
+                    cecl["portfolio"].eq("CRE")
+                    & cecl["stress_level"].eq(level)
+                    & cecl["bucket"].eq("Total")
+                ].iloc[0]
+                aggregate_total = cecl[
+                    cecl["portfolio"].eq("Aggregate")
+                    & cecl["stress_level"].eq(level)
+                    & cecl["bucket"].eq("Total")
+                ].iloc[0]
+                for row in (portfolio_total, aggregate_total):
+                    self.assertEqual(float(row["balance"]), 150.0)
+                    self.assertEqual(
+                        float(row["proforma_cecl_reserve"]), 3.0
+                    )
+                    self.assertEqual(
+                        row["cecl_reserve_status"], "available"
+                    )
+                    self.assertEqual(row["exception_code"], "")
+        self.assertNotIn(
+            "CECL_RESERVE_RATIO_DUPLICATE",
+            {row["code"] for row in exceptions},
+        )
+
     def test_public_portfolio_rollup_applies_each_tag_ratio_first(self):
         scenario = _scenario()
         results = pd.concat(

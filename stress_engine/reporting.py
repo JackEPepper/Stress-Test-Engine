@@ -609,7 +609,11 @@ def build_cecl_summary(
                     "exception_code": bucket_exception_code,
                 }
                 public_bucket_rows.append(public_row)
-                rows.append(public_row)
+                # Unknown remains an internal CECL component so portfolio and
+                # Aggregate totals reconcile, but it is intentionally omitted
+                # from the public bucket-level CECL report.
+                if bucket != "Unknown":
+                    rows.append(public_row)
 
             total_balance = float(
                 pd.to_numeric(
