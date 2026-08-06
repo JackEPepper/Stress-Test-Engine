@@ -14,7 +14,7 @@ from stress_engine.comparison import _cecl_impact_rows
 from stress_engine.config import load_scenario
 from stress_engine.engine import OUTPUT_MANIFEST_KIND, StressEngine
 from stress_engine.io import write_csv
-from stress_engine.modules.ci import run_ci
+from stress_engine.modules.ci import _brg_key, run_ci
 from stress_engine.modules.consumer import run_consumer
 from stress_engine.reporting import (
     build_cecl_summary,
@@ -22,7 +22,12 @@ from stress_engine.reporting import (
     build_reports,
 )
 from stress_engine.tagging import evaluate_conditions
-from stress_engine.utils import compare_values, parse_date_series, to_number
+from stress_engine.utils import (
+    compare_values,
+    parse_date_series,
+    risk_bucket_from_rating,
+    to_number,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -772,11 +777,22 @@ class HardeningRegressionTest(unittest.TestCase):
         self.assertTrue(out_of_scope.empty)
         self.assertIn("CI_SECTOR_DEFAULT_USED", {row["code"] for row in exceptions})
 
-    def test_ci_brg_reductions_cover_one_through_eight_and_cap_higher_grades(self):
+    def test_ci_brg_six_point_five_is_distinct_and_remains_pass(self):
+        for rating in (6.5, np.float64(6.5), "6.5", " 6.50 "):
+            with self.subTest(rating=rating):
+                self.assertEqual(_brg_key(rating), "6.5")
+                self.assertEqual(risk_bucket_from_rating(rating), "Pass")
+
+        for rating in (6.25, 6.5001, 6.75, 7.5):
+            with self.subTest(rating=rating):
+                self.assertIsNone(_brg_key(rating))
+
+    def test_ci_brg_reductions_cover_supported_grades_and_cap_higher_grades(self):
         reductions = {
             str(brg): {"S1": brg / 100.0}
             for brg in range(1, 9)
         }
+        reductions["6.5"] = {"S1": 0.065}
         scenario = {
             "stress_levels": ["S1"],
             "cutoffs": {
@@ -801,14 +817,8 @@ class HardeningRegressionTest(unittest.TestCase):
             },
         }
         rows = []
-        for brg in [*range(1, 9), 12]:
-            base_bucket = (
-                "Pass"
-                if brg < 7
-                else "Special Mention"
-                if brg == 7
-                else "Substandard"
-            )
+        for brg in [*range(1, 7), 6.5, 7, 8, 12]:
+            base_bucket = risk_bucket_from_rating(brg)
             rows.append(
                 {
                     "borrower_id": f"CI-{brg}",
@@ -831,15 +841,25 @@ class HardeningRegressionTest(unittest.TestCase):
                 }
             )
 
-        stressed, out_of_scope = run_ci(pd.DataFrame(rows), scenario, [])
+        exceptions = []
+        stressed, out_of_scope = run_ci(
+            pd.DataFrame(rows), scenario, exceptions
+        )
         stressed = stressed.set_index("borrower_id")
 
         self.assertTrue(out_of_scope.empty)
-        for brg in range(1, 9):
+        self.assertFalse(
+            any(row["severity"] == "ERROR" for row in exceptions)
+        )
+        for brg in [*range(1, 7), 6.5, 7, 8]:
             self.assertAlmostEqual(
                 float(stressed.at[f"CI-{brg}", "ci_available_cash_flow_S1"]),
                 100.0 - brg,
             )
+        self.assertEqual(stressed.at["CI-6.5", "base_bucket"], "Pass")
+        self.assertEqual(
+            stressed.at["CI-6.5", "stressed_bucket_S1"], "Pass"
+        )
         self.assertEqual(
             float(stressed.at["CI-12", "ci_available_cash_flow_S1"]),
             float(stressed.at["CI-8", "ci_available_cash_flow_S1"]),
@@ -922,6 +942,14 @@ class HardeningRegressionTest(unittest.TestCase):
                 "base_bucket": "Pass",
             }
         )
+        rows.append(
+            {
+                **base_row,
+                "borrower_id": "CI-BRG-6.5-NOT-CONFIGURED",
+                "brg": 6.5,
+                "base_bucket": "Pass",
+            }
+        )
         exceptions = []
 
         stressed, out_of_scope = run_ci(pd.DataFrame(rows), scenario, exceptions)
@@ -941,8 +969,12 @@ class HardeningRegressionTest(unittest.TestCase):
             invalid_ids,
         )
 
+        missing_assumption_ids = {
+            "CI-BRG-2-NOT-CONFIGURED",
+            "CI-BRG-6.5-NOT-CONFIGURED",
+        }
         missing_assumption = out_of_scope[
-            out_of_scope["borrower_id"] == "CI-BRG-2-NOT-CONFIGURED"
+            out_of_scope["borrower_id"].isin(missing_assumption_ids)
         ]
         self.assertEqual(set(missing_assumption["field"]), {"ebitda_reduction"})
         self.assertEqual(
@@ -956,7 +988,7 @@ class HardeningRegressionTest(unittest.TestCase):
         ]
         self.assertEqual(
             {row["borrower_id"] for row in assumption_errors},
-            {"CI-BRG-2-NOT-CONFIGURED"},
+            missing_assumption_ids,
         )
 
     def test_abl_calculated_cash_interest_and_fallbacks(self):

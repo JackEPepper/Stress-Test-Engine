@@ -13,6 +13,7 @@ from stress_engine.batch import _base_cecl_lookup
 from stress_engine.comparison import _cecl_impact_rows
 from stress_engine.engine import StressEngine
 from stress_engine.targeted import (
+    _baseline_parameter,
     _copy_rows,
     _evaluate_selector,
     _resolve_variant,
@@ -329,9 +330,39 @@ class TargetedStressTest(unittest.TestCase):
             & (audit["parameter"] == "ebitda_reduction")
         ]
         self.assertEqual(rows["shock"].tolist(), ["oil_shock", "tariff_shock"])
+        self.assertTrue(rows["baseline_value"].eq(0.10).all())
         self.assertAlmostEqual(float(rows.iloc[0]["effective_value"]), 0.18)
         self.assertAlmostEqual(float(rows.iloc[1]["value_before_operation"]), 0.18)
         self.assertAlmostEqual(float(rows.iloc[1]["effective_value"]), 0.25)
+
+    def test_ci_rr_six_point_five_targeted_baseline_uses_distinct_assumption(self):
+        scenario = {
+            "borrower": {"risk_rating_field": "risk_rating"},
+            "modules": {
+                "C&I": {
+                    "sector_field": "ci_sector",
+                    "ebitda_reduction": {
+                        "default": {
+                            "6": {"S1": 0.10},
+                            "6.5": {"S1": 0.165},
+                            "7": {"S1": 0.20},
+                        }
+                    },
+                }
+            },
+        }
+        row = {"ci_sector": "Test Sector", "risk_rating": "6.5"}
+
+        self.assertAlmostEqual(
+            _baseline_parameter(
+                row,
+                scenario,
+                "C&I",
+                "ebitda_reduction",
+                "S1",
+            ),
+            0.165,
+        )
 
     def test_consumer_targeted_parameters_are_applied_per_loan(self):
         scenario, base_dir = load_scenario(ROOT / "examples" / "scenario.json")

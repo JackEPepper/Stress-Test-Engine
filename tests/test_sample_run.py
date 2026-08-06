@@ -208,7 +208,13 @@ class SampleScenarioRunTest(unittest.TestCase):
             )
             self.assertEqual(
                 set(scenario["modules"]["C&I"]["ebitda_reduction"]["default"]),
-                {str(brg) for brg in range(1, 9)},
+                {str(brg) for brg in range(1, 9)} | {"6.5"},
+            )
+            self.assertEqual(
+                scenario["modules"]["C&I"]["ebitda_reduction"]["default"][
+                    "6.5"
+                ],
+                {"S1": 0.1, "S2": 0.2},
             )
 
             borrowers = result["borrowers"]
@@ -240,6 +246,11 @@ class SampleScenarioRunTest(unittest.TestCase):
             b002 = borrowers.loc[borrowers["borrower_id"] == "B002"].iloc[0]
             self.assertEqual(float(b002["current_appraised_value"]), 1500000.0)
             self.assertTrue(pd.isna(b002["consumer_appraised_value"]))
+
+            ci_six_point_five = borrowers.loc[
+                borrowers["borrower_id"] == "B005"
+            ].iloc[0]
+            self.assertEqual(float(ci_six_point_five["risk_rating"]), 6.5)
 
             consumer_borrower = borrowers.loc[borrowers["borrower_id"] == "B007"].iloc[0]
             self.assertEqual(float(consumer_borrower["fico_score"]), 680.0)
@@ -319,6 +330,32 @@ class SampleScenarioRunTest(unittest.TestCase):
                 pd.isna(abl_result["calculated_cash_paid_for_interest_fallback_reason"])
             )
             self.assertEqual(float(abl_result["ci_debt_service_S1"]), 63500.0)
+
+            ci_six_point_five_result = result["results"].loc[
+                result["results"]["borrower_id"] == "B005"
+            ].iloc[0]
+            self.assertEqual(ci_six_point_five_result["base_bucket"], "Pass")
+            self.assertEqual(ci_six_point_five_result["module_applied"], "C&I")
+            self.assertEqual(
+                float(
+                    ci_six_point_five_result[
+                        "ci_available_cash_flow_S1"
+                    ]
+                ),
+                85000.0,
+            )
+            self.assertEqual(
+                float(ci_six_point_five_result["ci_debt_service_S1"]),
+                62000.0,
+            )
+            self.assertAlmostEqual(
+                float(ci_six_point_five_result["ci_fccr_S1"]),
+                85 / 62,
+            )
+            self.assertAlmostEqual(
+                float(ci_six_point_five_result["ci_fccr_S2"]),
+                73 / 69,
+            )
 
             for borrower_id in ("B014", "B015"):
                 grade_eight = result["results"].loc[
@@ -414,6 +451,13 @@ class SampleScenarioRunTest(unittest.TestCase):
             exceptions = result["reports"]["exception_log"]
             self.assertNotIn("CECL_RESERVE_RATIO_UNAVAILABLE", set(exceptions["code"]))
             self.assertNotIn("CI_CALCULATED_CASH_INTEREST_FALLBACK", set(exceptions["code"]))
+            ci_six_point_five_errors = exceptions[
+                exceptions["borrower_id"].eq("B005")
+                & exceptions["code"].isin(
+                    ["CI_BRG_INVALID", "CI_SCENARIO_ASSUMPTION_INVALID"]
+                )
+            ]
+            self.assertTrue(ci_six_point_five_errors.empty)
             self.assertIn("CECL_LOAN_RESERVE_MISSING_TREATED_AS_ZERO", set(exceptions["code"]))
             self.assertEqual(result["metadata"]["exception_count"], len(exceptions))
 

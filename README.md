@@ -645,7 +645,7 @@ The base bucket is derived from `risk_rating`:
 
 | Rating | Base bucket |
 |---|---|
-| Less than 7 | Pass |
+| Less than 7, including RR 6.5 | Pass |
 | Exactly 7 | Special Mention |
 | Greater than 7 | Substandard |
 | Missing or invalid | Unknown |
@@ -690,11 +690,18 @@ C&I calculates stressed FCCR rather than importing it:
 7. FCCR cutoffs determine migration.
 
 The BRG comes from the configured `borrower.risk_rating_field`. Integral grades
-1 through 7 select the matching string key in `ebitda_reduction`; every finite
-numeric grade of 8 or higher selects key `"8"`. Missing, nonnumeric, below-1,
-and fractional grades below 8 do not select an assumption. Every effective
-sector table must be keyed by BRG and supply the applicable grade; bucket-keyed
-EBITDA reduction tables are not supported.
+1 through 7 select the matching string key in `ebitda_reduction`, while exact
+grade 6.5 selects the separate `"6.5"` key. Every finite numeric grade of 8 or
+higher selects key `"8"`. Missing, nonnumeric, below-1, and all other fractional
+grades below 8 do not select an assumption. RR 6.5 remains in the Pass base
+bucket, but its C&I stress assumption is independently configurable and never
+falls back to the assumptions for RR 6 or RR 7. Every effective sector table
+must be keyed by BRG and supply the applicable grade; bucket-keyed EBITDA
+reduction tables are not supported.
+
+The bundled example initializes the separate `"6.5"` key with the same S1 and
+S2 rates as `"6"`; those values can be changed independently when approved
+C&I assumptions are available.
 
 Missing C&I components are treated as zero and logged. A row becomes out of
 scope when available cash flow is zero or missing, or debt service is
@@ -1133,6 +1140,15 @@ filesystem failures that prevent a run return a nonzero status with a concise
 | ERROR | A calculation or control was unavailable or materially invalid |
 | WARNING | The run continued, but data or reconciliation requires review |
 | INFO | A documented default or fallback was used |
+
+Borrower-attributable ERROR rows are omitted when that borrower's normalized
+aggregate modeled balance is zero. The check uses
+`cecl.zero_balance_tolerance` and borrower totals in both standard and targeted
+runs, so a zero-dollar loan with a positive sibling does not qualify. WARNING
+and INFO rows, borrowerless structural controls, calculations, and
+`out_of_scope_detail.csv` remain unchanged. Metadata records the number omitted
+as `suppressed_zero_balance_error_count`; the visible severity totals and batch
+rollups use the cleaned exception log.
 
 Start with ERROR, then WARNING. INFO rows are useful for explaining how defaults
 were applied.

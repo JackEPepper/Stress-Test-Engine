@@ -127,7 +127,7 @@ def run_ci(
                     field=risk_rating_field,
                     details=(
                         f"sector={sector};risk_rating={row.get(risk_rating_field)};"
-                        "expected=integral_1_to_7_or_numeric_8_plus"
+                        "expected=integral_1_to_7_or_6.5_or_numeric_8_plus"
                     ),
                 )
                 continue
@@ -414,10 +414,12 @@ def _ebitda_reduction_table(
 
 
 def _brg_key(rating: Any) -> str | None:
-    """Normalize BRGs 1-7 exactly and cap every finite BRG >=8 at 8."""
+    """Normalize C&I BRGs, preserving 6.5 and capping finite grades 8+."""
     numeric = to_number(rating, np.nan)
     if not np.isfinite(numeric) or numeric < 1:
         return None
+    if numeric == 6.5:
+        return "6.5"
     if numeric >= 8:
         return "8"
     if not float(numeric).is_integer():

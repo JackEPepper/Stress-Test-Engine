@@ -21,7 +21,11 @@ from .borrower import (
     record_identity_data_issues,
     split_identity_balance_scope,
 )
-from .cecl import attach_cecl_reserve_basis, cecl_history_frame
+from .cecl import (
+    attach_cecl_reserve_basis,
+    cecl_history_frame,
+    normalized_balance_values,
+)
 from .comparison import build_comparison_report
 from .config import output_dir_for, validate_scenario
 from .exceptions import exception_frame, record_exception
@@ -167,8 +171,11 @@ class StressEngine:
                 reports["tag_summary"] = targeted["tag_summary"]
                 reports["source_reconciliation"] = source_reconciliation
                 reports["out_of_scope_detail"] = targeted["out_of_scope"]
-                reports["exception_log"] = exception_frame(
-                    exceptions, ["scenario_variant", "loan_id"]
+                reports["exception_log"] = _exception_report(
+                    exceptions,
+                    audit_borrowers,
+                    self.scenario,
+                    ["scenario_variant", "loan_id"],
                 )
                 reporter.update(
                     f"Assembled {len(reports):,} report tables and control files."
@@ -186,8 +193,11 @@ class StressEngine:
                     comparison_errors = _record_comparison_errors(
                         reports["scenario_diff"], exceptions
                     )
-                    reports["exception_log"] = exception_frame(
-                        exceptions, ["scenario_variant", "loan_id"]
+                    reports["exception_log"] = _exception_report(
+                        exceptions,
+                        audit_borrowers,
+                        self.scenario,
+                        ["scenario_variant", "loan_id"],
                     )
                     reporter.update(
                         _comparison_progress_message(
@@ -196,6 +206,11 @@ class StressEngine:
                     )
             with reporter.step("metadata"):
                 metadata = self._metadata(raw_loaded, reports)
+                metadata["suppressed_zero_balance_error_count"] = (
+                    _suppressed_zero_balance_error_count(
+                        exceptions, audit_borrowers, self.scenario
+                    )
+                )
                 metadata["targeted_stress"] = {
                     "enabled": True,
                     "primary_variant": targeted["primary_variant"],
@@ -290,7 +305,9 @@ class StressEngine:
             reports["tag_summary"] = tag_summary
             reports["source_reconciliation"] = source_reconciliation
             reports["out_of_scope_detail"] = out_of_scope
-            reports["exception_log"] = exception_frame(exceptions)
+            reports["exception_log"] = _exception_report(
+                exceptions, audit_borrowers, self.scenario
+            )
             reporter.update(
                 f"Built {len(reports):,} report tables and control files."
             )
@@ -310,7 +327,9 @@ class StressEngine:
                 comparison_errors = _record_comparison_errors(
                     reports["scenario_diff"], exceptions
                 )
-                reports["exception_log"] = exception_frame(exceptions)
+                reports["exception_log"] = _exception_report(
+                    exceptions, audit_borrowers, self.scenario
+                )
                 reporter.update(
                     _comparison_progress_message(
                         len(previous), comparison_errors
@@ -321,6 +340,11 @@ class StressEngine:
             # Metadata and hashes are deliberately last: comparison failures may
             # add control rows that must be reflected in deterministic report hashes.
             metadata = self._metadata(raw_loaded, reports)
+            metadata["suppressed_zero_balance_error_count"] = (
+                _suppressed_zero_balance_error_count(
+                    exceptions, audit_borrowers, self.scenario
+                )
+            )
         if write_outputs:
             with reporter.step("outputs"):
                 destination = output_dir_for(
@@ -600,6 +624,107 @@ def _record_comparison_errors(
             details=row.get("notes", ""),
         )
     return int(len(failures))
+
+
+def _exception_report(
+    exceptions: list[Dict[str, Any]],
+    borrowers: pd.DataFrame,
+    scenario: Mapping[str, Any],
+    extra_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Build the public control log after zero-balance error suppression."""
+    return exception_frame(
+        _reportable_exception_rows(exceptions, borrowers, scenario),
+        extra_columns,
+    )
+
+
+def _reportable_exception_rows(
+    exceptions: list[Dict[str, Any]],
+    borrowers: pd.DataFrame,
+    scenario: Mapping[str, Any],
+) -> list[Dict[str, Any]]:
+    """Omit borrower-scoped errors when the canonical borrower total is zero.
+
+    The model and out-of-scope audits remain unchanged. Warnings, informational
+    events, and structural errors without a borrower ID stay visible.
+    """
+    zero_balance_ids = _zero_balance_borrower_ids(borrowers, scenario)
+    if not zero_balance_ids:
+        return list(exceptions)
+    return [
+        row
+        for row in exceptions
+        if not (
+            str(row.get("severity", "")).strip().upper() == "ERROR"
+            and _exception_borrower_key(row.get("borrower_id"))
+            in zero_balance_ids
+        )
+    ]
+
+
+def _zero_balance_borrower_ids(
+    borrowers: pd.DataFrame,
+    scenario: Mapping[str, Any],
+) -> set[str]:
+    """Return borrower IDs whose normalized modeled balances are all zero."""
+    borrower_field = str(
+        scenario.get("borrower", {}).get(
+            "borrower_id_field", "borrower_id"
+        )
+    )
+    balance_field = str(
+        scenario.get("borrower", {}).get(
+            "balance_field", "outstanding_balance"
+        )
+    )
+    if (
+        not isinstance(borrowers, pd.DataFrame)
+        or borrowers.empty
+        or borrower_field not in borrowers.columns
+        or balance_field not in borrowers.columns
+    ):
+        return set()
+    keys = borrowers[borrower_field].map(_exception_borrower_key)
+    classified = pd.DataFrame(
+        {
+            "borrower_id": keys,
+            "is_zero": normalized_balance_values(
+                borrowers, scenario
+            ).eq(0.0),
+        },
+        index=borrowers.index,
+    )
+    classified = classified[classified["borrower_id"].ne("")]
+    if classified.empty:
+        return set()
+    all_zero = classified.groupby(
+        "borrower_id", sort=False, observed=True
+    )["is_zero"].all()
+    return set(all_zero.index[all_zero])
+
+
+def _exception_borrower_key(value: Any) -> str:
+    """Normalize one scalar borrower ID for control-log matching."""
+    if isinstance(value, (list, tuple, set, Mapping)):
+        return str(value).strip()
+    try:
+        if bool(pd.isna(value)):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def _suppressed_zero_balance_error_count(
+    exceptions: list[Dict[str, Any]],
+    borrowers: pd.DataFrame,
+    scenario: Mapping[str, Any],
+) -> int:
+    """Count borrower-scoped errors omitted from the public exception log."""
+    return len(exceptions) - len(
+        _reportable_exception_rows(exceptions, borrowers, scenario)
+    )
 
 
 def _comparison_progress_message(

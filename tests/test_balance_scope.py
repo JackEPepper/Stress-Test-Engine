@@ -19,7 +19,7 @@ from stress_engine.cecl import (
     validate_cecl_config,
 )
 from stress_engine.config import load_scenario
-from stress_engine.engine import StressEngine
+from stress_engine.engine import StressEngine, _reportable_exception_rows
 from stress_engine.reporting import build_cecl_summary, build_consumer_summary
 
 
@@ -55,6 +55,62 @@ def _scenario(
 
 
 class IdentityBalanceScopeTest(unittest.TestCase):
+    def test_zero_balance_filter_only_removes_borrower_scoped_errors(self):
+        scenario = _scenario(tolerance=0.01)
+        borrowers = pd.DataFrame(
+            {
+                "borrower_id": [
+                    "zero",
+                    "boundary",
+                    "over",
+                    "mixed",
+                    "mixed",
+                    "negative",
+                    "missing",
+                ],
+                "balance": [
+                    0.0,
+                    0.01,
+                    0.0101,
+                    0.0,
+                    100.0,
+                    -1.0,
+                    np.nan,
+                ],
+            }
+        )
+        exceptions = [
+            {"severity": "ERROR", "borrower_id": "zero", "code": "zero_error"},
+            {"severity": "WARNING", "borrower_id": "zero", "code": "zero_warning"},
+            {"severity": "INFO", "borrower_id": "zero", "code": "zero_info"},
+            {"severity": "ERROR", "borrower_id": "boundary", "code": "boundary_error"},
+            {"severity": "ERROR", "borrower_id": "over", "code": "over_error"},
+            {"severity": "ERROR", "borrower_id": "mixed", "code": "mixed_error"},
+            {"severity": "ERROR", "borrower_id": "negative", "code": "negative_error"},
+            {"severity": "ERROR", "borrower_id": "missing", "code": "missing_error"},
+            {"severity": "ERROR", "borrower_id": "", "code": "global_error"},
+            {"severity": "ERROR", "borrower_id": "unknown", "code": "unknown_error"},
+        ]
+
+        reportable = _reportable_exception_rows(
+            exceptions, borrowers, scenario
+        )
+
+        self.assertEqual(
+            [row["code"] for row in reportable],
+            [
+                "zero_warning",
+                "zero_info",
+                "over_error",
+                "mixed_error",
+                "negative_error",
+                "missing_error",
+                "global_error",
+                "unknown_error",
+            ],
+        )
+        self.assertEqual(len(exceptions), 10)
+
     def test_nullable_reserves_are_counted_without_three_value_masks(self):
         scenario = _scenario()
         identity = pd.DataFrame(
@@ -336,6 +392,126 @@ class IdentityBalanceScopeTest(unittest.TestCase):
 
 
 class CeclBalanceIsolationTest(unittest.TestCase):
+    def test_standard_log_suppresses_only_zero_balance_borrower_errors(self):
+        scenario, base_dir = load_scenario(
+            ROOT / "examples" / "scenario.json"
+        )
+        identity = pd.read_csv(
+            ROOT / "examples" / "data" / "loans.csv",
+            dtype=str,
+            keep_default_na=False,
+        )
+        identity.loc[identity["loan_id"].eq("L006"), "outstanding_balance"] = "0"
+        identity.loc[
+            identity["loan_id"].isin(["L006", "L011"]), "risk_rating"
+        ] = ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_path = Path(tmp) / "loans.csv"
+            identity.to_csv(identity_path, index=False)
+            scenario["inputs"]["identity"]["path"] = str(identity_path)
+            run = StressEngine(scenario, base_dir).run(
+                write_outputs=False, run_comparison=False
+            )
+
+        exception_log = run["reports"]["exception_log"]
+        errors = exception_log[exception_log["severity"].eq("ERROR")]
+        self.assertFalse(errors["borrower_id"].eq("B005").any())
+        positive_errors = errors[
+            errors["borrower_id"].eq("B010")
+            & errors["code"].eq("CI_BRG_INVALID")
+        ]
+        self.assertEqual(len(positive_errors), 2)
+        missing_rating_warnings = exception_log[
+            exception_log["severity"].eq("WARNING")
+            & exception_log["code"].eq("RISK_RATING_MISSING")
+        ]
+        self.assertTrue(
+            {"B005", "B010"}.issubset(
+                set(missing_rating_warnings["borrower_id"])
+            )
+        )
+        out_of_scope = run["reports"]["out_of_scope_detail"]
+        self.assertTrue(
+            {"B005", "B010"}.issubset(
+                set(
+                    out_of_scope.loc[
+                        out_of_scope["reason"].eq("missing_or_invalid_brg"),
+                        "borrower_id",
+                    ]
+                )
+            )
+        )
+        zero_result = run["results"].set_index("borrower_id").loc["B005"]
+        self.assertEqual(float(zero_result["outstanding_balance"]), 0.0)
+        self.assertEqual(zero_result["module_applied"], "C&I")
+        self.assertEqual(
+            run["metadata"]["suppressed_zero_balance_error_count"], 2
+        )
+        self.assertEqual(
+            run["metadata"]["exception_count"], len(exception_log)
+        )
+        self.assertEqual(
+            run["metadata"]["exception_counts_by_severity"]["ERROR"],
+            len(errors),
+        )
+
+    def test_targeted_log_uses_aggregate_borrower_balance_for_suppression(self):
+        scenario, base_dir = load_scenario(
+            ROOT / "examples" / "targeted_stress.json"
+        )
+        identity = pd.read_csv(
+            ROOT / "examples" / "data" / "loans.csv",
+            dtype=str,
+            keep_default_na=False,
+        )
+        identity.loc[identity["loan_id"].eq("L016"), "outstanding_balance"] = "0"
+        identity.loc[
+            identity["loan_id"].isin(["L011", "L016"]), "risk_rating"
+        ] = ""
+        scenario["targeted_stress"]["shocks"]["tariff_shock"]["exclude"] = {
+            "field": "loan_id",
+            "op": "eq",
+            "value": "L011",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_path = Path(tmp) / "loans.csv"
+            identity.to_csv(identity_path, index=False)
+            scenario["inputs"]["identity"]["path"] = str(identity_path)
+            run = StressEngine(scenario, base_dir).run(
+                write_outputs=False, run_comparison=False
+            )
+
+        exception_log = run["reports"]["exception_log"]
+        errors = exception_log[exception_log["severity"].eq("ERROR")]
+        self.assertFalse(errors["borrower_id"].eq("B015").any())
+        self.assertTrue(
+            (
+                errors["borrower_id"].eq("B010")
+                & errors["code"].eq("CI_BRG_INVALID")
+            ).any()
+        )
+        missing_rating_warnings = exception_log[
+            exception_log["severity"].eq("WARNING")
+            & exception_log["code"].eq("RISK_RATING_MISSING")
+        ]
+        self.assertTrue(
+            {"B010", "B015"}.issubset(
+                set(missing_rating_warnings["borrower_id"])
+            )
+        )
+        out_of_scope = run["reports"]["out_of_scope_detail"]
+        self.assertIn("B015", set(out_of_scope["borrower_id"]))
+        zero_borrower = run["borrowers"].set_index("borrower_id").loc["B015"]
+        self.assertEqual(float(zero_borrower["outstanding_balance"]), 0.0)
+        self.assertGreater(
+            run["metadata"]["suppressed_zero_balance_error_count"], 0
+        )
+        self.assertEqual(
+            run["metadata"]["exception_count"], len(exception_log)
+        )
+
     def test_duplicate_consumer_labels_keep_positionally_aligned_reserves(self):
         scenario = _scenario()
         scenario["cecl"]["portfolios"] = {

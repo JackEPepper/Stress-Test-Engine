@@ -4,7 +4,7 @@ L002,B001,CRE Alpha,Active,Traditional Office,,,531120,6,2029-06-30,250000,2500
 L003,B002,CRE Beta,Active,Multifamily Market,,,531110,6,2026-12-31,800000,
 L004,B003,CRE Gamma,Active,Retail,,,531120,7,2027-03-31,600000,9000
 L005,B004,CRE Missing,Active,Industrial,,,531120,6,2028-01-01,500000,5000
-L006,B005,CI Middle,Active,Middle Market,,,211120,6,2027-07-01,700000,7000
+L006,B005,CI Middle,Active,Middle Market,,,211120,6.5,2027-07-01,700000,7000
 L007,B006,CI Sponsor,Active,Sponsor and Specialty,,,213112,7,2027-07-01,500000,7500
 L008,B007,Consumer One,Active,Consumer,,,522291,6,2031-01-01,300000,4000
 L009,B008,Equipment Finance Borrower,Active,Equipment Finance,,,532490,6,2027-01-01,400000,4000
